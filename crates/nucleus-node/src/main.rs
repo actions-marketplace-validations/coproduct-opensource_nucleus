@@ -835,7 +835,8 @@ async fn create_pod(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
 
-    let (id, proxy_addr) = create_pod_internal(&state, spec, parent_pod_id).await?;
+    let raw = String::from_utf8_lossy(&body).to_string();
+    let (id, proxy_addr) = create_pod_internal(&state, spec, parent_pod_id, Some(raw)).await?;
 
     Ok(Json(CreatePodResponse { id, proxy_addr }))
 }
@@ -861,6 +862,7 @@ async fn create_pod_internal(
     state: &NodeState,
     spec: PodSpec,
     parent_pod_id: Option<Uuid>,
+    raw_yaml: Option<String>,
 ) -> Result<(Uuid, Option<String>), ApiError> {
     let id = Uuid::new_v4();
     let created_at = now_unix();
@@ -871,7 +873,9 @@ async fn create_pod_internal(
         #[cfg(feature = "local-driver")]
         DriverKind::Local => spawn_local_pod(state, &pod_dir, &spec, id).await?,
         DriverKind::Firecracker => spawn_firecracker_pod(state, &pod_dir, &spec, id).await?,
-        DriverKind::Container => spawn_container_pod(state, &pod_dir, &spec, id).await?,
+        DriverKind::Container => {
+            spawn_container_pod(state, &pod_dir, &spec, id, raw_yaml.as_deref()).await?
+        }
     };
 
     let handle = Arc::new(PodHandle {
@@ -1290,6 +1294,7 @@ async fn spawn_container_pod(
     pod_dir: &Path,
     spec: &PodSpec,
     id: Uuid,
+    raw_yaml: Option<&str>,
 ) -> Result<(DriverState, Option<String>, PathBuf), ApiError> {
     let docker = state
         .docker
@@ -1312,7 +1317,12 @@ async fn spawn_container_pod(
     let announce_path = pod_dir.join("proxy.addr");
     let audit_path = pod_dir.join("audit.log");
 
-    let spec_yaml = serde_yaml::to_string(spec).map_err(ApiError::Serde)?;
+    // Prefer raw YAML (preserves free-form fields like `task:` that aren't in PodInner).
+    // Fall back to re-serialized typed spec if raw isn't available.
+    let spec_yaml = match raw_yaml {
+        Some(raw) => raw.to_string(),
+        None => serde_yaml::to_string(spec).map_err(ApiError::Serde)?,
+    };
     let spec_yaml_hash = {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(spec_yaml.as_bytes()))
@@ -1408,24 +1418,47 @@ async fn spawn_container_pod(
         ..Default::default()
     };
 
-    // In proxy mode: entrypoint is tool-proxy binary, cmd is args.
-    // In direct mode: use the image's default entrypoint/cmd.
-    let cmd = if proxy_mode {
-        Some(vec![
-            "nucleus-tool-proxy".to_string(),
-            "--spec".to_string(),
-            "/data/pod/pod.yaml".to_string(),
-            "--listen".to_string(),
-            "0.0.0.0:0".to_string(),
-            "--announce-path".to_string(),
-            "/data/pod/proxy.addr".to_string(),
-        ])
+    // In proxy mode: override entrypoint + cmd so we control the full command,
+    // regardless of the image's ENTRYPOINT/CMD. This avoids double-binary issues
+    // when the image has ENTRYPOINT ["nucleus-tool-proxy", "--listen", "..."].
+    // In direct mode with NUCLEUS_TASK: override entrypoint to run a shell that
+    // invokes the task via the container's CLI tools (e.g. claude).
+    // In direct mode without NUCLEUS_TASK: use the image's default entrypoint/cmd.
+    let has_task = env.iter().any(|e| e.starts_with("NUCLEUS_TASK="));
+    let (entrypoint, cmd) = if proxy_mode {
+        (
+            Some(vec!["nucleus-tool-proxy".to_string()]),
+            Some(vec![
+                "--spec".to_string(),
+                "/data/pod/pod.yaml".to_string(),
+                "--listen".to_string(),
+                "0.0.0.0:0".to_string(),
+                "--announce-path".to_string(),
+                "/data/pod/proxy.addr".to_string(),
+            ]),
+        )
+    } else if has_task {
+        // Direct task execution: run a shell that sets up credentials and invokes
+        // Claude CLI (or whichever LLM CLI is installed in the image).
+        (
+            Some(vec!["/bin/bash".to_string(), "-c".to_string()]),
+            Some(vec![concat!(
+                "mkdir -p ~/.claude && ",
+                "echo '{\"hasCompletedOnboarding\":true}' > ~/.claude.json && ",
+                "export CLAUDE_CODE_OAUTH_TOKEN=\"${LLM_API_TOKEN}\" && ",
+                "echo \"NUCLEUS_ARTIFACT type=task_start\" && ",
+                "claude -p \"$NUCLEUS_TASK\" --dangerously-skip-permissions 2>&1 && ",
+                "echo \"NUCLEUS_ARTIFACT type=task_complete\""
+            )
+            .to_string()]),
+        )
     } else {
-        None
+        (None, None)
     };
 
     let config = bollard::secret::ContainerCreateBody {
         image: Some(image.clone()),
+        entrypoint,
         cmd,
         env: Some(env),
         host_config: Some(host_config),
@@ -2351,9 +2384,10 @@ impl NodeService for GrpcService {
 
         let spec: PodSpec = serde_yaml::from_str(&yaml)
             .map_err(|e| Status::invalid_argument(format!("invalid yaml: {e}")))?;
-        let (id, proxy_addr) = create_pod_internal(&self.state, spec, parent_pod_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let (id, proxy_addr) =
+            create_pod_internal(&self.state, spec, parent_pod_id, Some(yaml.clone()))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(GrpcResponse::new(proto::CreatePodResponse {
             id: id.to_string(),
