@@ -92,6 +92,7 @@ mod capability;
 mod command;
 pub mod constraint;
 pub mod delegation;
+pub mod dropout;
 pub mod escalation;
 pub mod frame;
 pub mod galois;
