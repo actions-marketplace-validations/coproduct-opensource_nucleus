@@ -982,6 +982,358 @@ proof fn proof_nucleus_bottom_is_identity(p: Perm)
     // trifecta_obligations returns empty, union with empty = identity.
 }
 
+// ============================================================================
+// Obligation Lattice Proofs
+// ============================================================================
+
+/// obs_union is commutative.
+proof fn proof_obs_union_commutative(a: Obs, b: Obs)
+    ensures
+        obs_union(a, b) == obs_union(b, a),
+{
+}
+
+/// obs_union is associative.
+proof fn proof_obs_union_associative(a: Obs, b: Obs, c: Obs)
+    ensures
+        obs_union(obs_union(a, b), c) == obs_union(a, obs_union(b, c)),
+{
+}
+
+/// obs_union is idempotent.
+proof fn proof_obs_union_idempotent(a: Obs)
+    ensures
+        obs_union(a, a) == a,
+{
+}
+
+/// obs_empty is identity for obs_union.
+proof fn proof_obs_union_identity(a: Obs)
+    ensures
+        obs_union(a, obs_empty()) == a,
+{
+}
+
+/// obs_intersection is commutative.
+proof fn proof_obs_intersection_commutative(a: Obs, b: Obs)
+    ensures
+        obs_intersection(a, b) == obs_intersection(b, a),
+{
+}
+
+/// obs_intersection is associative.
+proof fn proof_obs_intersection_associative(a: Obs, b: Obs, c: Obs)
+    ensures
+        obs_intersection(obs_intersection(a, b), c)
+            == obs_intersection(a, obs_intersection(b, c)),
+{
+}
+
+/// obs_full is identity for obs_intersection.
+proof fn proof_obs_intersection_identity(a: Obs)
+    ensures
+        obs_intersection(a, obs_full()) == a,
+{
+}
+
+/// Absorption: obs_union(a, obs_intersection(a, b)) == a
+proof fn proof_obs_absorption(a: Obs, b: Obs)
+    ensures
+        obs_union(a, obs_intersection(a, b)) == a,
+{
+}
+
+/// obs_leq is reflexive.
+proof fn proof_obs_leq_reflexive(a: Obs)
+    ensures
+        obs_leq(a, a),
+{
+}
+
+/// obs_leq is transitive.
+proof fn proof_obs_leq_transitive(a: Obs, b: Obs, c: Obs)
+    requires
+        obs_leq(a, b),
+        obs_leq(b, c),
+    ensures
+        obs_leq(a, c),
+{
+}
+
+/// obs_union produces the meet (greatest lower bound) in obligation order.
+proof fn proof_obs_union_is_meet(a: Obs, b: Obs)
+    ensures
+        obs_leq(obs_union(a, b), a),
+        obs_leq(obs_union(a, b), b),
+{
+}
+
+// ============================================================================
+// Fixed Point Helper Lemmas
+// ============================================================================
+
+/// A fixed point's obligations subsume its trifecta obligations.
+///
+/// If ν(p) = p, then p.obs already includes trifecta_obligations(p.caps).
+/// This follows directly from the fixed point characterization.
+proof fn lemma_fixed_point_includes_trifecta(p: Perm)
+    requires
+        valid_perm(p),
+        nucleus(p) == p,
+    ensures
+        obs_union(p.obs, trifecta_obligations(p.caps)) == p.obs,
+{
+    // nucleus(p) = Perm { caps: p.caps, obs: union(p.obs, trifecta_obs(p.caps)), ... }
+    // nucleus(p) == p implies union(p.obs, trifecta_obs(p.caps)) == p.obs
+}
+
+/// When both inputs are fixed points, trifecta_obligations of their meet
+/// is subsumed by the union of their obligations.
+///
+/// Key insight: if trifecta is complete for meet(a,b), then by upward
+/// monotonicity it's complete for both a and b. Each trifecta obligation
+/// flag in the meet (e.g., run_bash) requires min(a.f3, b.f3) >= 1,
+/// meaning a.f3 >= 1, so trifecta_obligations(a).run_bash = true,
+/// and since a is a fixed point, a.obs.run_bash = true.
+proof fn lemma_trifecta_obs_meet_subsumed(a: Perm, b: Perm)
+    requires
+        valid_perm(a),
+        valid_perm(b),
+        nucleus(a) == a,
+        nucleus(b) == b,
+    ensures
+        obs_union(obs_union(a.obs, b.obs), trifecta_obligations(lattice_meet(a.caps, b.caps)))
+            == obs_union(a.obs, b.obs),
+{
+    // First, establish that a.obs and b.obs already include their trifecta obs.
+    lemma_fixed_point_includes_trifecta(a);
+    lemma_fixed_point_includes_trifecta(b);
+
+    // For the meet's trifecta obligations, we need:
+    // trifecta_obs(meet(a,b)) subsumed by union(a.obs, b.obs)
+    //
+    // Case 1: trifecta NOT complete for meet(a,b).
+    //   Then trifecta_obligations returns empty. union with empty = identity. ✓
+    //
+    // Case 2: trifecta IS complete for meet(a,b).
+    //   Since meet(a,b) ≤ a and meet(a,b) ≤ b (deflationary),
+    //   by trifecta upward monotonicity, trifecta is complete for a and b.
+    //
+    //   For each flag (e.g., run_bash):
+    //     trifecta_obs(meet).run_bash = true
+    //     → meet.f3 >= 1 → min(a.f3, b.f3) >= 1 → a.f3 >= 1
+    //     → trifecta_obs(a).run_bash = true (since trifecta complete for a)
+    //     → a.obs.run_bash = true (since a is fixed point)
+    //     → union(a.obs, b.obs).run_bash = true ✓
+    //
+    //   Same for git_push (f9) and create_pr (f10).
+    //
+    // Z3 handles this by unfolding the boolean definitions.
+    let meet_caps = lattice_meet(a.caps, b.caps);
+    proof_meet_preserves_validity(a.caps, b.caps);
+    proof_meet_deflationary(a.caps, b.caps);
+
+    if is_trifecta_complete(meet_caps) {
+        // Trifecta is complete for the meet. By upward monotonicity
+        // (meet ≤ a and meet ≤ b), trifecta is complete for both a and b.
+        proof_trifecta_upward_monotone(meet_caps, a.caps);
+        proof_trifecta_upward_monotone(meet_caps, b.caps);
+        // Now Z3 knows:
+        //   is_trifecta_complete(a.caps) && is_trifecta_complete(b.caps)
+        //   a.obs includes trifecta_obs(a.caps) (from fixed point property)
+        //   Each flag in trifecta_obs(meet) implies the flag in trifecta_obs(a)
+        //   which implies the flag in a.obs.
+    } else {
+        // Trifecta not complete for meet → trifecta_obligations = empty.
+        // Union with empty is identity. Trivially holds.
+    }
+}
+
+/// On fixed points, perm_meet simplifies: the trifecta_obligations term
+/// is redundant because it's already subsumed by the input obligations.
+proof fn lemma_perm_meet_on_fixed_points(a: Perm, b: Perm)
+    requires
+        valid_perm(a),
+        valid_perm(b),
+        nucleus(a) == a,
+        nucleus(b) == b,
+    ensures
+        perm_meet(a, b).obs == obs_union(a.obs, b.obs),
+        perm_meet(a, b).caps == lattice_meet(a.caps, b.caps),
+        perm_meet(a, b).trifecta_constraint == true,
+{
+    lemma_trifecta_obs_meet_subsumed(a, b);
+}
+
+// ============================================================================
+// Quotient Meet Associativity (on Fixed Points)
+// ============================================================================
+
+/// **The key algebraic property**: perm_meet is associative on fixed points.
+///
+/// This is what the real code relies on — all PermissionLattice values
+/// are constructed via normalize(), so they're fixed points of ν.
+/// The associativity of the quotient meet guarantees that policy
+/// composition is well-defined regardless of evaluation order.
+///
+/// The proof strategy:
+/// 1. On fixed points, perm_meet.obs = union(a.obs, b.obs) (helper lemma)
+/// 2. Boolean union is associative
+/// 3. Capability meet is associative
+/// 4. Therefore the triple product is equal
+proof fn proof_quotient_meet_associative_on_fixed_points(a: Perm, b: Perm, c: Perm)
+    requires
+        valid_perm(a),
+        valid_perm(b),
+        valid_perm(c),
+        nucleus(a) == a,
+        nucleus(b) == b,
+        nucleus(c) == c,
+    ensures
+        perm_meet(perm_meet(a, b), c) == perm_meet(a, perm_meet(b, c)),
+{
+    // Step 1: Show perm_meet(a,b) is a fixed point
+    // (already proved: proof_quotient_meet_is_fixed_point)
+    // But we need valid_lattice for the intermediate too.
+    proof_meet_preserves_validity(a.caps, b.caps);
+    proof_meet_preserves_validity(b.caps, c.caps);
+
+    // Step 2: Show obs simplifies on fixed points
+    lemma_perm_meet_on_fixed_points(a, b);
+    lemma_perm_meet_on_fixed_points(b, c);
+
+    // Step 3: perm_meet(a,b) is a fixed point, so we can apply the lemma again
+    // We need nucleus(perm_meet(a,b)) == perm_meet(a,b)
+    // This is proof_quotient_meet_is_fixed_point.
+    // And valid_perm(perm_meet(a,b)).
+
+    // Step 4: The intermediate meets are fixed points
+    let ab = perm_meet(a, b);
+    let bc = perm_meet(b, c);
+
+    // ab and bc have trifecta_constraint = true and valid caps
+    assert(valid_lattice(ab.caps));
+    assert(valid_lattice(bc.caps));
+    assert(ab.trifecta_constraint == true);
+    assert(bc.trifecta_constraint == true);
+
+    // Prove ab and bc are fixed points so we can use the lemma
+    assert(nucleus(ab) == ab) by {
+        lemma_trifecta_obs_meet_subsumed(a, b);
+    }
+    assert(nucleus(bc) == bc) by {
+        lemma_trifecta_obs_meet_subsumed(b, c);
+    }
+
+    // Now apply the simplification to the triple meets
+    lemma_perm_meet_on_fixed_points(ab, c);
+    lemma_perm_meet_on_fixed_points(a, bc);
+
+    // At this point Z3 knows:
+    // perm_meet(ab, c).obs = union(ab.obs, c.obs) = union(union(a.obs, b.obs), c.obs)
+    // perm_meet(a, bc).obs = union(a.obs, bc.obs) = union(a.obs, union(b.obs, c.obs))
+    // These are equal by associativity of boolean ||.
+
+    // And caps:
+    // perm_meet(ab, c).caps = meet(meet(a.caps, b.caps), c.caps)
+    // perm_meet(a, bc).caps = meet(a.caps, meet(b.caps, c.caps))
+    // Equal by lattice meet associativity.
+    proof_lattice_meet_associative(a.caps, b.caps, c.caps);
+
+    // And trifecta_constraint = true on both sides.
+}
+
+/// Counterexample: perm_meet is NOT associative on arbitrary (non-fixed-point) inputs.
+///
+/// Witness: a and b have full caps (trifecta complete) but empty obligations.
+/// c has no private access. The intermediate meet(a,b) triggers trifecta
+/// obligations that persist, but meet(b,c) doesn't trigger them.
+proof fn proof_perm_meet_not_associative()
+    ensures
+        ({
+            let a = Perm {
+                caps: lattice_top(),
+                obs: obs_empty(),
+                trifecta_constraint: true,
+            };
+            let b = Perm {
+                caps: lattice_top(),
+                obs: obs_empty(),
+                trifecta_constraint: true,
+            };
+            let c = Perm {
+                caps: CapLattice {
+                    f0: 0, f1: 2, f2: 2, f3: 2, f4: 0, f5: 0,
+                    f6: 2, f7: 2, f8: 2, f9: 2, f10: 2, f11: 2,
+                },
+                obs: obs_empty(),
+                trifecta_constraint: true,
+            };
+            perm_meet(perm_meet(a, b), c) != perm_meet(a, perm_meet(b, c))
+        }),
+{
+    // LHS: meet(a,b) has trifecta complete → adds {t,t,t} obligations
+    //       meet(that, c) carries those obligations forward
+    // RHS: meet(b,c) has no private access → no trifecta obligations
+    //       meet(a, that) also has no private access → no trifecta obligations
+    // LHS.obs = {t,t,t}, RHS.obs = {} — provably different
+}
+
+// ============================================================================
+// Delegation Monotonicity (Ceiling Theorem)
+// ============================================================================
+
+/// Delegation via meet is deflationary: the delegated permission is ≤ the delegator's.
+///
+/// This is the ceiling theorem: you cannot delegate more permission than you have.
+/// Since meet(a, b) ≤ a for all b, the delegatee's effective permission is
+/// bounded by the delegator's permission.
+proof fn proof_delegation_ceiling(delegator: Perm, requested: Perm)
+    requires
+        valid_perm(delegator),
+        valid_perm(requested),
+    ensures
+        perm_leq(perm_meet(delegator, requested), delegator),
+{
+    // perm_meet computes meet of capabilities (deflationary) and
+    // union of obligations (more constrained). So the result has
+    // ≤ capabilities and ≥ obligations compared to the delegator.
+
+    // Caps: meet(delegator.caps, requested.caps) ≤ delegator.caps
+    proof_meet_deflationary(delegator.caps, requested.caps);
+
+    // Obs: union(delegator.obs, requested.obs, trifecta_obs) ⊇ delegator.obs
+    // obs_leq checks that delegator.obs implies result.obs — which holds
+    // since result.obs is a superset of delegator.obs.
+}
+
+/// Delegation is transitive with bounded depth:
+/// meet(meet(a, b), c) ≤ meet(a, b) ≤ a
+///
+/// A chain of delegations produces strictly decreasing permissions.
+proof fn proof_delegation_chain_monotone(a: Perm, b: Perm, c: Perm)
+    requires
+        valid_perm(a),
+        valid_perm(b),
+        valid_perm(c),
+    ensures
+        perm_leq(perm_meet(perm_meet(a, b), c), perm_meet(a, b)),
+        perm_leq(perm_meet(a, b), a),
+{
+    proof_meet_preserves_validity(a.caps, b.caps);
+    proof_delegation_ceiling(a, b);
+
+    // For the chain: meet(meet(a,b), c) ≤ meet(a,b)
+    // We need valid_perm for the intermediate
+    let ab = perm_meet(a, b);
+    assert(valid_lattice(ab.caps));
+    assert(ab.trifecta_constraint == true);
+    proof_delegation_ceiling(
+        Perm { caps: ab.caps, obs: ab.obs, trifecta_constraint: ab.trifecta_constraint },
+        c,
+    );
+}
+
 fn main() {}
 
 } // verus!
