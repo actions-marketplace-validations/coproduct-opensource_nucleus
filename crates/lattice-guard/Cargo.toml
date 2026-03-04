@@ -66,3 +66,7 @@ proptest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 kani = "0.0.1"
+
+[[test]]
+name = "example_policies"
+required-features = ["spec"]
