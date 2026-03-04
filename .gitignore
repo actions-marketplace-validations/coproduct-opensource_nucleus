@@ -31,3 +31,9 @@ nucleus-node/pods/
 
 # Node.js
 node_modules/
+
+# Verus binary distribution (downloaded, not committed)
+.verus/verus-x86-macos/
+.verus/verus-arm64-macos/
+.verus/verus-x86-linux/
+.verus/*.zip
