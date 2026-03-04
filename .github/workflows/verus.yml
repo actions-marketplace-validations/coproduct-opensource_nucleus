@@ -1,0 +1,78 @@
+name: Verus
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "crates/lattice-guard-verified/**"
+      - ".verus-version"
+      - ".github/workflows/verus.yml"
+  pull_request:
+    paths:
+      - "crates/lattice-guard-verified/**"
+      - ".verus-version"
+      - ".github/workflows/verus.yml"
+  schedule:
+    # Nightly: catch regressions from Verus toolchain updates
+    - cron: "42 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verus SMT Proofs
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read Verus version
+        id: verus-version
+        run: echo "version=$(cat .verus-version | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Verus binary
+        uses: actions/cache@v4
+        id: cache-verus
+        with:
+          path: .verus/verus-x86-linux
+          key: verus-linux-${{ steps.verus-version.outputs.version }}
+
+      - name: Download Verus
+        if: steps.cache-verus.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .verus
+          VERUS_TAG="${{ steps.verus-version.outputs.version }}"
+          VERUS_FILE="verus-${VERUS_TAG#release/}-x86-linux.zip"
+          gh release download "$VERUS_TAG" \
+            -R verus-lang/verus \
+            -p "$VERUS_FILE" \
+            -D .verus/
+          cd .verus && unzip "$VERUS_FILE" && rm "$VERUS_FILE"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Verus Rust toolchain
+        run: |
+          REQUIRED=$(.verus/verus-x86-linux/verus --version 2>&1 | grep -oP 'Toolchain: \K\S+' || true)
+          if [ -z "$REQUIRED" ]; then
+            REQUIRED=$(.verus/verus-x86-linux/verus 2>&1 | grep -oP "toolchain '\K[^']+")
+          fi
+          echo "Installing Rust toolchain: $REQUIRED"
+          rustup install "$REQUIRED"
+          rustup default "$REQUIRED"
+
+      - name: Verify lattice-guard-verified
+        run: |
+          echo "::group::Verus verification"
+          .verus/verus-x86-linux/verus crates/lattice-guard-verified/src/lib.rs
+          echo "::endgroup::"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Verus Verification Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Verus version:** ${{ steps.verus-version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Target:** \`crates/lattice-guard-verified/src/lib.rs\`" >> "$GITHUB_STEP_SUMMARY"
