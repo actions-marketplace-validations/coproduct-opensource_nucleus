@@ -17,6 +17,8 @@ members = [
     "crates/nucleus-sdk",        # Rust SDK for building sandboxed AI agents
     "crates/nucleus-permission-market", # Lagrangian permission pricing oracle
 ]
+# Verified with Verus (not standard cargo); run: .verus/verus-x86-macos/verus crates/lattice-guard-verified/src/lib.rs
+exclude = ["crates/lattice-guard-verified"]
 resolver = "2"
 
 [workspace.package]
