@@ -1,6 +1,17 @@
-name: Kani (nightly)
+name: Kani BMC
 
 on:
+  push:
+    branches: ["main"]
+    paths:
+      - "crates/lattice-guard/src/**"
+      - ".kani-minimum-proofs"
+      - ".github/workflows/kani-nightly.yml"
+  pull_request:
+    paths:
+      - "crates/lattice-guard/src/**"
+      - ".kani-minimum-proofs"
+      - ".github/workflows/kani-nightly.yml"
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -20,3 +31,22 @@ jobs:
         uses: model-checking/kani-github-action@v1
         with:
           args: "-p lattice-guard"
+      - name: Proof count regression gate
+        run: |
+          PROOF_COUNT=$(grep -c '#\[kani::proof\]' crates/lattice-guard/src/kani.rs)
+          MINIMUM=$(cat .kani-minimum-proofs | tr -d '[:space:]')
+          echo "Kani proof harnesses: $PROOF_COUNT (minimum: $MINIMUM)"
+          if [ "$PROOF_COUNT" -lt "$MINIMUM" ]; then
+            echo "::error::Kani proof count regression: $PROOF_COUNT < $MINIMUM"
+            exit 1
+          fi
+      - name: Summary
+        if: always()
+        run: |
+          PROOF_COUNT=$(grep -c '#\[kani::proof\]' crates/lattice-guard/src/kani.rs)
+          MINIMUM=$(cat .kani-minimum-proofs | tr -d '[:space:]')
+          echo "## Kani BMC Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Proof harnesses:** $PROOF_COUNT" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Minimum required:** $MINIMUM" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Target:** lattice-guard" >> "$GITHUB_STEP_SUMMARY"

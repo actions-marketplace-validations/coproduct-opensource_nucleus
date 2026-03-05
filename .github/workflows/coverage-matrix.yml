@@ -1,0 +1,160 @@
+name: Coverage Matrix
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Layer 1: LLVM source-based code coverage with threshold enforcement
+  llvm-cov:
+    name: Code Coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: llvm-tools-preview
+          cache: true
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Workspace coverage (threshold gate)
+        run: |
+          cargo llvm-cov --all-features \
+            --fail-under-lines 85 \
+            --ignore-filename-regex '(tests/|kani\.rs|main\.rs)' 2>&1 | tee /tmp/workspace-cov.txt
+      - name: lattice-guard coverage (security-critical threshold)
+        run: |
+          cargo llvm-cov --all-features -p lattice-guard \
+            --fail-under-lines 87 \
+            --ignore-filename-regex '(tests/|kani\.rs)' 2>&1 | tee /tmp/lattice-guard-cov.txt
+      - name: Generate JSON coverage report
+        if: always()
+        run: |
+          cargo llvm-cov --all-features -p lattice-guard \
+            --json --output-path /tmp/lattice-guard-cov.json \
+            --ignore-filename-regex '(tests/|kani\.rs)' || true
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo "## Code Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Workspace" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -5 /tmp/workspace-cov.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### lattice-guard (security-critical)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -5 /tmp/lattice-guard-cov.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Thresholds:** workspace ≥ 85% lines, lattice-guard ≥ 87% lines" >> "$GITHUB_STEP_SUMMARY"
+
+  # Layer 2: Mutation testing on security-critical modules
+  mutants:
+    name: Mutation Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Run mutation tests on security-critical modules
+        run: |
+          cargo mutants --package lattice-guard \
+            --file crates/lattice-guard/src/capability.rs \
+            --file crates/lattice-guard/src/guard.rs \
+            --file crates/lattice-guard/src/lattice.rs \
+            --file crates/lattice-guard/src/certificate.rs \
+            --file crates/lattice-guard/src/delegation.rs \
+            --file crates/lattice-guard/src/trust.rs \
+            --timeout 120 \
+            -- --all-features 2>&1 | tee /tmp/mutants.txt
+      - name: Check for survived mutants
+        if: always()
+        run: |
+          echo "## Mutation Testing Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Modules tested:** capability, guard, lattice, certificate, delegation, trust" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if grep -q "SURVIVED" /tmp/mutants.txt 2>/dev/null; then
+            echo "⚠️ **Survived mutants found** — tests may have coverage gaps:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep "SURVIVED" /tmp/mutants.txt >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "All mutants caught by tests." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # Layer 3: Verification proof count regression gates
+  proof-ratchet:
+    name: Proof Count Ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Count Verus proofs
+        id: verus-count
+        run: |
+          PROOF_COUNT=$(grep -c '^proof fn\|^pub proof fn' crates/lattice-guard-verified/src/lib.rs)
+          MINIMUM=$(cat .verus-minimum-proofs | tr -d '[:space:]')
+          echo "count=$PROOF_COUNT" >> "$GITHUB_OUTPUT"
+          echo "minimum=$MINIMUM" >> "$GITHUB_OUTPUT"
+          echo "Verus proof functions: $PROOF_COUNT (minimum: $MINIMUM)"
+          if [ "$PROOF_COUNT" -lt "$MINIMUM" ]; then
+            echo "::error::Verus proof count regression: $PROOF_COUNT < $MINIMUM"
+            exit 1
+          fi
+      - name: Count Kani proofs
+        id: kani-count
+        run: |
+          PROOF_COUNT=$(grep -c '#\[kani::proof\]' crates/lattice-guard/src/kani.rs)
+          MINIMUM=$(cat .kani-minimum-proofs | tr -d '[:space:]')
+          echo "count=$PROOF_COUNT" >> "$GITHUB_OUTPUT"
+          echo "minimum=$MINIMUM" >> "$GITHUB_OUTPUT"
+          echo "Kani proof harnesses: $PROOF_COUNT (minimum: $MINIMUM)"
+          if [ "$PROOF_COUNT" -lt "$MINIMUM" ]; then
+            echo "::error::Kani proof count regression: $PROOF_COUNT < $MINIMUM"
+            exit 1
+          fi
+      - name: Count conformance tests
+        id: conformance-count
+        run: |
+          CONFORMANCE_COUNT=$(grep -c 'proptest!' crates/lattice-guard/tests/verus_conformance.rs)
+          echo "count=$CONFORMANCE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Conformance test suites: $CONFORMANCE_COUNT"
+      - name: Ratchet summary
+        if: always()
+        run: |
+          echo "## Proof Count Ratchet" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Layer | Count | Minimum | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|---------|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+          VERUS="${{ steps.verus-count.outputs.count }}"
+          VERUS_MIN="${{ steps.verus-count.outputs.minimum }}"
+          if [ "$VERUS" -ge "$VERUS_MIN" ]; then
+            echo "| Verus SMT proofs | $VERUS | $VERUS_MIN | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Verus SMT proofs | $VERUS | $VERUS_MIN | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          KANI="${{ steps.kani-count.outputs.count }}"
+          KANI_MIN="${{ steps.kani-count.outputs.minimum }}"
+          if [ "$KANI" -ge "$KANI_MIN" ]; then
+            echo "| Kani BMC harnesses | $KANI | $KANI_MIN | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Kani BMC harnesses | $KANI | $KANI_MIN | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          CONF="${{ steps.conformance-count.outputs.count }}"
+          echo "| Conformance suites | $CONF | — | ℹ️ |" >> "$GITHUB_STEP_SUMMARY"
