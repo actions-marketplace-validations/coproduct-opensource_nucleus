@@ -1277,3 +1277,158 @@ proptest! {
         );
     }
 }
+
+// ============================================================================
+// Tier H: MCP Session Trace Conformance (bridges Phase 7 proofs to production)
+//
+// These tests verify the session-level trace properties: taint monotonicity,
+// phantom taint freedom, neutral ops, trifecta irreversibility, and the
+// composition (free monoid homomorphism) property.
+// ============================================================================
+
+/// Model an MCP event: (operation, succeeded)
+fn apply_event(taint: &TaintSet, op: Operation, succeeded: bool) -> TaintSet {
+    if succeeded {
+        if let Some(label) = operation_taint(op) {
+            taint.union(&TaintSet::singleton(label))
+        } else {
+            taint.clone()
+        }
+    } else {
+        taint.clone()
+    }
+}
+
+/// Compute trace taint by folding over events.
+fn trace_taint(events: &[(Operation, bool)]) -> TaintSet {
+    let mut taint = TaintSet::empty();
+    for &(op, succeeded) in events {
+        taint = apply_event(&taint, op, succeeded);
+    }
+    taint
+}
+
+proptest! {
+    /// CONFORMANCE M1: Trace taint monotonicity — each event only grows taint.
+    ///
+    /// Mirrors Verus proof_trace_taint_monotone.
+    #[test]
+    fn conformance_trace_taint_monotone(
+        ops in proptest::collection::vec(
+            (arb_operation(), any::<bool>()),
+            0..20,
+        ),
+    ) {
+        let mut taint = TaintSet::empty();
+        for &(op, succeeded) in &ops {
+            let before = taint.clone();
+            taint = apply_event(&taint, op, succeeded);
+            // Monotone: every leg that was true stays true
+            for l in [TaintLabel::PrivateData, TaintLabel::UntrustedContent, TaintLabel::ExfilVector] {
+                if before.contains(l) {
+                    prop_assert!(taint.contains(l), "lost taint leg {:?}", l);
+                }
+            }
+            prop_assert!(taint.count() >= before.count(), "count decreased");
+        }
+    }
+
+    /// CONFORMANCE M4: Phantom taint freedom — failed events contribute nothing.
+    ///
+    /// Mirrors Verus proof_phantom_taint_freedom.
+    #[test]
+    fn conformance_phantom_taint_freedom(
+        before in arb_taint_set(),
+        op in arb_operation(),
+    ) {
+        let after = apply_event(&before, op, false);
+        prop_assert_eq!(after, before, "failed event changed taint for {:?}", op);
+    }
+
+    /// CONFORMANCE M5: Neutral ops don't change taint.
+    ///
+    /// Mirrors Verus proof_neutral_op_preserves_taint.
+    #[test]
+    fn conformance_neutral_op_preserves(
+        before in arb_taint_set(),
+        op in prop_oneof![
+            Just(Operation::WriteFiles),
+            Just(Operation::EditFiles),
+            Just(Operation::GitCommit),
+            Just(Operation::ManagePods),
+        ],
+    ) {
+        // Even if succeeded, neutral ops don't add taint
+        let after = apply_event(&before, op, true);
+        prop_assert_eq!(after, before, "neutral op {:?} changed taint", op);
+    }
+
+    /// CONFORMANCE M6: Trifecta irreversibility — once latched, always latched.
+    ///
+    /// Mirrors Verus proof_trifecta_irreversible.
+    #[test]
+    fn conformance_trifecta_irreversible(
+        ops in proptest::collection::vec(
+            (arb_operation(), any::<bool>()),
+            0..20,
+        ),
+    ) {
+        let mut taint = TaintSet::empty();
+        let mut latched = false;
+        for &(op, succeeded) in &ops {
+            taint = apply_event(&taint, op, succeeded);
+            if taint.is_trifecta_complete() {
+                latched = true;
+            }
+            if latched {
+                prop_assert!(
+                    taint.is_trifecta_complete(),
+                    "trifecta unlatched after op {:?} (succeeded={})", op, succeeded
+                );
+            }
+        }
+    }
+
+    /// CONFORMANCE M3: Free monoid homomorphism — trace_taint(s1++s2) == union(tt(s1), tt(s2)).
+    ///
+    /// Mirrors Verus proof_trace_composition.
+    #[test]
+    fn conformance_trace_composition(
+        s1 in proptest::collection::vec(
+            (arb_operation(), any::<bool>()),
+            0..10,
+        ),
+        s2 in proptest::collection::vec(
+            (arb_operation(), any::<bool>()),
+            0..10,
+        ),
+    ) {
+        let t1 = trace_taint(&s1);
+        let t2 = trace_taint(&s2);
+        let mut combined = s1.clone();
+        combined.extend_from_slice(&s2);
+        let t_combined = trace_taint(&combined);
+
+        prop_assert_eq!(
+            t_combined, t1.union(&t2),
+            "composition failed: tt(s1++s2) != union(tt(s1), tt(s2))"
+        );
+    }
+
+    /// CONFORMANCE M8: Three-step minimum — fewer than 3 non-neutral successes can't trigger trifecta.
+    ///
+    /// Mirrors Verus proof_trifecta_minimum_three_steps.
+    #[test]
+    fn conformance_trifecta_minimum(
+        ops in proptest::collection::vec(
+            (arb_operation(), any::<bool>()),
+            0..2, // 0 or 1 events — always < 3 non-neutral successes
+        ),
+    ) {
+        let taint = trace_taint(&ops);
+        prop_assert!(
+            !taint.is_trifecta_complete(),
+            "trifecta triggered with only {} events", ops.len()
+        );
+    }
+}
