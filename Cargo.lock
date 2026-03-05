@@ -1855,6 +1855,7 @@ dependencies = [
  "proptest",
  "regex",
  "reqwest",
+ "ring",
  "rust_decimal",
  "serde",
  "serde_json",
