@@ -2,20 +2,22 @@
 //!
 //! When `--mcp` is passed, the tool-proxy serves the Model Context Protocol
 //! over stdio instead of HTTP. Each MCP tool maps 1:1 to an existing
-//! tool-proxy operation. The same sandbox enforcement and audit logging apply.
+//! tool-proxy operation, enforced through the same sandbox and permission
+//! lattice as the HTTP API.
 //!
 //! Auth: stdio transport implies the client is the pod's guest process —
 //! already authenticated by sandbox proof. HMAC auth is skipped.
 
 use std::sync::Arc;
 
+use lattice_guard::{CapabilityLevel, GradedTaintGuard, Operation, ToolCallGuard};
 use rmcp::{
     handler::server::router::tool::ToolRouter, handler::server::wrapper::Parameters, model::*,
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::AppState;
 
@@ -24,12 +26,14 @@ use crate::AppState;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
+/// Parameters for the read tool.
 pub struct ReadParams {
     /// File path to read (relative to workspace root).
     pub path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+/// Parameters for the write tool.
 pub struct WriteParams {
     /// File path to write (relative to workspace root).
     pub path: String,
@@ -38,6 +42,7 @@ pub struct WriteParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+/// Parameters for the run tool.
 pub struct RunParams {
     /// Command and arguments (first element is the binary).
     pub args: Vec<String>,
@@ -47,19 +52,24 @@ pub struct RunParams {
     /// Optional working directory.
     #[serde(default)]
     pub directory: Option<String>,
-    /// Timeout in seconds (default: 30).
+    /// Timeout in seconds (ignored — Executor enforces pod-level budget).
     #[serde(default)]
-    pub timeout_seconds: Option<u64>,
+    pub _timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+/// Result of a run command.
 pub struct RunResult {
+    /// Exit code of the process.
     pub exit_code: i32,
+    /// Standard output.
     pub stdout: String,
+    /// Standard error.
     pub stderr: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+/// Parameters for the glob tool.
 pub struct GlobParams {
     /// Glob pattern to match files (e.g. "**/*.rs").
     pub pattern: String,
@@ -69,6 +79,7 @@ pub struct GlobParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+/// Parameters for the grep tool.
 pub struct GrepParams {
     /// Regex pattern to search for.
     pub pattern: String,
@@ -84,6 +95,7 @@ pub struct GrepParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+/// Parameters for the web_fetch tool.
 pub struct WebFetchParams {
     /// URL to fetch.
     pub url: String,
@@ -97,60 +109,96 @@ pub struct WebFetchParams {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
+/// MCP server with session-scoped trifecta guard and schema pinning.
 pub struct NucleusMcpServer {
     state: Arc<AppState>,
     tool_router: ToolRouter<Self>,
+    /// Session-scoped taint-tracking guard (graded monad).
+    guard: Arc<GradedTaintGuard>,
 }
 
-fn work_dir(state: &AppState) -> String {
-    state
-        .runtime
-        .sandbox()
-        .root_path()
-        .to_string_lossy()
-        .to_string()
+/// Convert a tool-level error into a CallToolResult error.
+fn err_result(msg: impl std::fmt::Display) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(format!("{msg}"))])
 }
 
 #[tool_router]
 impl NucleusMcpServer {
+    /// Create a new MCP server with session-scoped security enforcement.
     pub fn new(state: Arc<AppState>) -> Self {
+        let tool_router = Self::tool_router();
+
+        // Schema pinning: hash the tool list at session start for rug-pull detection
+        let tool_schemas = format!("{:?}", tool_router.list_all());
+        let policy = state.runtime.policy().clone();
+
+        let guard = Arc::new(GradedTaintGuard::new(policy, &tool_schemas));
+
         Self {
             state,
-            tool_router: Self::tool_router(),
+            tool_router,
+            guard,
         }
     }
+
+    // -----------------------------------------------------------------------
+    // read — uses Sandbox.read_to_string (cap-std kernel protection)
+    // -----------------------------------------------------------------------
 
     #[tool(description = "Read a file from the pod workspace")]
     async fn read(
         &self,
         Parameters(params): Parameters<ReadParams>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.state.runtime.sandbox().root_path();
-        let full_path = root.join(&params.path);
+        if let Err(e) = self.guard.check(Operation::ReadFiles) {
+            return Ok(err_result(e));
+        }
 
-        match tokio::fs::read_to_string(&full_path).await {
-            Ok(contents) => Ok(CallToolResult::success(vec![Content::text(contents)])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "read failed: {e}"
-            ))])),
+        let result = tokio::task::block_in_place(|| {
+            self.state.runtime.sandbox().read_to_string(&params.path)
+        });
+
+        match result {
+            Ok(contents) => {
+                self.guard.record(Operation::ReadFiles);
+                Ok(CallToolResult::success(vec![Content::text(contents)]))
+            }
+            Err(e) => Ok(err_result(e)),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // write — uses Sandbox.write (cap-std kernel protection)
+    // -----------------------------------------------------------------------
 
     #[tool(description = "Write contents to a file in the pod workspace")]
     async fn write(
         &self,
         Parameters(params): Parameters<WriteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.state.runtime.sandbox().root_path();
-        let full_path = root.join(&params.path);
+        if let Err(e) = self.guard.check(Operation::WriteFiles) {
+            return Ok(err_result(e));
+        }
 
-        match tokio::fs::write(&full_path, &params.contents).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text("ok")])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "write failed: {e}"
-            ))])),
+        let result = tokio::task::block_in_place(|| {
+            self.state
+                .runtime
+                .sandbox()
+                .write(&params.path, params.contents.as_bytes())
+        });
+
+        match result {
+            Ok(()) => {
+                self.guard.record(Operation::WriteFiles);
+                Ok(CallToolResult::success(vec![Content::text("ok")]))
+            }
+            Err(e) => Ok(err_result(e)),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // run — uses Executor.run_args (capability + command policy + env isolation)
+    // -----------------------------------------------------------------------
 
     #[tool(
         description = "Execute a command in the pod sandbox (array-based args, no shell injection)"
@@ -160,122 +208,293 @@ impl NucleusMcpServer {
         Parameters(params): Parameters<RunParams>,
     ) -> Result<CallToolResult, McpError> {
         if params.args.is_empty() {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "args must not be empty",
-            )]));
+            return Ok(err_result("args must not be empty"));
         }
 
-        let dir = params
-            .directory
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| self.state.runtime.sandbox().root_path().to_path_buf());
+        if let Err(e) = self.guard.check(Operation::RunBash) {
+            return Ok(err_result(e));
+        }
 
-        let timeout = std::time::Duration::from_secs(params.timeout_seconds.unwrap_or(30));
+        let result = tokio::task::block_in_place(|| {
+            self.state.runtime.executor().run_args(
+                &params.args,
+                params.stdin.as_deref(),
+                params.directory.as_deref(),
+            )
+        });
 
-        let mut cmd = tokio::process::Command::new(&params.args[0]);
-        cmd.args(&params.args[1..]);
-        cmd.current_dir(&dir);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let output_future = async {
-            if let Some(ref stdin_data) = params.stdin {
-                cmd.stdin(std::process::Stdio::piped());
-                let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-                if let Some(mut stdin) = child.stdin.take() {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = stdin.write_all(stdin_data.as_bytes()).await;
-                    drop(stdin);
-                }
-                child
-                    .wait_with_output()
-                    .await
-                    .map_err(|e| format!("wait failed: {e}"))
-            } else {
-                cmd.output().await.map_err(|e| format!("run failed: {e}"))
-            }
-        };
-
-        match tokio::time::timeout(timeout, output_future).await {
-            Ok(Ok(output)) => {
-                let result = RunResult {
+        match result {
+            Ok(output) => {
+                self.guard.record(Operation::RunBash);
+                let run_result = RunResult {
                     exit_code: output.status.code().unwrap_or(-1),
                     stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                     stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 };
-                let json = serde_json::to_string_pretty(&result).unwrap_or_default();
+                let json = serde_json::to_string_pretty(&run_result).unwrap_or_default();
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            Ok(Err(msg)) => Ok(CallToolResult::error(vec![Content::text(msg)])),
-            Err(_) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "command timed out after {timeout:?}"
-            ))])),
+            Err(e) => Ok(err_result(e)),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // glob — sandbox boundary enforcement with canonicalization
+    // -----------------------------------------------------------------------
 
     #[tool(description = "Search for files matching a glob pattern")]
     async fn glob(
         &self,
         Parameters(params): Parameters<GlobParams>,
     ) -> Result<CallToolResult, McpError> {
-        let root = params.root.unwrap_or_else(|| work_dir(&self.state));
-        let pattern = format!("{}/{}", root, params.pattern);
+        if let Err(e) = self.guard.check(Operation::GlobSearch) {
+            return Ok(err_result(e));
+        }
 
-        match glob::glob(&pattern) {
+        // Check capability level
+        let level = self.state.runtime.policy().capabilities.glob_search;
+        if level == CapabilityLevel::Never {
+            return Ok(err_result("glob_search capability is disabled"));
+        }
+
+        let state = self.state.clone();
+        let result = tokio::task::block_in_place(move || -> Result<Vec<String>, String> {
+            let sandbox_root = state.runtime.sandbox().root_path();
+            let sandbox_canonical = sandbox_root
+                .canonicalize()
+                .map_err(|e| format!("sandbox root error: {e}"))?;
+
+            // Resolve search root within sandbox
+            let search_root = if let Some(ref root) = params.root {
+                let root_path = std::path::Path::new(root);
+                if root_path.is_absolute() {
+                    return Err(format!("absolute paths not allowed: {root}"));
+                }
+                let resolved = sandbox_root.join(root);
+                let canonical = resolved
+                    .canonicalize()
+                    .map_err(|e| format!("path resolution error: {e}"))?;
+                if !canonical.starts_with(&sandbox_canonical) {
+                    return Err(format!("path escapes sandbox: {root}"));
+                }
+                canonical
+            } else {
+                sandbox_canonical.clone()
+            };
+
+            let full_pattern = search_root.join(&params.pattern);
+            let pattern_str = full_pattern.to_string_lossy();
+
+            let mut results = Vec::new();
+            let entries =
+                glob::glob(&pattern_str).map_err(|e| format!("invalid glob pattern: {e}"))?;
+
+            for entry in entries {
+                if let Ok(path) = entry {
+                    if let Ok(canonical) = path.canonicalize() {
+                        if canonical.starts_with(&sandbox_canonical) {
+                            if let Ok(relative) = canonical.strip_prefix(&sandbox_canonical) {
+                                results.push(relative.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+                if results.len() >= 1000 {
+                    break;
+                }
+            }
+            Ok(results)
+        });
+
+        match result {
             Ok(paths) => {
-                let results: Vec<String> = paths
-                    .filter_map(|p| p.ok())
-                    .map(|p| p.display().to_string())
-                    .collect();
+                self.guard.record(Operation::GlobSearch);
                 Ok(CallToolResult::success(vec![Content::text(
-                    results.join("\n"),
+                    paths.join("\n"),
                 )]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "glob error: {e}"
-            ))])),
+            Err(e) => Ok(err_result(e)),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // grep — regex + walkdir (no subprocess), skip symlinks, boundary check
+    // -----------------------------------------------------------------------
 
     #[tool(description = "Search file contents with regex")]
     async fn grep(
         &self,
         Parameters(params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, McpError> {
-        let search_path = params.path.unwrap_or_else(|| work_dir(&self.state));
-
-        let mut cmd = tokio::process::Command::new("grep");
-        cmd.arg("-rn");
-        cmd.arg("--color=never");
-        if let Some(ref include) = params.include {
-            cmd.arg("--include").arg(include);
+        if let Err(e) = self.guard.check(Operation::GrepSearch) {
+            return Ok(err_result(e));
         }
-        if let Some(ctx) = params.context_lines {
-            cmd.arg(format!("-C{ctx}"));
-        }
-        cmd.arg(&params.pattern).arg(&search_path);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
 
-        match cmd.output().await {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Ok(CallToolResult::success(vec![Content::text(
-                    stdout.to_string(),
-                )]))
+        let level = self.state.runtime.policy().capabilities.grep_search;
+        if level == CapabilityLevel::Never {
+            return Ok(err_result("grep_search capability is disabled"));
+        }
+
+        let state = self.state.clone();
+        let result = tokio::task::block_in_place(move || -> Result<String, String> {
+            let sandbox_root = state.runtime.sandbox().root_path();
+            let sandbox_canonical = sandbox_root
+                .canonicalize()
+                .map_err(|e| format!("sandbox root error: {e}"))?;
+
+            // Resolve search path within sandbox
+            let search_path = if let Some(ref path) = params.path {
+                let p = std::path::Path::new(path);
+                if p.is_absolute() {
+                    return Err(format!("absolute paths not allowed: {path}"));
+                }
+                let resolved = sandbox_root.join(path);
+                let canonical = resolved
+                    .canonicalize()
+                    .map_err(|e| format!("path resolution error: {e}"))?;
+                if !canonical.starts_with(&sandbox_canonical) {
+                    return Err(format!("path escapes sandbox: {path}"));
+                }
+                canonical
+            } else {
+                sandbox_canonical.clone()
+            };
+
+            let re =
+                regex::Regex::new(&params.pattern).map_err(|e| format!("invalid regex: {e}"))?;
+
+            let include_glob = params.include.as_deref();
+            let ctx = params.context_lines.unwrap_or(0) as usize;
+            let mut output = String::new();
+            let mut match_count = 0usize;
+            const MAX_MATCHES: usize = 5000;
+
+            for entry in walkdir::WalkDir::new(&search_path)
+                .follow_links(false) // Never follow symlinks
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                // Skip symlinks explicitly
+                if entry.file_type().is_symlink() {
+                    continue;
+                }
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+
+                // Verify canonical path is within sandbox
+                let canonical = match entry.path().canonicalize() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if !canonical.starts_with(&sandbox_canonical) {
+                    continue;
+                }
+
+                // Apply include filter
+                if let Some(glob_pat) = include_glob {
+                    let name = entry.file_name().to_string_lossy();
+                    if !glob::Pattern::new(glob_pat)
+                        .map(|p| p.matches(&name))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                }
+
+                // Read and search
+                let contents = match std::fs::read_to_string(entry.path()) {
+                    Ok(c) => c,
+                    Err(_) => continue, // Skip binary/unreadable files
+                };
+
+                let lines: Vec<&str> = contents.lines().collect();
+                let relative = canonical
+                    .strip_prefix(&sandbox_canonical)
+                    .unwrap_or(&canonical);
+
+                for (i, line) in lines.iter().enumerate() {
+                    if re.is_match(line) {
+                        // Print context lines
+                        let start = i.saturating_sub(ctx);
+                        let end = std::cmp::min(i + ctx + 1, lines.len());
+                        for (j, line_text) in lines[start..end].iter().enumerate() {
+                            let abs_j = start + j;
+                            let sep = if abs_j == i { ':' } else { '-' };
+                            output.push_str(&format!(
+                                "{}{}{}:{}\n",
+                                relative.display(),
+                                sep,
+                                abs_j + 1,
+                                line_text
+                            ));
+                        }
+                        if ctx > 0 && end < lines.len() {
+                            output.push_str("--\n");
+                        }
+                        match_count += 1;
+                        if match_count >= MAX_MATCHES {
+                            output.push_str(&format!("\n(truncated at {} matches)\n", MAX_MATCHES));
+                            return Ok(output);
+                        }
+                    }
+                }
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "grep failed: {e}"
-            ))])),
+
+            Ok(output)
+        });
+
+        match result {
+            Ok(matches) => {
+                self.guard.record(Operation::GrepSearch);
+                Ok(CallToolResult::success(vec![Content::text(matches)]))
+            }
+            Err(e) => Ok(err_result(e)),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // web_fetch — capability check + DNS allow-list + trifecta gate
+    // -----------------------------------------------------------------------
 
     #[tool(description = "Fetch a URL (HTTP GET/POST/PUT/DELETE)")]
     async fn web_fetch(
         &self,
         Parameters(params): Parameters<WebFetchParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.guard.check(Operation::WebFetch) {
+            return Ok(err_result(e));
+        }
+
+        let level = self.state.runtime.policy().capabilities.web_fetch;
+        if level == CapabilityLevel::Never {
+            return Ok(err_result("web_fetch capability is disabled"));
+        }
+
+        // Parse and validate URL
+        let parsed_url = match url::Url::parse(&params.url) {
+            Ok(u) => u,
+            Err(e) => return Ok(err_result(format!("invalid URL: {e}"))),
+        };
+
+        // DNS allow-list enforcement
+        if !self.state.dns_allow.is_empty() {
+            let host = match parsed_url.host_str() {
+                Some(h) => h,
+                None => return Ok(err_result("URL has no host")),
+            };
+            let port = parsed_url.port_or_known_default().unwrap_or(443);
+            let host_port = format!("{host}:{port}");
+
+            let allowed = self.state.dns_allow.iter().any(|pattern| {
+                pattern == &host_port || pattern == host || pattern.starts_with(&format!("{host}:"))
+            });
+            if !allowed {
+                warn!(host = host, port = port, "DNS not in allow-list");
+                return Ok(err_result(format!("DNS not allowed: {host_port}")));
+            }
+        }
+
         let method = params.method.as_deref().unwrap_or("GET");
         let client = &self.state.web_client;
 
@@ -284,28 +503,29 @@ impl NucleusMcpServer {
             "POST" => client.post(&params.url),
             "PUT" => client.put(&params.url),
             "DELETE" => client.delete(&params.url),
-            _ => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "unsupported method: {method}"
-                ))]))
-            }
+            _ => return Ok(err_result(format!("unsupported method: {method}"))),
         };
 
         match request.send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                match resp.text().await {
-                    Ok(body) => Ok(CallToolResult::success(vec![Content::text(format!(
-                        "HTTP {status}\n\n{body}"
-                    ))])),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                        "body read failed: {e}"
-                    ))])),
+                let max_bytes = self.state.web_fetch_max_bytes;
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        self.guard.record(Operation::WebFetch);
+                        let truncated = bytes.len() > max_bytes;
+                        let body = String::from_utf8_lossy(
+                            &bytes[..std::cmp::min(bytes.len(), max_bytes)],
+                        );
+                        let suffix = if truncated { "\n(truncated)" } else { "" };
+                        Ok(CallToolResult::success(vec![Content::text(format!(
+                            "HTTP {status}\n\n{body}{suffix}"
+                        ))]))
+                    }
+                    Err(e) => Ok(err_result(format!("body read failed: {e}"))),
                 }
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "fetch failed: {e}"
-            ))])),
+            Err(e) => Ok(err_result(format!("fetch failed: {e}"))),
         }
     }
 }

@@ -327,6 +327,24 @@ impl IncompatibilityConstraint {
 }
 
 impl CapabilityLattice {
+    /// Get the capability level for a given operation.
+    pub fn level_for(&self, op: Operation) -> CapabilityLevel {
+        match op {
+            Operation::ReadFiles => self.read_files,
+            Operation::WriteFiles => self.write_files,
+            Operation::EditFiles => self.edit_files,
+            Operation::RunBash => self.run_bash,
+            Operation::GlobSearch => self.glob_search,
+            Operation::GrepSearch => self.grep_search,
+            Operation::WebSearch => self.web_search,
+            Operation::WebFetch => self.web_fetch,
+            Operation::GitCommit => self.git_commit,
+            Operation::GitPush => self.git_push,
+            Operation::CreatePr => self.create_pr,
+            Operation::ManagePods => self.manage_pods,
+        }
+    }
+
     /// Meet operation: minimum of each capability.
     pub fn meet(&self, other: &Self) -> Self {
         Self {
