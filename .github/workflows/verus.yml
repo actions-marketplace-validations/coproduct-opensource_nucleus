@@ -6,11 +6,13 @@ on:
     paths:
       - "crates/lattice-guard-verified/**"
       - ".verus-version"
+      - ".verus-minimum-proofs"
       - ".github/workflows/verus.yml"
   pull_request:
     paths:
       - "crates/lattice-guard-verified/**"
       - ".verus-version"
+      - ".verus-minimum-proofs"
       - ".github/workflows/verus.yml"
   schedule:
     # Nightly: catch regressions from Verus toolchain updates
@@ -64,15 +66,31 @@ jobs:
           rustup default "$REQUIRED"
 
       - name: Verify lattice-guard-verified
+        id: verify
         run: |
           echo "::group::Verus verification"
-          .verus/verus-x86-linux/verus crates/lattice-guard-verified/src/lib.rs
+          .verus/verus-x86-linux/verus crates/lattice-guard-verified/src/lib.rs 2>&1 | tee /tmp/verus-output.txt
           echo "::endgroup::"
+
+      - name: Proof count regression gate
+        run: |
+          VERIFIED=$(grep -oP '\d+ verified' /tmp/verus-output.txt | grep -oP '^\d+')
+          MINIMUM=$(cat .verus-minimum-proofs | tr -d '[:space:]')
+          echo "Verified: $VERIFIED (minimum: $MINIMUM)"
+          if [ "$VERIFIED" -lt "$MINIMUM" ]; then
+            echo "::error::Verus proof count regression: $VERIFIED verified < $MINIMUM minimum"
+            exit 1
+          fi
 
       - name: Summary
         if: always()
         run: |
+          VERIFIED=$(grep -oP '\d+ verified' /tmp/verus-output.txt | grep -oP '^\d+' || echo "?")
+          ERRORS=$(grep -oP '\d+ errors' /tmp/verus-output.txt | grep -oP '^\d+' || echo "?")
+          MINIMUM=$(cat .verus-minimum-proofs | tr -d '[:space:]')
           echo "## Verus Verification Results" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Verus version:** ${{ steps.verus-version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Target:** \`crates/lattice-guard-verified/src/lib.rs\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Result:** $VERIFIED verified, $ERRORS errors" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Minimum required:** $MINIMUM" >> "$GITHUB_STEP_SUMMARY"
