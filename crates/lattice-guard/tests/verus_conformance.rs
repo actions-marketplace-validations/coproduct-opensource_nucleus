@@ -830,3 +830,251 @@ proptest! {
         prop_assert!(leaf.leq(&root), "4-hop transitivity: leaf should be ≤ root");
     }
 }
+
+// ============================================================================
+// Tier E: Constructor Fixed-Point Conformance
+//
+// Mirrors Verus proof_preset_*_is_fixed_point.
+// ============================================================================
+
+proptest! {
+    /// CONFORMANCE: normalize is idempotent on any permission (full check).
+    ///
+    /// Mirrors Verus proof_normalized_perm_is_fixed_point.
+    #[test]
+    fn conformance_normalize_idempotent_full(caps in arb_capability_lattice()) {
+        let perms = perms_with_empty_obligations(caps);
+        let once = perms.normalize();
+        let twice = once.clone().normalize();
+
+        prop_assert_eq!(
+            once.capabilities, twice.capabilities,
+            "normalize should be idempotent on capabilities"
+        );
+        for op in [Operation::RunBash, Operation::GitPush, Operation::CreatePr] {
+            prop_assert_eq!(
+                once.obligations.requires(op),
+                twice.obligations.requires(op),
+                "normalize should be idempotent on trifecta obligations for {:?}",
+                op,
+            );
+        }
+    }
+
+    /// CONFORMANCE: Delegation from normalized root preserves normalization.
+    ///
+    /// Mirrors Verus proof_delegation_preserves_fixed_point.
+    #[test]
+    fn conformance_delegation_preserves_fixed_point(
+        root_caps in arb_capability_lattice(),
+        req_caps in arb_capability_lattice(),
+    ) {
+        let root = perms_with_empty_obligations(root_caps).normalize();
+        let requested = perms_with_empty_obligations(req_caps);
+        let delegated = root.meet(&requested);
+        let renormalized = delegated.clone().normalize();
+
+        prop_assert_eq!(
+            delegated.capabilities, renormalized.capabilities,
+            "delegation from normalized root should produce normalized result"
+        );
+        for op in [Operation::RunBash, Operation::GitPush, Operation::CreatePr] {
+            prop_assert_eq!(
+                delegated.obligations.requires(op),
+                renormalized.obligations.requires(op),
+                "delegation obligations should be stable for {:?}",
+                op,
+            );
+        }
+    }
+
+    /// CONFORMANCE: 2-hop chain maintains normalization invariant.
+    ///
+    /// Mirrors Verus proof_chain_two_hop_fixed_point.
+    #[test]
+    fn conformance_chain_extension_invariant(
+        root_caps in arb_capability_lattice(),
+        req1_caps in arb_capability_lattice(),
+        req2_caps in arb_capability_lattice(),
+    ) {
+        let root = perms_with_empty_obligations(root_caps).normalize();
+        let req1 = perms_with_empty_obligations(req1_caps);
+        let req2 = perms_with_empty_obligations(req2_caps);
+
+        let mid = root.meet(&req1);
+        let leaf = mid.meet(&req2);
+
+        prop_assert!(leaf.leq(&root), "chain leaf should be \u{2264} root");
+
+        let leaf_renorm = leaf.clone().normalize();
+        prop_assert_eq!(
+            leaf.capabilities, leaf_renorm.capabilities,
+            "chain leaf should be normalized"
+        );
+    }
+
+    /// CONFORMANCE: THE CRITICAL TEST — verified chain denies exfiltration.
+    ///
+    /// Mirrors Verus proof_verified_chain_denies_exfil.
+    #[test]
+    fn conformance_verified_chain_denies_exfil(
+        root_caps in arb_capability_lattice(),
+        req_caps in arb_capability_lattice(),
+        op in arb_exfil_operation(),
+    ) {
+        let root = perms_with_empty_obligations(root_caps).normalize();
+        let leaf = root.meet(&perms_with_empty_obligations(req_caps));
+
+        if !model_is_trifecta_complete(&leaf.capabilities) {
+            return Ok(());
+        }
+
+        let exfil_active = match op {
+            Operation::RunBash => leaf.capabilities.run_bash >= CapabilityLevel::LowRisk,
+            Operation::GitPush => leaf.capabilities.git_push >= CapabilityLevel::LowRisk,
+            Operation::CreatePr => leaf.capabilities.create_pr >= CapabilityLevel::LowRisk,
+            _ => false,
+        };
+        if !exfil_active {
+            return Ok(());
+        }
+
+        let guard = GradedGuard::new(leaf);
+        let result = guard.check_operation(op);
+        prop_assert!(
+            result.value.is_err(),
+            "Chain + trifecta + exfil must DENY. Op={:?}, risk={:?}",
+            op,
+            guard.risk(),
+        );
+    }
+
+    /// CONFORMANCE: No weakening produces zero cost.
+    ///
+    /// Mirrors Verus proof_no_weakening_zero_cost.
+    #[test]
+    fn conformance_no_weakening_zero_cost(level in arb_capability_level()) {
+        use lattice_guard::weakening::WeakeningCostConfig;
+        let config = WeakeningCostConfig::default();
+        let cost = config.capability_cost(level, level);
+        prop_assert!(cost.is_zero(), "same level should produce zero cost");
+    }
+
+    /// CONFORMANCE: Trust ceiling is deflationary.
+    ///
+    /// Mirrors Verus proof_trust_ceiling_deflationary.
+    #[test]
+    fn conformance_trust_ceiling_deflationary(
+        caps in arb_capability_lattice(),
+        ceiling in arb_capability_lattice(),
+    ) {
+        let result = caps.meet(&ceiling);
+        prop_assert!(
+            result.leq(&caps),
+            "meet(caps, ceiling) should be \u{2264} caps"
+        );
+    }
+
+    /// CONFORMANCE: Trust ceiling is monotone.
+    ///
+    /// Mirrors Verus proof_trust_ceiling_monotone.
+    #[test]
+    fn conformance_trust_ceiling_monotone(
+        a in arb_capability_lattice(),
+        b in arb_capability_lattice(),
+        ceiling in arb_capability_lattice(),
+    ) {
+        if a.leq(&b) {
+            let a_enforced = a.meet(&ceiling);
+            let b_enforced = b.meet(&ceiling);
+            prop_assert!(
+                a_enforced.leq(&b_enforced),
+                "trust ceiling should be monotone"
+            );
+        }
+    }
+}
+
+/// CONFORMANCE: Each production preset is a \u{03bd}-fixed point.
+/// Mirrors Verus proof_preset_*_is_fixed_point for all 7 presets.
+#[test]
+fn conformance_preset_permissive_is_fixed_point() {
+    let p = PermissionLattice::permissive();
+    let n = p.clone().normalize();
+    assert_eq!(p.capabilities, n.capabilities, "permissive: caps unchanged");
+    for op in [Operation::RunBash, Operation::GitPush, Operation::CreatePr] {
+        assert_eq!(
+            p.obligations.requires(op),
+            n.obligations.requires(op),
+            "permissive: obligations unchanged for {:?}",
+            op,
+        );
+    }
+}
+
+#[test]
+fn conformance_preset_restrictive_is_fixed_point() {
+    let p = PermissionLattice::restrictive();
+    assert_eq!(p.capabilities, p.clone().normalize().capabilities);
+}
+
+#[test]
+fn conformance_preset_read_only_is_fixed_point() {
+    let p = PermissionLattice::read_only();
+    assert_eq!(p.capabilities, p.clone().normalize().capabilities);
+}
+
+#[test]
+fn conformance_preset_network_only_is_fixed_point() {
+    let p = PermissionLattice::network_only();
+    assert_eq!(p.capabilities, p.clone().normalize().capabilities);
+}
+
+#[test]
+fn conformance_preset_web_research_is_fixed_point() {
+    let p = PermissionLattice::web_research();
+    assert_eq!(p.capabilities, p.clone().normalize().capabilities);
+}
+
+#[test]
+fn conformance_preset_code_review_is_fixed_point() {
+    let p = PermissionLattice::code_review();
+    assert_eq!(p.capabilities, p.clone().normalize().capabilities);
+}
+
+#[test]
+fn conformance_preset_edit_only_is_fixed_point() {
+    let p = PermissionLattice::edit_only();
+    assert_eq!(p.capabilities, p.clone().normalize().capabilities);
+}
+
+/// CONFORMANCE: Untrusted profile prevents trifecta.
+///
+/// Mirrors Verus proof_untrusted_profile_no_trifecta.
+#[test]
+fn conformance_untrusted_profile_prevents_trifecta() {
+    let ceiling = CapabilityLattice {
+        read_files: CapabilityLevel::Always,
+        write_files: CapabilityLevel::LowRisk,
+        edit_files: CapabilityLevel::LowRisk,
+        run_bash: CapabilityLevel::Never,
+        glob_search: CapabilityLevel::Always,
+        grep_search: CapabilityLevel::Always,
+        web_search: CapabilityLevel::LowRisk,
+        web_fetch: CapabilityLevel::LowRisk,
+        git_commit: CapabilityLevel::LowRisk,
+        git_push: CapabilityLevel::Never,
+        create_pr: CapabilityLevel::Never,
+        manage_pods: CapabilityLevel::Never,
+    };
+
+    let all_caps = CapabilityLattice::permissive();
+    let enforced = all_caps.meet(&ceiling);
+    assert!(
+        !model_is_trifecta_complete(&enforced),
+        "untrusted ceiling must prevent trifecta even on permissive caps"
+    );
+    assert_eq!(enforced.run_bash, CapabilityLevel::Never);
+    assert_eq!(enforced.git_push, CapabilityLevel::Never);
+    assert_eq!(enforced.create_pr, CapabilityLevel::Never);
+}

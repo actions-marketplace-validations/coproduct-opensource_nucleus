@@ -2986,6 +2986,403 @@ fn exec_verify_two_step_chain(root: Perm, mid: Perm, leaf: Perm) -> (ok: bool)
     ok
 }
 
+// ============================================================================
+// Phase 5 — Tier E: Constructor Fixed-Point Proofs
+//
+// Verify that all production preset constructors produce ν-fixed points:
+// nucleus(preset) == preset. This is SECURITY_TODO #5 formally verified.
+// ============================================================================
+
+pub open spec fn preset_permissive() -> Perm {
+    let caps = CapLattice {
+        f0: 2, f1: 2, f2: 2, f3: 2, f4: 2, f5: 2,
+        f6: 2, f7: 2, f8: 2, f9: 2, f10: 2, f11: 2,
+    };
+    Perm {
+        caps: caps,
+        obs: Obs { run_bash: true, git_push: true, create_pr: true },
+        trifecta_constraint: true,
+    }
+}
+
+pub open spec fn preset_restrictive() -> Perm {
+    Perm {
+        caps: CapLattice {
+            f0: 2, f1: 0, f2: 0, f3: 0, f4: 2, f5: 2,
+            f6: 0, f7: 0, f8: 0, f9: 0, f10: 0, f11: 0,
+        },
+        obs: obs_empty(),
+        trifecta_constraint: true,
+    }
+}
+
+pub open spec fn preset_read_only() -> Perm {
+    Perm {
+        caps: CapLattice {
+            f0: 2, f1: 0, f2: 0, f3: 0, f4: 2, f5: 2,
+            f6: 0, f7: 0, f8: 0, f9: 0, f10: 0, f11: 0,
+        },
+        obs: obs_empty(),
+        trifecta_constraint: true,
+    }
+}
+
+pub open spec fn preset_network_only() -> Perm {
+    Perm {
+        caps: CapLattice {
+            f0: 0, f1: 0, f2: 0, f3: 0, f4: 0, f5: 0,
+            f6: 1, f7: 1, f8: 0, f9: 0, f10: 0, f11: 0,
+        },
+        obs: obs_empty(),
+        trifecta_constraint: true,
+    }
+}
+
+pub open spec fn preset_web_research() -> Perm {
+    Perm {
+        caps: CapLattice {
+            f0: 1, f1: 0, f2: 0, f3: 0, f4: 2, f5: 2,
+            f6: 1, f7: 1, f8: 0, f9: 0, f10: 0, f11: 0,
+        },
+        obs: obs_empty(),
+        trifecta_constraint: true,
+    }
+}
+
+pub open spec fn preset_code_review() -> Perm {
+    Perm {
+        caps: CapLattice {
+            f0: 2, f1: 0, f2: 0, f3: 0, f4: 2, f5: 2,
+            f6: 1, f7: 0, f8: 0, f9: 0, f10: 0, f11: 0,
+        },
+        obs: obs_empty(),
+        trifecta_constraint: true,
+    }
+}
+
+pub open spec fn preset_edit_only() -> Perm {
+    Perm {
+        caps: CapLattice {
+            f0: 2, f1: 1, f2: 1, f3: 0, f4: 2, f5: 2,
+            f6: 0, f7: 0, f8: 0, f9: 0, f10: 0, f11: 0,
+        },
+        obs: obs_empty(),
+        trifecta_constraint: true,
+    }
+}
+
+proof fn proof_preset_permissive_is_fixed_point()
+    ensures nucleus(preset_permissive()) == preset_permissive(),
+{}
+
+proof fn proof_preset_restrictive_is_fixed_point()
+    ensures nucleus(preset_restrictive()) == preset_restrictive(),
+{}
+
+proof fn proof_preset_read_only_is_fixed_point()
+    ensures nucleus(preset_read_only()) == preset_read_only(),
+{}
+
+proof fn proof_preset_network_only_is_fixed_point()
+    ensures nucleus(preset_network_only()) == preset_network_only(),
+{}
+
+proof fn proof_preset_web_research_is_fixed_point()
+    ensures nucleus(preset_web_research()) == preset_web_research(),
+{}
+
+proof fn proof_preset_code_review_is_fixed_point()
+    ensures nucleus(preset_code_review()) == preset_code_review(),
+{}
+
+proof fn proof_preset_edit_only_is_fixed_point()
+    ensures nucleus(preset_edit_only()) == preset_edit_only(),
+{}
+
+proof fn proof_presets_are_valid()
+    ensures
+        valid_perm(preset_permissive()),
+        valid_perm(preset_restrictive()),
+        valid_perm(preset_read_only()),
+        valid_perm(preset_network_only()),
+        valid_perm(preset_web_research()),
+        valid_perm(preset_code_review()),
+        valid_perm(preset_edit_only()),
+{}
+
+proof fn proof_normalized_perm_is_fixed_point(p: Perm)
+    requires
+        p.trifecta_constraint,
+        obs_leq(p.obs, obs_union(p.obs, trifecta_obligations(p.caps))),
+        obs_leq(obs_union(p.obs, trifecta_obligations(p.caps)), p.obs),
+    ensures
+        nucleus(p) == p,
+{}
+
+// ============================================================================
+// Phase 5 — Tier F: Delegation-Guard Composition Proofs
+//
+// THE GRAND THEOREM: verified delegation chain + trifecta → DENIED.
+// ============================================================================
+
+pub open spec fn verified_chain_invariant(root: Perm, leaf: Perm) -> bool {
+    valid_perm(root) && valid_perm(leaf)
+    && nucleus(root) == root
+    && nucleus(leaf) == leaf
+    && perm_leq(leaf, root)
+    && leaf.trifecta_constraint
+}
+
+pub open spec fn pipeline_denies_exfil(leaf: Perm, op: nat) -> bool {
+    is_trifecta_complete(leaf.caps) && is_exfil_op(op) ==>
+        !check_operation_allowed(leaf.obs, trifecta_risk_level(leaf.caps), op)
+}
+
+proof fn proof_perm_meet_preserves_trifecta(a: Perm, b: Perm)
+    requires a.trifecta_constraint || b.trifecta_constraint,
+    ensures (perm_meet(a, b)).trifecta_constraint,
+{}
+
+proof fn proof_delegation_preserves_fixed_point(root: Perm, requested: Perm)
+    requires
+        valid_perm(root),
+        valid_perm(requested),
+        nucleus(root) == root,
+    ensures
+        nucleus(perm_meet(root, requested)) == perm_meet(root, requested),
+{}
+
+proof fn proof_chain_two_hop_fixed_point(root: Perm, req1: Perm, req2: Perm)
+    requires
+        valid_perm(root),
+        valid_perm(req1),
+        valid_perm(req2),
+        valid_lattice(req1.caps),
+        valid_lattice(req2.caps),
+        nucleus(root) == root,
+    ensures
+        nucleus(perm_meet(perm_meet(root, req1), req2))
+            == perm_meet(perm_meet(root, req1), req2),
+{
+    let mid = perm_meet(root, req1);
+    proof_delegation_preserves_fixed_point(root, req1);
+    assert(nucleus(mid) == mid);
+    assert(valid_lattice(mid.caps));
+    assert(mid.trifecta_constraint);
+    let mid_perm = Perm { caps: mid.caps, obs: mid.obs, trifecta_constraint: mid.trifecta_constraint };
+    proof_delegation_preserves_fixed_point(mid_perm, req2);
+}
+
+proof fn proof_fixed_point_guard_denies_exfil(leaf: Perm, op: nat)
+    requires
+        valid_perm(leaf),
+        nucleus(leaf) == leaf,
+        is_trifecta_complete(leaf.caps),
+        is_exfil_op(op),
+        (op == 3 ==> leaf.caps.f3 >= 1),
+        (op == 9 ==> leaf.caps.f9 >= 1),
+        (op == 10 ==> leaf.caps.f10 >= 1),
+    ensures
+        !check_operation_allowed(leaf.obs, trifecta_risk_level(leaf.caps), op),
+{
+    proof_trifecta_complete_iff_count_three(leaf.caps);
+    proof_trifecta_obligations_cover_active_exfil(leaf.caps);
+}
+
+/// THE GRAND THEOREM: verified delegation chain denies exfiltration.
+proof fn proof_verified_chain_denies_exfil(root: Perm, leaf: Perm, op: nat)
+    requires
+        verified_chain_invariant(root, leaf),
+        is_trifecta_complete(leaf.caps),
+        is_exfil_op(op),
+        (op == 3 ==> leaf.caps.f3 >= 1),
+        (op == 9 ==> leaf.caps.f9 >= 1),
+        (op == 10 ==> leaf.caps.f10 >= 1),
+    ensures
+        !check_operation_allowed(leaf.obs, trifecta_risk_level(leaf.caps), op),
+{
+    assert(valid_perm(leaf));
+    assert(nucleus(leaf) == leaf);
+    proof_fixed_point_guard_denies_exfil(leaf, op);
+}
+
+proof fn proof_single_delegation_composition(root: Perm, requested: Perm)
+    requires
+        valid_perm(root),
+        valid_perm(requested),
+        valid_lattice(requested.caps),
+        nucleus(root) == root,
+    ensures
+        verified_chain_invariant(root, perm_meet(root, requested)),
+{
+    proof_delegation_preserves_fixed_point(root, requested);
+}
+
+proof fn proof_chain_extension(root: Perm, mid: Perm, requested: Perm)
+    requires
+        verified_chain_invariant(root, mid),
+        valid_perm(requested),
+        valid_lattice(requested.caps),
+    ensures
+        verified_chain_invariant(root, perm_meet(mid, requested)),
+{
+    proof_delegation_preserves_fixed_point(mid, requested);
+}
+
+proof fn proof_permissive_delegation_guard(requested: Perm, op: nat)
+    requires
+        valid_perm(requested),
+        valid_lattice(requested.caps),
+        is_exfil_op(op),
+        is_trifecta_complete(lattice_meet(preset_permissive().caps, requested.caps)),
+        (op == 3 ==> cap_meet(preset_permissive().caps.f3, requested.caps.f3) >= 1),
+        (op == 9 ==> cap_meet(preset_permissive().caps.f9, requested.caps.f9) >= 1),
+        (op == 10 ==> cap_meet(preset_permissive().caps.f10, requested.caps.f10) >= 1),
+    ensures ({
+        let leaf = perm_meet(preset_permissive(), requested);
+        !check_operation_allowed(leaf.obs, trifecta_risk_level(leaf.caps), op)
+    }),
+{
+    let root = preset_permissive();
+    proof_preset_permissive_is_fixed_point();
+    proof_single_delegation_composition(root, requested);
+    let leaf = perm_meet(root, requested);
+    proof_fixed_point_guard_denies_exfil(leaf, op);
+}
+
+fn exec_verified_chain_guard_check(
+    root: Perm, mid: Perm, leaf: Perm, op: u8
+) -> (allowed: bool)
+    requires
+        valid_perm(root),
+        valid_perm(mid),
+        valid_perm(leaf),
+        valid_lattice(root.caps),
+        valid_lattice(mid.caps),
+        valid_lattice(leaf.caps),
+        nucleus(root) == root,
+        op <= 11,
+    ensures
+        allowed ==> !(
+            perm_leq(mid, root)
+            && perm_leq(leaf, mid)
+            && is_trifecta_complete(leaf.caps)
+            && is_exfil_op(op as nat)
+            && (op == 3 ==> leaf.caps.f3 >= 1)
+            && (op == 9 ==> leaf.caps.f9 >= 1)
+            && (op == 10 ==> leaf.caps.f10 >= 1)
+        ),
+{
+    let chain_ok = exec_verify_chain_step(root, mid)
+        && exec_verify_chain_step(mid, leaf);
+
+    if !chain_ok {
+        return false;
+    }
+
+    let risk = exec_trifecta_risk(leaf.caps);
+    let allowed = exec_check_operation(leaf.obs, risk, op);
+
+    proof {
+        if is_trifecta_complete(leaf.caps)
+            && is_exfil_op(op as nat)
+            && (op == 3 ==> leaf.caps.f3 >= 1)
+            && (op == 9 ==> leaf.caps.f9 >= 1)
+            && (op == 10 ==> leaf.caps.f10 >= 1)
+        {
+            proof_trifecta_complete_iff_count_three(leaf.caps);
+            proof_trifecta_obligations_cover_active_exfil(leaf.caps);
+        }
+    }
+
+    allowed
+}
+
+// ============================================================================
+// Phase 5 — Tier G: Market Bridge Properties
+// ============================================================================
+
+pub struct CostModel {
+    pub base: nat,
+    pub trifecta_mult: nat,
+    pub isolation_mult: nat,
+}
+
+pub open spec fn cap_weakening_cost(from: CapLevel, to: CapLevel) -> nat {
+    if to > from { (to - from) as nat } else { 0 }
+}
+
+pub open spec fn trifecta_multiplier(risk_before: nat, risk_after: nat) -> nat {
+    if risk_after > risk_before {
+        (1 + (risk_after - risk_before)) as nat
+    } else {
+        1
+    }
+}
+
+pub open spec fn trust_enforce(caps: CapLattice, ceiling: CapLattice) -> CapLattice {
+    lattice_meet(caps, ceiling)
+}
+
+pub open spec fn untrusted_ceiling() -> CapLattice {
+    CapLattice {
+        f0: 2, f1: 1, f2: 1, f3: 0, f4: 2, f5: 2,
+        f6: 1, f7: 1, f8: 1, f9: 0, f10: 0, f11: 0,
+    }
+}
+
+proof fn proof_cap_cost_monotone(from: CapLevel, mid: CapLevel, to: CapLevel)
+    requires
+        valid_cap(from), valid_cap(mid), valid_cap(to),
+        cap_leq(from, mid), cap_leq(mid, to),
+    ensures
+        cap_weakening_cost(from, mid) <= cap_weakening_cost(from, to),
+{}
+
+proof fn proof_trifecta_mult_monotone(
+    risk_before: nat, risk_mid: nat, risk_after: nat
+)
+    requires risk_before <= risk_mid, risk_mid <= risk_after,
+    ensures
+        trifecta_multiplier(risk_before, risk_mid)
+            <= trifecta_multiplier(risk_before, risk_after),
+{}
+
+proof fn proof_no_weakening_zero_cost(level: CapLevel)
+    requires valid_cap(level),
+    ensures cap_weakening_cost(level, level) == 0,
+{}
+
+proof fn proof_trust_ceiling_deflationary(caps: CapLattice, ceiling: CapLattice)
+    requires valid_lattice(caps), valid_lattice(ceiling),
+    ensures lattice_leq(trust_enforce(caps, ceiling), caps),
+{}
+
+proof fn proof_trust_ceiling_monotone(
+    a: CapLattice, b: CapLattice, ceiling: CapLattice
+)
+    requires
+        valid_lattice(a), valid_lattice(b), valid_lattice(ceiling),
+        lattice_leq(a, b),
+    ensures
+        lattice_leq(trust_enforce(a, ceiling), trust_enforce(b, ceiling)),
+{}
+
+proof fn proof_untrusted_profile_no_trifecta(caps: CapLattice)
+    requires valid_lattice(caps),
+    ensures !is_trifecta_complete(trust_enforce(caps, untrusted_ceiling())),
+{
+    let result = trust_enforce(caps, untrusted_ceiling());
+    assert(result.f3 == cap_meet(caps.f3, 0));
+    assert(result.f3 == 0);
+}
+
+proof fn proof_market_cost_commutative(a: Cost, b: Cost)
+    requires valid_cost(a), valid_cost(b),
+    ensures cost_combine(a, b) == cost_combine(b, a),
+{
+    proof_cost_combine_commutative(a, b);
+}
 
 fn main() {}
 
