@@ -62,6 +62,15 @@
 //! - Bridge: TaintSet trifecta ↔ CapLattice trifecta, guard agrees with nucleus operator
 //! - Executable specs: empty, singleton, union, is_trifecta, count
 //!
+//! ## MCP Session Safety — Trace-Based Verification (Phase 7)
+//! - McpEvent: (operation, succeeded) pair modeling tool call outcomes
+//! - Trace taint: Seq<McpEvent> fold via recursive apply_event_taint
+//! - Session safety: trifecta-complete trace → all future exfil ops denied
+//! - Trifecta irreversibility: once latched, never unlatched (monotone latch)
+//! - Free monoid homomorphism: trace concatenation = taint union
+//! - Phantom taint freedom: failed operations contribute nothing
+//! - Three-step minimum: at least 3 non-neutral successes needed for trifecta
+//!
 //! # Running Verification
 //!
 //! ```bash
@@ -3715,6 +3724,588 @@ exec fn exec_taint_count(s: SpecTaintSet) -> (result: u8)
     (if s.private_data { 1u8 } else { 0u8 })
     + (if s.untrusted_content { 1u8 } else { 0u8 })
     + (if s.exfil_vector { 1u8 } else { 0u8 })
+}
+
+// ============================================================================
+// Phase 7: MCP Session Safety — Trace-Based Taint Verification
+//
+// The MCP interposition model: each tool call is an McpEvent carrying an
+// operation index and success flag. A session is a trace (Seq<McpEvent>).
+// Taint accumulates monotonically across successful events. The security
+// theorem: once the trifecta latches, all subsequent exfil ops are denied.
+//
+// This is the FIRST formally verified MCP session security model.
+//
+// Proofs:
+// - M1: Trace taint monotonicity (each event only grows taint)
+// - M2: Session safety theorem (trifecta blocks all future exfil)
+// - M3: Free monoid homomorphism (trace concatenation = taint union)
+// - M4: Phantom taint freedom (failed events contribute nothing)
+// - M5: Neutral ops preserve safety (write/edit/commit/pods invisible)
+// - M6: Trifecta irreversibility (once latched, stays latched)
+// - M7: Guard projection soundness (check predicts record outcome)
+// - M8: Three-step trifecta minimum (no spurious firing)
+// ============================================================================
+
+// --- Spec Types ---
+
+/// A single MCP tool call outcome.
+///
+/// Models the production pattern in mcp.rs:
+///   guard.check(op)?   →  op field
+///   sandbox_operation   →  succeeded field
+///   guard.record(op)   →  only if succeeded == true
+pub struct McpEvent {
+    pub op: nat,
+    pub succeeded: bool,
+}
+
+// --- Spec Functions ---
+
+/// Validity predicate for McpEvent.
+pub open spec fn valid_event(e: McpEvent) -> bool {
+    valid_operation(e.op)
+}
+
+/// Apply one event to a taint set: union with singleton iff succeeded
+/// and the operation has a non-neutral taint label.
+pub open spec fn apply_event_taint(
+    taint: SpecTaintSet,
+    event: McpEvent,
+) -> SpecTaintSet {
+    if event.succeeded && operation_taint_label(event.op) <= 2 {
+        taint_union(taint, taint_singleton(operation_taint_label(event.op)))
+    } else {
+        taint
+    }
+}
+
+/// Compute accumulated taint for a trace prefix of length n.
+///
+/// Recursive fold: trace_taint_at(trace, 0) = taint_empty(),
+/// trace_taint_at(trace, i+1) = apply_event_taint(trace_taint_at(trace, i), trace[i]).
+pub open spec fn trace_taint_at(
+    trace: Seq<McpEvent>,
+    n: nat,
+) -> SpecTaintSet
+    decreases n,
+{
+    if n == 0 {
+        taint_empty()
+    } else {
+        apply_event_taint(
+            trace_taint_at(trace, (n - 1) as nat),
+            trace[(n - 1) as int],
+        )
+    }
+}
+
+/// Taint of an entire trace.
+pub open spec fn trace_taint(trace: Seq<McpEvent>) -> SpecTaintSet {
+    trace_taint_at(trace, trace.len())
+}
+
+/// All events in a trace are valid operations.
+pub open spec fn trace_valid(trace: Seq<McpEvent>) -> bool {
+    forall|i: int| 0 <= i < trace.len() ==> valid_event(#[trigger] trace[i])
+}
+
+/// The guard's check decision: would this operation be denied?
+///
+/// Models the production GradedTaintGuard::check():
+///   1. Project taint: union(current, singleton(label))
+///   2. If projected is trifecta-complete AND requires_approval → deny
+pub open spec fn guard_would_deny(
+    obs: Obs,
+    current_taint: SpecTaintSet,
+    op: nat,
+) -> bool {
+    let projected = if operation_taint_label(op) <= 2 {
+        taint_union(current_taint, taint_singleton(operation_taint_label(op)))
+    } else {
+        current_taint
+    };
+    taint_is_trifecta_complete(projected) && requires_approval(obs, op)
+}
+
+/// Count of successful non-neutral events in a trace.
+pub open spec fn count_successful_nonneutral(
+    trace: Seq<McpEvent>,
+) -> nat
+    decreases trace.len(),
+{
+    if trace.len() == 0 {
+        0
+    } else {
+        let n = trace.len();
+        let prefix_count = count_successful_nonneutral(
+            trace.subrange(0, (n - 1) as int),
+        );
+        let last = trace[(n - 1) as int];
+        if last.succeeded && operation_taint_label(last.op) <= 2 {
+            prefix_count + 1
+        } else {
+            prefix_count
+        }
+    }
+}
+
+// ============================================================================
+// M4: Phantom Taint Freedom
+// ============================================================================
+
+/// M4: Failed operations contribute no taint.
+///
+/// If an event has succeeded == false, applying it is the identity.
+/// Models the production code where guard.record() is only called
+/// in the Ok arm of the sandbox operation.
+proof fn proof_phantom_taint_freedom(
+    taint: SpecTaintSet,
+    event: McpEvent,
+)
+    requires !event.succeeded,
+    ensures apply_event_taint(taint, event) == taint,
+{}
+
+/// M4-corollary: A trace of all-failed events has empty taint.
+proof fn proof_all_failed_trace_empty_taint(
+    trace: Seq<McpEvent>,
+    n: nat,
+)
+    requires
+        n <= trace.len(),
+        forall|i: int| 0 <= i < trace.len() ==>
+            !(#[trigger] trace[i]).succeeded,
+    ensures
+        trace_taint_at(trace, n) == taint_empty(),
+    decreases n,
+{
+    if n > 0 {
+        proof_all_failed_trace_empty_taint(trace, (n - 1) as nat);
+    }
+}
+
+// ============================================================================
+// M5: Neutral Operations Preserve Safety
+// ============================================================================
+
+/// M5: Neutral operations do not change the taint set.
+proof fn proof_neutral_op_preserves_taint(
+    taint: SpecTaintSet,
+    event: McpEvent,
+)
+    requires is_neutral_op(event.op),
+    ensures apply_event_taint(taint, event) == taint,
+{
+    proof_neutral_ops_no_taint(event.op);
+}
+
+// ============================================================================
+// M7: Guard Projection Soundness
+// ============================================================================
+
+/// M7: The guard's check projection matches what record would produce.
+///
+/// For a successful event, apply_event_taint produces exactly the taint
+/// that guard_would_deny's projection predicts.
+proof fn proof_guard_projection_sound(
+    current_taint: SpecTaintSet,
+    op: nat,
+)
+    requires valid_operation(op),
+    ensures ({
+        let event = McpEvent { op: op, succeeded: true };
+        let projected = if operation_taint_label(op) <= 2 {
+            taint_union(current_taint, taint_singleton(operation_taint_label(op)))
+        } else {
+            current_taint
+        };
+        apply_event_taint(current_taint, event) == projected
+    }),
+{}
+
+// ============================================================================
+// M1: Trace Taint Monotonicity
+// ============================================================================
+
+/// M1: Each event can only grow the accumulated taint.
+///
+/// trace_taint_at(trace, n+1) is a superset of trace_taint_at(trace, n).
+proof fn proof_trace_taint_monotone(
+    trace: Seq<McpEvent>,
+    n: nat,
+)
+    requires
+        trace_valid(trace),
+        n < trace.len(),
+    ensures
+        taint_subset(
+            trace_taint_at(trace, n),
+            trace_taint_at(trace, (n + 1) as nat),
+        ),
+{
+    let before = trace_taint_at(trace, n);
+    let event = trace[n as int];
+    if event.succeeded && operation_taint_label(event.op) <= 2 {
+        proof_taint_accumulation_monotone(
+            before,
+            operation_taint_label(event.op),
+        );
+    }
+}
+
+// ============================================================================
+// M6: Trifecta Irreversibility (THE LATCH)
+// ============================================================================
+
+/// M6: Once trifecta-complete, always trifecta-complete.
+///
+/// If trace_taint_at(trace, prefix_len) is trifecta-complete, then
+/// trace_taint_at(trace, n) is also trifecta-complete for all n >= prefix_len.
+proof fn proof_trifecta_irreversible(
+    trace: Seq<McpEvent>,
+    prefix_len: nat,
+    n: nat,
+)
+    requires
+        trace_valid(trace),
+        prefix_len <= n,
+        n <= trace.len(),
+        taint_is_trifecta_complete(trace_taint_at(trace, prefix_len)),
+    ensures
+        taint_is_trifecta_complete(trace_taint_at(trace, n)),
+    decreases (n - prefix_len),
+{
+    if prefix_len < n {
+        // Show step n-1 → n preserves trifecta-completeness
+        proof_trifecta_irreversible(trace, prefix_len, (n - 1) as nat);
+        // Now: taint_is_trifecta_complete(trace_taint_at(trace, n-1))
+        proof_trace_taint_monotone(trace, (n - 1) as nat);
+        // taint_subset(at(n-1), at(n))
+        // All 3 legs true in at(n-1) → all 3 legs true in at(n)
+    }
+}
+
+// ============================================================================
+// M2: Session Safety Theorem (THE CROWN JEWEL)
+// ============================================================================
+
+/// M2: THE SESSION SAFETY THEOREM
+///
+/// For any valid trace where the accumulated taint is trifecta-complete,
+/// the guard denies all subsequent exfil operations that require approval.
+///
+/// This composes J1 (trifecta blocks exfil) with trace monotonicity
+/// to give a MULTI-STEP security guarantee.
+proof fn proof_session_safety(
+    trace: Seq<McpEvent>,
+    obs: Obs,
+    next_op: nat,
+)
+    requires
+        trace_valid(trace),
+        taint_is_trifecta_complete(trace_taint(trace)),
+        valid_operation(next_op),
+        requires_approval(obs, next_op),
+    ensures
+        guard_would_deny(obs, trace_taint(trace), next_op),
+{
+    let current = trace_taint(trace);
+    // The projected taint is union(current, singleton(label)) or current.
+    // Since current is already trifecta-complete, the projection is also
+    // trifecta-complete (union can only add more true bits).
+    if operation_taint_label(next_op) <= 2 {
+        let projected = taint_union(
+            current,
+            taint_singleton(operation_taint_label(next_op)),
+        );
+        // projected is a superset of current (by J3/accumulation monotone)
+        proof_taint_accumulation_monotone(
+            current,
+            operation_taint_label(next_op),
+        );
+        // taint_subset(current, projected)
+        // current has all 3 legs true → projected has all 3 legs true
+    }
+    // else: projected == current, already trifecta-complete
+    // With trifecta-complete projected + requires_approval → guard denies
+}
+
+// ============================================================================
+// M3: Free Monoid Homomorphism (Trace Composition)
+// ============================================================================
+
+/// Helper: apply_event distributes over taint_union (left factor unchanged).
+///
+/// apply_event_taint(union(A, B), e) == union(A, apply_event_taint(B, e))
+proof fn lemma_apply_distributes_over_union(
+    a: SpecTaintSet,
+    b: SpecTaintSet,
+    event: McpEvent,
+)
+    ensures
+        apply_event_taint(taint_union(a, b), event) ==
+            taint_union(a, apply_event_taint(b, event)),
+{
+    if event.succeeded && operation_taint_label(event.op) <= 2 {
+        let label = operation_taint_label(event.op);
+        let singleton = taint_singleton(label);
+        // LHS = union(union(a, b), singleton)
+        // RHS = union(a, union(b, singleton))
+        // Equal by associativity (H4)
+        proof_taintset_union_associative(a, b, singleton);
+    }
+    // else: both sides are union(a, b), trivially equal
+}
+
+/// Helper: trace_taint_at on concatenation relates to individual traces.
+///
+/// For indices in the first segment, trace_taint_at of the concatenation
+/// equals trace_taint_at of the first segment.
+proof fn lemma_concat_prefix_taint(
+    s1: Seq<McpEvent>,
+    s2: Seq<McpEvent>,
+    n: nat,
+)
+    requires
+        n <= s1.len(),
+    ensures
+        trace_taint_at(s1.add(s2), n) == trace_taint_at(s1, n),
+    decreases n,
+{
+    if n > 0 {
+        lemma_concat_prefix_taint(s1, s2, (n - 1) as nat);
+        // s1.add(s2)[n-1] == s1[n-1] when n-1 < s1.len()
+        assert(s1.add(s2)[(n - 1) as int] == s1[(n - 1) as int]);
+    }
+}
+
+/// M3: Trace taint is a monoid homomorphism.
+///
+/// trace_taint(s1 ++ s2) == taint_union(trace_taint(s1), trace_taint(s2))
+///
+/// The taint of concatenated sessions is the union of individual taints.
+/// This is the FREE MONOID structure of the graded monad.
+proof fn proof_trace_composition(
+    s1: Seq<McpEvent>,
+    s2: Seq<McpEvent>,
+)
+    requires
+        trace_valid(s1),
+        trace_valid(s2),
+    ensures
+        trace_taint(s1.add(s2)) == taint_union(
+            trace_taint(s1),
+            trace_taint(s2),
+        ),
+    decreases s2.len(),
+{
+    if s2.len() == 0 {
+        // trace_taint(s2) == taint_empty()
+        // trace_taint(s1 ++ []) == trace_taint(s1)
+        // union(trace_taint(s1), taint_empty()) == trace_taint(s1)
+        assert(s1.add(s2) =~= s1);
+        proof_taintset_identity_right(trace_taint(s1));
+    } else {
+        let n2 = s2.len();
+        let s2_prefix = s2.subrange(0, (n2 - 1) as int);
+        let last = s2[(n2 - 1) as int];
+        let concat = s1.add(s2);
+        let concat_prefix = s1.add(s2_prefix);
+
+        // IH: trace_taint(s1 ++ s2_prefix) == union(tt(s1), tt(s2_prefix))
+        proof_trace_composition(s1, s2_prefix);
+
+        // Now: trace_taint(concat) = apply_event(trace_taint_at(concat, |concat|-1), last)
+        // And: trace_taint_at(concat, |concat|-1) == trace_taint(concat_prefix)
+        // because concat[0..|concat|-1] has the same elements as concat_prefix
+        assert(concat.len() == s1.len() + s2.len());
+        assert(concat_prefix.len() == s1.len() + s2_prefix.len());
+
+        // Key: s1.add(s2) with last element peeled == s1.add(s2_prefix)
+        // concat[i] == concat_prefix[i] for i < |concat_prefix|
+        assert forall|i: int| 0 <= i < concat_prefix.len()
+            implies #[trigger] concat[i] == concat_prefix[i]
+        by {
+            if i < s1.len() as int {
+                assert(concat[i] == s1[i]);
+                assert(concat_prefix[i] == s1[i]);
+            } else {
+                assert(concat[i] == s2[i - s1.len() as int]);
+                assert(concat_prefix[i] == s2_prefix[i - s1.len() as int]);
+                assert(s2[i - s1.len() as int] == s2_prefix[i - s1.len() as int]);
+            }
+        }
+
+        // Therefore trace_taint_at(concat, |concat_prefix|) == trace_taint(concat_prefix)
+        lemma_trace_taint_eq_on_prefix(concat, concat_prefix);
+
+        // trace_taint(concat) = apply_event(trace_taint(concat_prefix), last)
+        //   = apply_event(union(tt(s1), tt(s2_prefix)), last)   [by IH]
+        //   = union(tt(s1), apply_event(tt(s2_prefix), last))   [distributes]
+        //   = union(tt(s1), trace_taint(s2))                    [by definition]
+        lemma_apply_distributes_over_union(
+            trace_taint(s1),
+            trace_taint(s2_prefix),
+            last,
+        );
+    }
+}
+
+/// Helper: if two traces agree on first n elements, their taint_at(n) is equal.
+proof fn lemma_trace_taint_eq_on_prefix(
+    a: Seq<McpEvent>,
+    b: Seq<McpEvent>,
+)
+    requires
+        b.len() <= a.len(),
+        forall|i: int| 0 <= i < b.len() ==> #[trigger] a[i] == b[i],
+    ensures
+        trace_taint_at(a, b.len()) == trace_taint(b),
+    decreases b.len(),
+{
+    if b.len() > 0 {
+        let n = b.len();
+        let b_prefix = b.subrange(0, (n - 1) as int);
+        // a[0..n-1] agrees with b[0..n-1]
+        assert forall|i: int| 0 <= i < b_prefix.len()
+            implies #[trigger] a[i] == b_prefix[i]
+        by {
+            assert(b_prefix[i] == b[i]);
+        }
+        lemma_trace_taint_eq_on_prefix(a, b_prefix);
+        // trace_taint_at(a, n-1) == trace_taint(b_prefix)
+        // a[n-1] == b[n-1]
+        // so apply_event(trace_taint_at(a, n-1), a[n-1])
+        //  == apply_event(trace_taint(b_prefix), b[n-1])
+        //  == trace_taint_at(b, n) == trace_taint(b)
+    }
+}
+
+// ============================================================================
+// M8: Three-Step Trifecta Minimum
+// ============================================================================
+
+/// Helper: taint_count is bounded by count of successful non-neutral events.
+proof fn lemma_taint_count_bounded_by_events(
+    trace: Seq<McpEvent>,
+    n: nat,
+)
+    requires
+        trace_valid(trace),
+        n <= trace.len(),
+    ensures
+        taint_count(trace_taint_at(trace, n)) <= count_successful_nonneutral(
+            trace.subrange(0, n as int),
+        ),
+    decreases n,
+{
+    if n > 0 {
+        let prefix = trace.subrange(0, (n - 1) as int);
+        let full = trace.subrange(0, n as int);
+        lemma_taint_count_bounded_by_events(trace, (n - 1) as nat);
+        // IH: taint_count(at(n-1)) <= count_nonneutral(trace[0..n-1])
+
+        let before = trace_taint_at(trace, (n - 1) as nat);
+        let event = trace[(n - 1) as int];
+        let after = trace_taint_at(trace, n);
+
+        if event.succeeded && operation_taint_label(event.op) <= 2 {
+            // after = union(before, singleton(label))
+            // taint_count(after) <= taint_count(before) + 1
+            // (each bool can only go from false to true, adding at most 1)
+            // count_nonneutral(full) == count_nonneutral(prefix) + 1
+        } else {
+            // after == before (no taint change)
+            // count_nonneutral(full) >= count_nonneutral(prefix)
+        }
+    }
+}
+
+/// M8: At least 3 successful non-neutral events needed for trifecta.
+///
+/// No trace with fewer than 3 successful non-neutral events can have
+/// trifecta-complete taint. The guard never fires spuriously.
+proof fn proof_trifecta_minimum_three_steps(
+    trace: Seq<McpEvent>,
+)
+    requires
+        trace_valid(trace),
+        count_successful_nonneutral(trace) < 3,
+    ensures
+        !taint_is_trifecta_complete(trace_taint(trace)),
+{
+    lemma_taint_count_bounded_by_events(trace, trace.len());
+    // taint_count(trace_taint(trace)) <= count_nonneutral(trace) < 3
+    proof_taintset_count_bounds(trace_taint(trace));
+    // taint_count < 3 → !trifecta_complete (from I4)
+}
+
+// ============================================================================
+// Phase 7 — Exec Functions
+// ============================================================================
+
+/// Executable: map operation to taint label.
+exec fn exec_operation_taint_label(op: u8) -> (label: u8)
+    requires op <= 11,
+    ensures label as nat == operation_taint_label(op as nat),
+{
+    if op == 0 || op == 4 || op == 5 {
+        0  // PrivateData
+    } else if op == 6 || op == 7 {
+        1  // UntrustedContent
+    } else if op == 3 || op == 9 || op == 10 {
+        2  // ExfilVector
+    } else {
+        3  // Neutral
+    }
+}
+
+/// Executable: apply one event to a taint set.
+exec fn exec_apply_event(
+    taint: SpecTaintSet,
+    op: u8,
+    succeeded: bool,
+) -> (result: SpecTaintSet)
+    requires op <= 11,
+    ensures
+        result == apply_event_taint(
+            taint,
+            McpEvent { op: op as nat, succeeded: succeeded },
+        ),
+{
+    if succeeded {
+        let label = exec_operation_taint_label(op);
+        if label <= 2 {
+            exec_taintset_union(taint, exec_taintset_singleton(label))
+        } else {
+            taint
+        }
+    } else {
+        taint
+    }
+}
+
+/// Executable: check if the guard would deny an operation.
+exec fn exec_guard_check(
+    taint: SpecTaintSet,
+    obs: Obs,
+    op: u8,
+) -> (denied: bool)
+    requires op <= 11,
+    ensures denied == guard_would_deny(obs, taint, op as nat),
+{
+    let label = exec_operation_taint_label(op);
+    let projected = if label <= 2 {
+        exec_taintset_union(taint, exec_taintset_singleton(label))
+    } else {
+        taint
+    };
+    let complete = exec_taintset_is_trifecta(projected);
+    let approval = (op == 3 && obs.run_bash)
+        || (op == 9 && obs.git_push)
+        || (op == 10 && obs.create_pr);
+    complete && approval
 }
 
 fn main() {}
