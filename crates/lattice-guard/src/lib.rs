@@ -89,6 +89,7 @@ pub mod audit;
 pub mod audit_backend;
 mod budget;
 mod capability;
+pub mod certificate;
 mod command;
 pub mod constraint;
 pub mod delegation;
@@ -166,6 +167,10 @@ pub use pipeline::{
 pub use audit::{
     AuditEntry, AuditLog, ChainVerificationError, IdentityAuditSummary, PermissionEvent,
     RetentionPolicy,
+};
+pub use certificate::{
+    verify_certificate, CertificateDelegationError, CertificateError, LatticeCertificate,
+    VerifiedPermissions,
 };
 pub use delegation::{
     meet_with_justification, DelegationChain, DelegationLink, MeetJustification, RestrictionDetail,

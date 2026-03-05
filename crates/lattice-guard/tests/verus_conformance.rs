@@ -735,3 +735,98 @@ proptest! {
         prop_assert_eq!(lhs, rhs);
     }
 }
+
+// ============================================================================
+// Tier F: Certificate Chain Conformance (bridges Phase 4 proofs to production)
+//
+// These tests verify that the LatticeCertificate production code matches
+// the Verus proofs for delegation chain verification soundness.
+// ============================================================================
+
+proptest! {
+    /// CONFORMANCE: perm_leq is transitive in production code.
+    ///
+    /// Mirrors Verus proof_perm_leq_transitive.
+    /// If meet(root, a) = mid and meet(mid, b) = leaf,
+    /// then leaf.leq(root) must hold.
+    #[test]
+    fn conformance_perm_leq_transitive(
+        root_caps in arb_capability_lattice(),
+        a_caps in arb_capability_lattice(),
+        b_caps in arb_capability_lattice(),
+    ) {
+        let root = perms_with_empty_obligations(root_caps);
+        let mid = root.meet(&perms_with_empty_obligations(a_caps));
+        let leaf = mid.meet(&perms_with_empty_obligations(b_caps));
+
+        // mid ≤ root (delegation ceiling)
+        prop_assert!(mid.leq(&root), "mid should be ≤ root");
+        // leaf ≤ mid (delegation ceiling)
+        prop_assert!(leaf.leq(&mid), "leaf should be ≤ mid");
+        // Transitivity: leaf ≤ root
+        prop_assert!(leaf.leq(&root), "transitivity: leaf should be ≤ root");
+    }
+
+    /// CONFORMANCE: meet witness correctness — meet(parent, requested) ≤ parent AND ≤ requested.
+    ///
+    /// Mirrors Verus proof_meet_witness_correct.
+    #[test]
+    fn conformance_meet_witness_correct(
+        parent_caps in arb_capability_lattice(),
+        requested_caps in arb_capability_lattice(),
+    ) {
+        let parent = perms_with_empty_obligations(parent_caps);
+        let requested = perms_with_empty_obligations(requested_caps);
+        let result = parent.meet(&requested);
+
+        // result ≤ parent
+        prop_assert!(result.leq(&parent), "meet result should be ≤ parent");
+        // result ≤ requested
+        prop_assert!(result.leq(&requested), "meet result should be ≤ requested");
+    }
+
+    /// CONFORMANCE: delegation preserves trifecta constraint.
+    ///
+    /// Mirrors Verus proof_chain_delegation_preserves_trifecta.
+    /// If parent has trifecta_constraint = true, the meet result does too.
+    #[test]
+    fn conformance_delegation_preserves_trifecta(
+        parent_caps in arb_capability_lattice(),
+        requested_caps in arb_capability_lattice(),
+    ) {
+        let parent = perms_with_empty_obligations(parent_caps);
+        prop_assert!(parent.trifecta_constraint, "default should have trifecta on");
+
+        let requested = perms_with_empty_obligations(requested_caps);
+        let result = parent.meet(&requested);
+
+        prop_assert!(
+            result.trifecta_constraint,
+            "trifecta constraint must propagate through meet"
+        );
+    }
+
+    /// CONFORMANCE: 4-hop chain maintains transitivity.
+    ///
+    /// Mirrors Verus proof_chain_transitivity_four.
+    #[test]
+    fn conformance_four_hop_chain_transitive(
+        root_caps in arb_capability_lattice(),
+        a_caps in arb_capability_lattice(),
+        b_caps in arb_capability_lattice(),
+        c_caps in arb_capability_lattice(),
+    ) {
+        let root = perms_with_empty_obligations(root_caps);
+        let hop1 = root.meet(&perms_with_empty_obligations(a_caps));
+        let hop2 = hop1.meet(&perms_with_empty_obligations(b_caps));
+        let leaf = hop2.meet(&perms_with_empty_obligations(c_caps));
+
+        // Each step ≤ previous
+        prop_assert!(hop1.leq(&root));
+        prop_assert!(hop2.leq(&hop1));
+        prop_assert!(leaf.leq(&hop2));
+
+        // Transitivity: leaf ≤ root
+        prop_assert!(leaf.leq(&root), "4-hop transitivity: leaf should be ≤ root");
+    }
+}

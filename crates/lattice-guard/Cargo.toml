@@ -41,6 +41,9 @@ tracing = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
+# Ed25519 signatures for attested delegation certificates
+ring = { workspace = true }
+
 # Security: proper decimal arithmetic for budget (no f64 exploits)
 rust_decimal = { workspace = true }
 

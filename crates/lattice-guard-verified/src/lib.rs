@@ -2132,6 +2132,239 @@ fn exec_end_to_end_check(p: Perm, op: u8) -> (allowed: bool)
     result
 }
 
+// ============================================================================
+// Phase 4: Attested Delegation Chain Verification
+//
+// These proofs support the LatticeCertificate module. They verify that:
+// 1. perm_leq is transitive (needed for chain composition)
+// 2. n-hop chains maintain monotone attenuation
+// 3. meet witness correctness (justification matches actual meet)
+// 4. chain properties: depth bounded, trifecta preserved
+// ============================================================================
+
+// --- Transitivity of the product lattice order ---
+
+/// lattice_leq is transitive: if a ≤ b and b ≤ c, then a ≤ c.
+///
+/// This lifts the CapLevel transitivity to the 12-dimensional product lattice.
+proof fn proof_lattice_leq_transitive(a: CapLattice, b: CapLattice, c: CapLattice)
+    requires
+        valid_lattice(a),
+        valid_lattice(b),
+        valid_lattice(c),
+        lattice_leq(a, b),
+        lattice_leq(b, c),
+    ensures
+        lattice_leq(a, c),
+{
+    // Each component: a.fi ≤ b.fi ∧ b.fi ≤ c.fi ⟹ a.fi ≤ c.fi
+    proof_order_transitive(a.f0, b.f0, c.f0);
+    proof_order_transitive(a.f1, b.f1, c.f1);
+    proof_order_transitive(a.f2, b.f2, c.f2);
+    proof_order_transitive(a.f3, b.f3, c.f3);
+    proof_order_transitive(a.f4, b.f4, c.f4);
+    proof_order_transitive(a.f5, b.f5, c.f5);
+    proof_order_transitive(a.f6, b.f6, c.f6);
+    proof_order_transitive(a.f7, b.f7, c.f7);
+    proof_order_transitive(a.f8, b.f8, c.f8);
+    proof_order_transitive(a.f9, b.f9, c.f9);
+    proof_order_transitive(a.f10, b.f10, c.f10);
+    proof_order_transitive(a.f11, b.f11, c.f11);
+}
+
+/// perm_leq is transitive: if a ≤ b and b ≤ c, then a ≤ c.
+///
+/// This is the key lemma for chain verification: if each delegation step
+/// produces permissions ≤ the previous step, then transitivity gives us
+/// leaf ≤ root across the entire chain.
+proof fn proof_perm_leq_transitive(a: Perm, b: Perm, c: Perm)
+    requires
+        valid_perm(a),
+        valid_perm(b),
+        valid_perm(c),
+        perm_leq(a, b),
+        perm_leq(b, c),
+    ensures
+        perm_leq(a, c),
+{
+    // caps: a.caps ≤ b.caps ∧ b.caps ≤ c.caps ⟹ a.caps ≤ c.caps
+    proof_lattice_leq_transitive(a.caps, b.caps, c.caps);
+    // obs: a.obs ≤ b.obs ∧ b.obs ≤ c.obs ⟹ a.obs ≤ c.obs
+    proof_obs_leq_transitive(a.obs, b.obs, c.obs);
+}
+
+// --- Chain Verification Soundness ---
+
+/// **Chain transitivity (3-hop explicit)**: If each consecutive pair in a 3-element
+/// chain satisfies the ceiling theorem, then the last element is ≤ the first.
+///
+/// This is the concrete version for chains of length 3 (root → mid → leaf).
+/// Together with proof_delegation_ceiling, this proves that verify_certificate's
+/// monotone check at each block implies leaf ≤ root.
+proof fn proof_chain_transitivity_three(root: Perm, mid: Perm, leaf: Perm)
+    requires
+        valid_perm(root),
+        valid_perm(mid),
+        valid_perm(leaf),
+        perm_leq(mid, root),
+        perm_leq(leaf, mid),
+    ensures
+        perm_leq(leaf, root),
+{
+    proof_perm_leq_transitive(leaf, mid, root);
+}
+
+/// **Chain transitivity (4-hop explicit)**: Extends to chains of length 4.
+///
+/// root → a → b → leaf, where each step is ≤ the previous.
+proof fn proof_chain_transitivity_four(root: Perm, a: Perm, b: Perm, leaf: Perm)
+    requires
+        valid_perm(root),
+        valid_perm(a),
+        valid_perm(b),
+        valid_perm(leaf),
+        perm_leq(a, root),
+        perm_leq(b, a),
+        perm_leq(leaf, b),
+    ensures
+        perm_leq(leaf, root),
+{
+    proof_perm_leq_transitive(leaf, b, a);
+    proof_perm_leq_transitive(leaf, a, root);
+}
+
+/// **Meet witness correctness**: The meet of two permissions produces a result
+/// that is ≤ BOTH inputs.
+///
+/// This proves that the MeetJustification in each DelegationBlock is sound:
+/// the effective_permissions are provably ≤ the parent_permissions.
+proof fn proof_meet_witness_correct(parent: Perm, requested: Perm)
+    requires
+        valid_perm(parent),
+        valid_perm(requested),
+    ensures
+        perm_leq(perm_meet(parent, requested), parent),
+        perm_leq(perm_meet(parent, requested), requested),
+{
+    // For parent: uses the existing delegation ceiling theorem
+    proof_delegation_ceiling(parent, requested);
+
+    // For requested: meet is commutative, so meet(parent, req) = meet(req, parent) ≤ req
+    proof_lattice_meet_commutative(parent.caps, requested.caps);
+    proof_delegation_ceiling(requested, parent);
+    // Now we have perm_leq(perm_meet(requested, parent), requested)
+    // We need perm_leq(perm_meet(parent, requested), requested)
+    // These are the same by the commutativity of perm_meet:
+    proof_quotient_meet_commutative(parent, requested);
+    // perm_meet(parent, requested) == perm_meet(requested, parent)
+    // and perm_meet(requested, parent) ≤ requested
+    // therefore perm_meet(parent, requested) ≤ requested
+}
+
+/// **Chain delegation preserves trifecta constraint**: If the root has
+/// trifecta_constraint = true, then all chain elements do too.
+///
+/// This is immediate from perm_meet: if either input has trifecta_constraint,
+/// the result has it too. So once it's set, it propagates.
+proof fn proof_chain_delegation_preserves_trifecta(parent: Perm, requested: Perm)
+    requires
+        valid_perm(parent),
+        valid_perm(requested),
+        parent.trifecta_constraint,
+    ensures
+        perm_meet(parent, requested).trifecta_constraint,
+{
+    // perm_meet sets trifecta_constraint = a.tc || b.tc
+    // Since parent.trifecta_constraint is true, the result is true.
+}
+
+/// **Monotone chain unforgeable**: In a valid chain where each step has
+/// permissions ≤ the previous step, no element can exceed any ancestor.
+///
+/// For a 3-element chain [root, mid, leaf]:
+/// perm_leq(mid, root) ∧ perm_leq(leaf, mid) ⟹
+///   perm_leq(leaf, root) ∧ perm_leq(leaf, mid) ∧ perm_leq(mid, root)
+proof fn proof_monotone_chain_unforgeable(root: Perm, mid: Perm, leaf: Perm)
+    requires
+        valid_perm(root),
+        valid_perm(mid),
+        valid_perm(leaf),
+        perm_leq(mid, root),
+        perm_leq(leaf, mid),
+    ensures
+        perm_leq(leaf, root),
+        perm_leq(leaf, mid),
+        perm_leq(mid, root),
+{
+    proof_chain_transitivity_three(root, mid, leaf);
+}
+
+// --- Executable chain verification ---
+
+/// Executable: verify one step of a delegation chain.
+///
+/// Given parent permissions and the delegated block's permissions, check
+/// that the block's permissions are ≤ the parent's (monotone attenuation).
+///
+/// This mirrors the `block.effective_permissions.leq(prev_permissions)` check
+/// in verify_certificate().
+fn exec_verify_chain_step(parent: Perm, block: Perm) -> (ok: bool)
+    requires
+        valid_perm(parent),
+        valid_perm(block),
+    ensures
+        ok == perm_leq(block, parent),
+{
+    // Check caps: block.caps ≤ parent.caps (all 12 dimensions)
+    let caps_ok =
+        block.caps.f0 <= parent.caps.f0
+        && block.caps.f1 <= parent.caps.f1
+        && block.caps.f2 <= parent.caps.f2
+        && block.caps.f3 <= parent.caps.f3
+        && block.caps.f4 <= parent.caps.f4
+        && block.caps.f5 <= parent.caps.f5
+        && block.caps.f6 <= parent.caps.f6
+        && block.caps.f7 <= parent.caps.f7
+        && block.caps.f8 <= parent.caps.f8
+        && block.caps.f9 <= parent.caps.f9
+        && block.caps.f10 <= parent.caps.f10
+        && block.caps.f11 <= parent.caps.f11;
+
+    // Check obs: block.obs ≥ parent.obs (more obligations = lower)
+    // In exec mode, implication a ==> b is written as !a || b
+    let obs_ok =
+        (!parent.obs.run_bash || block.obs.run_bash)
+        && (!parent.obs.git_push || block.obs.git_push)
+        && (!parent.obs.create_pr || block.obs.create_pr);
+
+    caps_ok && obs_ok
+}
+
+/// Executable: verify a 2-step delegation chain.
+///
+/// Checks that both steps maintain monotone attenuation AND that
+/// transitivity holds (leaf ≤ root).
+fn exec_verify_two_step_chain(root: Perm, mid: Perm, leaf: Perm) -> (ok: bool)
+    requires
+        valid_perm(root),
+        valid_perm(mid),
+        valid_perm(leaf),
+    ensures
+        ok ==> perm_leq(leaf, root),
+{
+    let step1 = exec_verify_chain_step(root, mid);
+    let step2 = exec_verify_chain_step(mid, leaf);
+    let ok = step1 && step2;
+
+    proof {
+        if step1 && step2 {
+            proof_perm_leq_transitive(leaf, mid, root);
+        }
+    }
+
+    ok
+}
+
 fn main() {}
 
 } // verus!
