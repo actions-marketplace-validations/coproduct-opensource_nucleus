@@ -23,6 +23,9 @@
 //! ```
 
 use std::marker::PhantomData;
+use std::sync::RwLock;
+
+use sha2::{Digest, Sha256};
 
 use crate::capability::{IncompatibilityConstraint, Operation, TrifectaRisk};
 use crate::graded::Graded;
@@ -363,6 +366,461 @@ impl GradedGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime tool-call interposition
+// ---------------------------------------------------------------------------
+
+/// Runtime tool-call interposition guard.
+///
+/// Called before every tool invocation at execution time (not just delegation
+/// time). This closes the gap between static permission checking and runtime
+/// enforcement by tracking the *sequence* of operations within a session.
+///
+/// Unlike [`GradedGuard`] which checks if the *permission set* has trifecta
+/// risk, `ToolCallGuard` checks if the *execution sequence* would complete
+/// the trifecta — catching read→fetch→exfil attack chains even when
+/// individual operations pass their static permission checks.
+pub trait ToolCallGuard: Send + Sync {
+    /// Check if a tool call is permitted given the current session state.
+    ///
+    /// Returns `Ok(())` if allowed. The guard may project future risk but
+    /// does NOT update accumulated state — call [`record`] after success.
+    fn check(&self, operation: Operation) -> Result<(), GuardError>;
+
+    /// Record that an operation was successfully executed.
+    ///
+    /// Updates accumulated risk. Must be called *after* a tool call succeeds,
+    /// not before (to avoid phantom risk from failed operations).
+    fn record(&self, operation: Operation);
+
+    /// Get the current accumulated trifecta risk for this session.
+    fn accumulated_risk(&self) -> TrifectaRisk;
+
+    /// Verify tool schema integrity (rug-pull detection).
+    ///
+    /// Compares the current tool schema hash against the pinned hash from
+    /// session initialization. Returns `Err` if they differ, indicating
+    /// tools were mutated after delegation-time approval.
+    fn verify_schema(&self, current_hash: &str) -> Result<(), GuardError>;
+}
+
+/// Session-scoped runtime trifecta guard.
+///
+/// Tracks the sequence of operations executed in an MCP session and blocks
+/// operations that would complete the lethal trifecta (private data access +
+/// untrusted content + exfiltration).
+///
+/// Also pins the tool schema at session start for rug-pull detection.
+pub struct RuntimeTrifectaGuard {
+    /// The underlying permission lattice for static checks.
+    perms: PermissionLattice,
+    /// Operations executed in this session.
+    executed_ops: RwLock<Vec<Operation>>,
+    /// Current accumulated risk level.
+    accumulated_risk_state: RwLock<TrifectaRisk>,
+    /// Pinned SHA-256 of tool list at session init.
+    pinned_schema_hash: String,
+}
+
+impl RuntimeTrifectaGuard {
+    /// Create a new guard for a session.
+    ///
+    /// `tool_schemas` is a string representation of the tool list, hashed
+    /// at session start for rug-pull detection.
+    pub fn new(perms: PermissionLattice, tool_schemas: &str) -> Self {
+        let hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(tool_schemas.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        Self {
+            perms,
+            executed_ops: RwLock::new(Vec::new()),
+            accumulated_risk_state: RwLock::new(TrifectaRisk::None),
+            pinned_schema_hash: hash,
+        }
+    }
+
+    /// Compute the trifecta risk from a set of executed operations.
+    ///
+    /// This looks at which *categories* of the trifecta have been touched,
+    /// not the static capability levels. A session that has only done reads
+    /// is Low risk even if the permission set allows web_fetch.
+    fn compute_session_risk(ops: &[Operation]) -> TrifectaRisk {
+        let has_private = ops.iter().any(|op| {
+            matches!(
+                op,
+                Operation::ReadFiles | Operation::GlobSearch | Operation::GrepSearch
+            )
+        });
+        let has_untrusted = ops
+            .iter()
+            .any(|op| matches!(op, Operation::WebFetch | Operation::WebSearch));
+        let has_exfil = ops.iter().any(|op| {
+            matches!(
+                op,
+                Operation::GitPush | Operation::CreatePr | Operation::RunBash
+            )
+        });
+
+        match (has_private as u8) + (has_untrusted as u8) + (has_exfil as u8) {
+            0 => TrifectaRisk::None,
+            1 => TrifectaRisk::Low,
+            2 => TrifectaRisk::Medium,
+            _ => TrifectaRisk::Complete,
+        }
+    }
+}
+
+impl ToolCallGuard for RuntimeTrifectaGuard {
+    fn check(&self, operation: Operation) -> Result<(), GuardError> {
+        use crate::CapabilityLevel;
+
+        // 1. Check capability level (is the operation allowed at all?)
+        let level = self.perms.capabilities.level_for(operation);
+        if level == CapabilityLevel::Never {
+            return Err(GuardError::Denied {
+                reason: format!("{:?} denied: capability level is Never", operation),
+            });
+        }
+
+        // 2. Project what the session risk would be if this op executes
+        let ops = self.executed_ops.read().expect("lock poisoned");
+        let mut projected = ops.clone();
+        projected.push(operation);
+        let projected_risk = Self::compute_session_risk(&projected);
+
+        // 3. If projected risk would complete trifecta and the operation
+        //    has approval obligations, deny it. This is the runtime
+        //    interposition gate — blocks the read→fetch→exfil sequence.
+        if projected_risk == TrifectaRisk::Complete && self.perms.requires_approval(operation) {
+            let current = *self.accumulated_risk_state.read().expect("lock poisoned");
+            return Err(GuardError::Denied {
+                reason: format!(
+                    "{:?} denied: would complete trifecta (session risk: {:?} -> Complete)",
+                    operation, current,
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn record(&self, operation: Operation) {
+        let mut ops = self.executed_ops.write().expect("lock poisoned");
+        ops.push(operation);
+        let new_risk = Self::compute_session_risk(&ops);
+        *self.accumulated_risk_state.write().expect("lock poisoned") = new_risk;
+    }
+
+    fn accumulated_risk(&self) -> TrifectaRisk {
+        *self.accumulated_risk_state.read().expect("lock poisoned")
+    }
+
+    fn verify_schema(&self, current_hash: &str) -> Result<(), GuardError> {
+        if current_hash != self.pinned_schema_hash {
+            Err(GuardError::Denied {
+                reason: format!(
+                    "tool schema hash mismatch: expected {}, got {} (possible rug-pull)",
+                    self.pinned_schema_hash, current_hash
+                ),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GradedTaintGuard — the beautiful version
+//
+// Rather than tracking Vec<Operation> and rescanning O(n), this uses a
+// 3-bit semilattice (TaintSet) as the grade monoid for the Graded monad.
+// Taint accumulation is O(1) per operation and compositional by
+// construction: the monoid homomorphism λ: Operation → TaintSet
+// factors through the graded bind (>>=).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Taint labels for the three legs of the lethal trifecta.
+///
+/// These form a free semilattice (join = set union) that the graded monad
+/// carries as its grade. When the join reaches `{PrivateData, UntrustedContent,
+/// ExfilVector}`, the trifecta is complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaintLabel {
+    /// Private data was accessed (read_files, glob_search, grep_search)
+    PrivateData,
+    /// Untrusted external content was ingested (web_fetch, web_search)
+    UntrustedContent,
+    /// An exfiltration-capable operation was performed (run_bash, git_push, create_pr)
+    ExfilVector,
+}
+
+/// A taint set tracking which trifecta legs have been touched.
+///
+/// This is the grade monoid for our graded monad:
+/// - Identity: empty set (no taint)
+/// - Compose: set union (taint only accumulates, never decreases)
+///
+/// The monoid laws hold trivially: union is associative with {} as identity.
+/// This gives us O(1) taint checking vs. O(n) scanning of `Vec<Operation>`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct TaintSet {
+    private_data: bool,
+    untrusted_content: bool,
+    exfil_vector: bool,
+}
+
+impl TaintSet {
+    /// Empty taint set (no trifecta legs touched).
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Create a taint set from a single label.
+    pub fn singleton(label: TaintLabel) -> Self {
+        let mut s = Self::empty();
+        match label {
+            TaintLabel::PrivateData => s.private_data = true,
+            TaintLabel::UntrustedContent => s.untrusted_content = true,
+            TaintLabel::ExfilVector => s.exfil_vector = true,
+        }
+        s
+    }
+
+    /// Union of two taint sets (the monoid operation).
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            private_data: self.private_data || other.private_data,
+            untrusted_content: self.untrusted_content || other.untrusted_content,
+            exfil_vector: self.exfil_vector || other.exfil_vector,
+        }
+    }
+
+    /// Check if the complete trifecta is present.
+    pub fn is_trifecta_complete(&self) -> bool {
+        self.private_data && self.untrusted_content && self.exfil_vector
+    }
+
+    /// Convert to the corresponding TrifectaRisk level.
+    pub fn to_risk(&self) -> TrifectaRisk {
+        let count =
+            self.private_data as u8 + self.untrusted_content as u8 + self.exfil_vector as u8;
+        match count {
+            0 => TrifectaRisk::None,
+            1 => TrifectaRisk::Low,
+            2 => TrifectaRisk::Medium,
+            _ => TrifectaRisk::Complete,
+        }
+    }
+
+    /// Check if a specific taint label is present.
+    pub fn contains(&self, label: TaintLabel) -> bool {
+        match label {
+            TaintLabel::PrivateData => self.private_data,
+            TaintLabel::UntrustedContent => self.untrusted_content,
+            TaintLabel::ExfilVector => self.exfil_vector,
+        }
+    }
+
+    /// Number of active taint legs.
+    pub fn count(&self) -> u8 {
+        self.private_data as u8 + self.untrusted_content as u8 + self.exfil_vector as u8
+    }
+}
+
+impl std::fmt::Display for TaintSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut labels = Vec::new();
+        if self.private_data {
+            labels.push("PrivateData");
+        }
+        if self.untrusted_content {
+            labels.push("UntrustedContent");
+        }
+        if self.exfil_vector {
+            labels.push("ExfilVector");
+        }
+        if labels.is_empty() {
+            write!(f, "{{}}")
+        } else {
+            write!(f, "{{{}}}", labels.join(", "))
+        }
+    }
+}
+
+impl crate::graded::RiskGrade for TaintSet {
+    fn identity() -> Self {
+        Self::empty()
+    }
+
+    fn compose(&self, other: &Self) -> Self {
+        self.union(other)
+    }
+
+    fn requires_intervention(&self) -> bool {
+        self.is_trifecta_complete()
+    }
+}
+
+/// Classify an operation into its taint label.
+///
+/// This is the labeling function `λ: Operation → Option<TaintLabel>` that
+/// tags each tool call with which trifecta leg it contributes to.
+/// Neutral operations (WriteFiles, EditFiles, GitCommit, ManagePods)
+/// return `None` — they don't contribute to the trifecta.
+pub fn operation_taint(op: Operation) -> Option<TaintLabel> {
+    match op {
+        // Leg 1: Private data access
+        Operation::ReadFiles | Operation::GlobSearch | Operation::GrepSearch => {
+            Some(TaintLabel::PrivateData)
+        }
+        // Leg 2: Untrusted content ingestion
+        Operation::WebFetch | Operation::WebSearch => Some(TaintLabel::UntrustedContent),
+        // Leg 3: Exfiltration vectors
+        Operation::RunBash | Operation::GitPush | Operation::CreatePr => {
+            Some(TaintLabel::ExfilVector)
+        }
+        // Neutral operations
+        Operation::WriteFiles
+        | Operation::EditFiles
+        | Operation::GitCommit
+        | Operation::ManagePods => None,
+    }
+}
+
+/// Session-scoped taint-tracking guard using the graded monad.
+///
+/// Each tool call is modeled as `Graded<TaintSet, Operation>` — the taint
+/// label is the grade, the operation is the value. The session's accumulated
+/// state is the monadic composition (>>=) of all recorded tool calls.
+///
+/// This is the **beautiful** counterpart to [`RuntimeTrifectaGuard`]:
+/// - `RuntimeTrifectaGuard`: tracks `Vec<Operation>`, rescans O(n)
+/// - `GradedTaintGuard`: tracks `TaintSet` (3 bits), O(1) per check
+///
+/// Both produce identical decisions. The graded version makes the
+/// mathematical structure explicit: taint propagation is a monoid
+/// homomorphism from operation sequences to the taint semilattice.
+///
+/// # Schema Pinning
+///
+/// At session init, the full tool schema is SHA-256 hashed. Before each
+/// tool call, the schema can be verified against this pin. A mismatch
+/// indicates an MCP rug-pull attack.
+pub struct GradedTaintGuard {
+    /// Static permission lattice for this session
+    perms: PermissionLattice,
+    /// Accumulated taint from all recorded operations (the grade accumulator)
+    taint: RwLock<TaintSet>,
+    /// Pinned SHA-256 of tool schema at session init
+    pinned_schema_hash: String,
+}
+
+impl GradedTaintGuard {
+    /// Create a new session guard.
+    ///
+    /// `tool_schemas` is a canonical string representation of the available
+    /// tools, hashed at construction for rug-pull detection.
+    pub fn new(perms: PermissionLattice, tool_schemas: &str) -> Self {
+        let hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(tool_schemas.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        Self {
+            perms,
+            taint: RwLock::new(TaintSet::empty()),
+            pinned_schema_hash: hash,
+        }
+    }
+
+    /// Project what the taint set would be if this operation is added.
+    fn projected_taint(&self, operation: Operation) -> TaintSet {
+        let current = self.taint.read().expect("taint lock poisoned");
+        if let Some(label) = operation_taint(operation) {
+            current.union(&TaintSet::singleton(label))
+        } else {
+            current.clone()
+        }
+    }
+
+    /// Get the current taint set.
+    pub fn taint(&self) -> TaintSet {
+        self.taint.read().expect("taint lock poisoned").clone()
+    }
+
+    /// Get the underlying permission lattice.
+    pub fn permissions(&self) -> &PermissionLattice {
+        &self.perms
+    }
+
+    /// Get the pinned schema hash.
+    pub fn schema_hash(&self) -> &str {
+        &self.pinned_schema_hash
+    }
+}
+
+impl ToolCallGuard for GradedTaintGuard {
+    fn check(&self, operation: Operation) -> Result<(), GuardError> {
+        use crate::CapabilityLevel;
+
+        // Layer 1: Capability level check (is the operation allowed at all?)
+        let level = self.perms.capabilities.level_for(operation);
+        if level == CapabilityLevel::Never {
+            return Err(GuardError::Denied {
+                reason: format!("{:?} denied: capability level is Never", operation),
+            });
+        }
+
+        // Layer 2: Session taint projection via graded monad
+        //
+        // Model this tool call as Graded<TaintSet, Operation>:
+        //   current_taint >>= (λ _ → singleton(label))
+        //
+        // If the projected taint completes the trifecta AND this
+        // operation requires approval under trifecta, DENY.
+        if self.perms.trifecta_constraint {
+            let projected = self.projected_taint(operation);
+            if projected.is_trifecta_complete() && self.perms.requires_approval(operation) {
+                let current = self.taint.read().expect("taint lock poisoned");
+                return Err(GuardError::Denied {
+                    reason: format!(
+                        "{:?} denied: would complete trifecta (taint: {} → {})",
+                        operation, current, projected,
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn record(&self, operation: Operation) {
+        if let Some(label) = operation_taint(operation) {
+            let mut taint = self.taint.write().expect("taint lock poisoned");
+            *taint = taint.union(&TaintSet::singleton(label));
+        }
+    }
+
+    fn accumulated_risk(&self) -> TrifectaRisk {
+        self.taint.read().expect("taint lock poisoned").to_risk()
+    }
+
+    fn verify_schema(&self, current_hash: &str) -> Result<(), GuardError> {
+        if current_hash != self.pinned_schema_hash {
+            Err(GuardError::Denied {
+                reason: format!(
+                    "tool schema hash mismatch: pinned={}, current={} (possible rug-pull attack)",
+                    self.pinned_schema_hash, current_hash,
+                ),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,5 +1075,419 @@ mod tests {
         // Risk should be composed (max of both checks)
         assert_eq!(result.grade, TrifectaRisk::Low);
         assert!(result.value.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // RuntimeTrifectaGuard tests
+    // -----------------------------------------------------------------------
+
+    fn trifecta_perms() -> PermissionLattice {
+        use crate::CapabilityLevel;
+        let mut perms = PermissionLattice::default();
+        perms.capabilities.read_files = CapabilityLevel::Always;
+        perms.capabilities.web_fetch = CapabilityLevel::LowRisk;
+        perms.capabilities.run_bash = CapabilityLevel::LowRisk;
+        perms.trifecta_constraint = true;
+        perms.normalize()
+    }
+
+    #[test]
+    fn test_session_risk_accumulates() {
+        let guard = RuntimeTrifectaGuard::new(trifecta_perms(), "[]");
+
+        // Start at None
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
+
+        // Read (private data leg)
+        assert!(guard.check(Operation::ReadFiles).is_ok());
+        guard.record(Operation::ReadFiles);
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
+
+        // Fetch (untrusted content leg)
+        assert!(guard.check(Operation::WebFetch).is_ok());
+        guard.record(Operation::WebFetch);
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
+
+        // RunBash (exfil leg) — should be BLOCKED because it completes trifecta
+        let result = guard.check(Operation::RunBash);
+        assert!(
+            result.is_err(),
+            "RunBash should be blocked when completing trifecta"
+        );
+
+        // Risk stays at Medium (RunBash was not recorded)
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
+    }
+
+    #[test]
+    fn test_no_phantom_risk() {
+        let guard = RuntimeTrifectaGuard::new(trifecta_perms(), "[]");
+
+        // check() alone does NOT increase risk
+        assert!(guard.check(Operation::ReadFiles).is_ok());
+        assert!(guard.check(Operation::WebFetch).is_ok());
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
+
+        // Only record() increases risk
+        guard.record(Operation::ReadFiles);
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
+    }
+
+    #[test]
+    fn test_benign_sequence_allowed() {
+        let guard = RuntimeTrifectaGuard::new(trifecta_perms(), "[]");
+
+        // Read, glob, grep — all private data, only 1 trifecta component
+        guard.record(Operation::ReadFiles);
+        guard.record(Operation::GlobSearch);
+        guard.record(Operation::GrepSearch);
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
+
+        // More reads are always fine
+        assert!(guard.check(Operation::ReadFiles).is_ok());
+    }
+
+    #[test]
+    fn test_schema_pinning_detects_mutation() {
+        let guard = RuntimeTrifectaGuard::new(trifecta_perms(), r#"[{"name":"read"}]"#);
+
+        // Same schema: OK
+        let mut hasher = Sha256::new();
+        hasher.update(r#"[{"name":"read"}]"#.as_bytes());
+        let same_hash = format!("{:x}", hasher.finalize());
+        assert!(guard.verify_schema(&same_hash).is_ok());
+
+        // Different schema: rug-pull detected
+        let mut hasher = Sha256::new();
+        hasher.update(r#"[{"name":"read"},{"name":"evil"}]"#.as_bytes());
+        let different_hash = format!("{:x}", hasher.finalize());
+        assert!(guard.verify_schema(&different_hash).is_err());
+    }
+
+    #[test]
+    fn test_two_leg_trifecta_allows_exfil() {
+        // If only 2 of 3 trifecta legs are present in permissions,
+        // exfil should be allowed (no trifecta constraint fires)
+        use crate::CapabilityLevel;
+        let mut perms = PermissionLattice::default();
+        perms.capabilities.read_files = CapabilityLevel::Always;
+        perms.capabilities.run_bash = CapabilityLevel::LowRisk;
+        // No web_fetch — only 2 legs
+        perms.trifecta_constraint = true;
+        let perms = perms.normalize();
+
+        let guard = RuntimeTrifectaGuard::new(perms, "[]");
+
+        guard.record(Operation::ReadFiles);
+        // RunBash should be allowed — no untrusted content present
+        assert!(guard.check(Operation::RunBash).is_ok());
+        guard.record(Operation::RunBash);
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
+    }
+
+    // -----------------------------------------------------------------------
+    // TaintSet monoid laws
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_taint_set_identity() {
+        let empty = TaintSet::empty();
+        let s = TaintSet::singleton(TaintLabel::PrivateData);
+
+        // Left identity: empty ∪ s = s
+        assert_eq!(empty.union(&s), s);
+        // Right identity: s ∪ empty = s
+        assert_eq!(s.union(&empty), s);
+    }
+
+    #[test]
+    fn test_taint_set_associativity() {
+        let a = TaintSet::singleton(TaintLabel::PrivateData);
+        let b = TaintSet::singleton(TaintLabel::UntrustedContent);
+        let c = TaintSet::singleton(TaintLabel::ExfilVector);
+
+        // (a ∪ b) ∪ c = a ∪ (b ∪ c)
+        assert_eq!(a.union(&b).union(&c), a.union(&b.union(&c)));
+    }
+
+    #[test]
+    fn test_taint_set_idempotent() {
+        let s = TaintSet::singleton(TaintLabel::PrivateData);
+        // s ∪ s = s (semilattice: join is idempotent)
+        assert_eq!(s.union(&s), s);
+    }
+
+    #[test]
+    fn test_taint_set_commutative() {
+        let a = TaintSet::singleton(TaintLabel::PrivateData);
+        let b = TaintSet::singleton(TaintLabel::UntrustedContent);
+        // a ∪ b = b ∪ a
+        assert_eq!(a.union(&b), b.union(&a));
+    }
+
+    #[test]
+    fn test_taint_set_trifecta_detection() {
+        let mut taint = TaintSet::empty();
+        assert!(!taint.is_trifecta_complete());
+        assert_eq!(taint.to_risk(), TrifectaRisk::None);
+
+        taint = taint.union(&TaintSet::singleton(TaintLabel::PrivateData));
+        assert!(!taint.is_trifecta_complete());
+        assert_eq!(taint.to_risk(), TrifectaRisk::Low);
+
+        taint = taint.union(&TaintSet::singleton(TaintLabel::UntrustedContent));
+        assert!(!taint.is_trifecta_complete());
+        assert_eq!(taint.to_risk(), TrifectaRisk::Medium);
+
+        taint = taint.union(&TaintSet::singleton(TaintLabel::ExfilVector));
+        assert!(taint.is_trifecta_complete());
+        assert_eq!(taint.to_risk(), TrifectaRisk::Complete);
+    }
+
+    #[test]
+    fn test_taint_set_risk_grade_impl() {
+        use crate::graded::RiskGrade;
+
+        // Identity
+        assert_eq!(TaintSet::identity(), TaintSet::empty());
+
+        // Compose = union
+        let a = TaintSet::singleton(TaintLabel::PrivateData);
+        let b = TaintSet::singleton(TaintLabel::ExfilVector);
+        let composed = a.compose(&b);
+        assert!(composed.contains(TaintLabel::PrivateData));
+        assert!(composed.contains(TaintLabel::ExfilVector));
+        assert!(!composed.contains(TaintLabel::UntrustedContent));
+
+        // requires_intervention only at Complete
+        assert!(!a.requires_intervention());
+        assert!(!composed.requires_intervention());
+        let full = composed.compose(&TaintSet::singleton(TaintLabel::UntrustedContent));
+        assert!(full.requires_intervention());
+    }
+
+    #[test]
+    fn test_taint_set_display() {
+        assert_eq!(format!("{}", TaintSet::empty()), "{}");
+        assert_eq!(
+            format!("{}", TaintSet::singleton(TaintLabel::PrivateData)),
+            "{PrivateData}"
+        );
+        let full = TaintSet::singleton(TaintLabel::PrivateData)
+            .union(&TaintSet::singleton(TaintLabel::UntrustedContent))
+            .union(&TaintSet::singleton(TaintLabel::ExfilVector));
+        assert_eq!(
+            format!("{}", full),
+            "{PrivateData, UntrustedContent, ExfilVector}"
+        );
+    }
+
+    #[test]
+    fn test_operation_taint_classification() {
+        // Private data leg
+        assert_eq!(
+            operation_taint(Operation::ReadFiles),
+            Some(TaintLabel::PrivateData)
+        );
+        assert_eq!(
+            operation_taint(Operation::GlobSearch),
+            Some(TaintLabel::PrivateData)
+        );
+        assert_eq!(
+            operation_taint(Operation::GrepSearch),
+            Some(TaintLabel::PrivateData)
+        );
+
+        // Untrusted content leg
+        assert_eq!(
+            operation_taint(Operation::WebFetch),
+            Some(TaintLabel::UntrustedContent)
+        );
+        assert_eq!(
+            operation_taint(Operation::WebSearch),
+            Some(TaintLabel::UntrustedContent)
+        );
+
+        // Exfil vector leg
+        assert_eq!(
+            operation_taint(Operation::RunBash),
+            Some(TaintLabel::ExfilVector)
+        );
+        assert_eq!(
+            operation_taint(Operation::GitPush),
+            Some(TaintLabel::ExfilVector)
+        );
+        assert_eq!(
+            operation_taint(Operation::CreatePr),
+            Some(TaintLabel::ExfilVector)
+        );
+
+        // Neutral operations
+        assert_eq!(operation_taint(Operation::WriteFiles), None);
+        assert_eq!(operation_taint(Operation::EditFiles), None);
+        assert_eq!(operation_taint(Operation::GitCommit), None);
+        assert_eq!(operation_taint(Operation::ManagePods), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // GradedTaintGuard tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_graded_taint_guard_risk_accumulates() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        // Start at empty taint
+        assert_eq!(guard.taint(), TaintSet::empty());
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
+
+        // Read (private data)
+        assert!(guard.check(Operation::ReadFiles).is_ok());
+        guard.record(Operation::ReadFiles);
+        assert!(guard.taint().contains(TaintLabel::PrivateData));
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
+
+        // Fetch (untrusted content)
+        assert!(guard.check(Operation::WebFetch).is_ok());
+        guard.record(Operation::WebFetch);
+        assert!(guard.taint().contains(TaintLabel::UntrustedContent));
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
+
+        // RunBash (exfil) — BLOCKED: would complete trifecta
+        let result = guard.check(Operation::RunBash);
+        assert!(
+            result.is_err(),
+            "RunBash should be blocked when completing trifecta"
+        );
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
+    }
+
+    #[test]
+    fn test_graded_taint_guard_no_phantom_taint() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        // check() alone does NOT taint the session
+        assert!(guard.check(Operation::ReadFiles).is_ok());
+        assert!(guard.check(Operation::WebFetch).is_ok());
+        assert_eq!(guard.taint(), TaintSet::empty());
+
+        // Only record() taints
+        guard.record(Operation::ReadFiles);
+        assert!(guard.taint().contains(TaintLabel::PrivateData));
+    }
+
+    #[test]
+    fn test_graded_taint_guard_neutral_ops_no_taint() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        guard.record(Operation::WriteFiles);
+        guard.record(Operation::EditFiles);
+        guard.record(Operation::GitCommit);
+
+        // Neutral ops don't contribute to taint
+        assert_eq!(guard.taint(), TaintSet::empty());
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
+    }
+
+    #[test]
+    fn test_graded_taint_guard_schema_pinning() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), r#"[{"name":"read"}]"#);
+
+        // Same schema: OK
+        let same_hash = {
+            let mut h = Sha256::new();
+            h.update(r#"[{"name":"read"}]"#.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        assert!(guard.verify_schema(&same_hash).is_ok());
+
+        // Mutated schema: rug-pull detected
+        let evil_hash = {
+            let mut h = Sha256::new();
+            h.update(r#"[{"name":"read"},{"name":"evil_tool"}]"#.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        let result = guard.verify_schema(&evil_hash);
+        assert!(result.is_err());
+        if let Err(GuardError::Denied { reason }) = result {
+            assert!(
+                reason.contains("rug-pull"),
+                "error should mention rug-pull: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_graded_taint_guard_agrees_with_runtime_guard() {
+        // Both guards should make identical decisions
+        let perms = trifecta_perms();
+        let runtime = RuntimeTrifectaGuard::new(perms.clone(), "[]");
+        let graded = GradedTaintGuard::new(perms, "[]");
+
+        let ops = vec![
+            Operation::ReadFiles,
+            Operation::GlobSearch,
+            Operation::WebFetch,
+        ];
+
+        for op in &ops {
+            let r1 = runtime.check(*op);
+            let r2 = graded.check(*op);
+            assert_eq!(r1.is_ok(), r2.is_ok(), "disagreement on {:?}", op);
+
+            if r1.is_ok() {
+                runtime.record(*op);
+                graded.record(*op);
+            }
+        }
+
+        // Both should block RunBash now (trifecta complete)
+        assert!(runtime.check(Operation::RunBash).is_err());
+        assert!(graded.check(Operation::RunBash).is_err());
+
+        // Both report same risk
+        assert_eq!(runtime.accumulated_risk(), graded.accumulated_risk());
+    }
+
+    #[test]
+    fn test_graded_taint_guard_as_graded_monad() {
+        // Demonstrate the graded monad composition explicitly
+        use crate::graded::{Graded, RiskGrade};
+
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        // Model each tool call as Graded<TaintSet, Operation>
+        let read_call = Graded::new(
+            TaintSet::singleton(TaintLabel::PrivateData),
+            Operation::ReadFiles,
+        );
+        let fetch_call = Graded::new(
+            TaintSet::singleton(TaintLabel::UntrustedContent),
+            Operation::WebFetch,
+        );
+
+        // Compose via >>= (and_then): taint accumulates through the monoid
+        let composed = read_call.and_then(|_| fetch_call);
+
+        // The composed grade is the union of both taint sets
+        assert!(composed.grade.contains(TaintLabel::PrivateData));
+        assert!(composed.grade.contains(TaintLabel::UntrustedContent));
+        assert!(!composed.grade.contains(TaintLabel::ExfilVector));
+        assert_eq!(composed.grade.to_risk(), TrifectaRisk::Medium);
+
+        // Adding an exfil call would complete the trifecta
+        let exfil_call = Graded::new(
+            TaintSet::singleton(TaintLabel::ExfilVector),
+            Operation::RunBash,
+        );
+        let full = composed.and_then(|_| exfil_call);
+        assert!(full.grade.is_trifecta_complete());
+        assert!(full.grade.requires_intervention());
+
+        // This is exactly what the guard does internally, but with
+        // RwLock state instead of pure functional composition
+        guard.record(Operation::ReadFiles);
+        guard.record(Operation::WebFetch);
+        assert!(guard.check(Operation::RunBash).is_err());
     }
 }

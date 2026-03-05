@@ -134,7 +134,10 @@ pub use galois::{
     TrustDomainBridge,
 };
 pub use graded::{Graded, GradedPermissionCheck, GradedPipeline, RiskCost, RiskGrade};
-pub use guard::{CompositeGuard, GradedGuard, GuardError, GuardFn, GuardedAction, PermissionGuard};
+pub use guard::{
+    operation_taint, CompositeGuard, GradedGuard, GradedTaintGuard, GuardError, GuardFn,
+    GuardedAction, PermissionGuard, RuntimeTrifectaGuard, TaintLabel, TaintSet, ToolCallGuard,
+};
 pub use heyting::{ConditionalPermission, HeytingAlgebra};
 pub use intent::{IntentKind, WorkIntent};
 pub use isolation::{FileIsolation, IsolationLattice, NetworkIsolation, ProcessIsolation};
