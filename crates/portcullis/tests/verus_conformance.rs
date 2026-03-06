@@ -3603,3 +3603,214 @@ mod budget_monotonicity {
         assert_eq!(budget.remaining(), budget.max_cost_usd);
     }
 }
+
+// ============================================================================
+// E7: Delegation Chain Ceiling Conformance
+//
+// These tests verify that the Verus chain_ceiling model matches the production
+// PermissionLattice::meet() fold behavior for delegation chains.
+// ============================================================================
+
+/// Compute chain ceiling by folding meet over a chain of PermissionLattice values.
+/// This mirrors the Verus `chain_ceiling(chain, n)` spec function.
+fn production_chain_ceiling(chain: &[PermissionLattice]) -> PermissionLattice {
+    assert!(!chain.is_empty());
+    let mut result = chain[0].clone();
+    for link in &chain[1..] {
+        result = result.meet(link);
+    }
+    result
+}
+
+/// Create a PermissionLattice from caps with trifecta_constraint = true.
+/// This matches the Verus `valid_perm(p)` requirement.
+fn perm_from_caps_enforcing(caps: CapabilityLattice) -> PermissionLattice {
+    let mut p = perms_with_empty_obligations(caps);
+    p.trifecta_constraint = true;
+    // Apply nucleus normalization: add trifecta obligations if needed
+    let constraint = IncompatibilityConstraint::enforcing();
+    let trifecta_obs = constraint.obligations_for(&p.capabilities);
+    p.obligations = p.obligations.union(&trifecta_obs);
+    p
+}
+
+proptest! {
+    // E7.1 CONFORMANCE: Singleton chain ceiling equals the element.
+    //
+    // Mirrors Verus proof_e7_singleton_chain.
+    #[test]
+    fn conformance_e7_singleton_chain(
+        caps in arb_capability_lattice(),
+    ) {
+        let p = perm_from_caps_enforcing(caps);
+        let ceiling = production_chain_ceiling(std::slice::from_ref(&p));
+        // Caps and obligations must match (ignoring id, description, created_at)
+        assert_eq!(
+            ceiling.capabilities, p.capabilities,
+            "singleton ceiling caps must equal the element"
+        );
+    }
+
+    // E7.2 CONFORMANCE: Ceiling ≤ first element in caps dimension.
+    //
+    // Mirrors Verus proof_e7_ceiling_leq_first.
+    #[test]
+    fn conformance_e7_ceiling_leq_first(
+        caps1 in arb_capability_lattice(),
+        caps2 in arb_capability_lattice(),
+        caps3 in arb_capability_lattice(),
+    ) {
+        let chain: Vec<PermissionLattice> = vec![
+            perm_from_caps_enforcing(caps1),
+            perm_from_caps_enforcing(caps2),
+            perm_from_caps_enforcing(caps3),
+        ];
+        let ceiling = production_chain_ceiling(&chain);
+        // ceiling.capabilities ≤ chain[0].capabilities
+        assert!(
+            ceiling.capabilities.leq(&chain[0].capabilities),
+            "ceiling caps must be ≤ first link"
+        );
+    }
+
+    // E7.3 CONFORMANCE: Adding a link can only shrink the ceiling (caps).
+    //
+    // Mirrors Verus proof_e7_adding_link_shrinks.
+    #[test]
+    fn conformance_e7_adding_link_shrinks(
+        caps1 in arb_capability_lattice(),
+        caps2 in arb_capability_lattice(),
+        caps3 in arb_capability_lattice(),
+    ) {
+        let short_chain = vec![
+            perm_from_caps_enforcing(caps1.clone()),
+            perm_from_caps_enforcing(caps2.clone()),
+        ];
+        let long_chain = vec![
+            perm_from_caps_enforcing(caps1),
+            perm_from_caps_enforcing(caps2),
+            perm_from_caps_enforcing(caps3),
+        ];
+        let short_ceiling = production_chain_ceiling(&short_chain);
+        let long_ceiling = production_chain_ceiling(&long_chain);
+        // longer chain → smaller (or equal) ceiling
+        assert!(
+            long_ceiling.capabilities.leq(&short_ceiling.capabilities),
+            "adding link must not increase ceiling"
+        );
+    }
+
+    // E7.4 CONFORMANCE: Ceiling ≤ every element in the chain (caps dimension).
+    //
+    // Mirrors Verus proof_e7_ceiling_leq_first + proof_e7_ceiling_leq_last.
+    #[test]
+    fn conformance_e7_ceiling_leq_all(
+        caps in proptest::collection::vec(arb_capability_lattice(), 1..6),
+    ) {
+        let chain: Vec<PermissionLattice> = caps.iter()
+            .map(|c| perm_from_caps_enforcing(c.clone()))
+            .collect();
+        let ceiling = production_chain_ceiling(&chain);
+        for (i, link) in chain.iter().enumerate() {
+            assert!(
+                ceiling.capabilities.leq(&link.capabilities),
+                "ceiling must be ≤ chain[{}]", i
+            );
+        }
+    }
+
+    // E7.5 CONFORMANCE: Two-hop chain matches direct meet.
+    //
+    // Mirrors Verus proof_e7_two_hop_consistency.
+    #[test]
+    fn conformance_e7_two_hop_is_meet(
+        caps_a in arb_capability_lattice(),
+        caps_b in arb_capability_lattice(),
+    ) {
+        let a = perm_from_caps_enforcing(caps_a);
+        let b = perm_from_caps_enforcing(caps_b);
+        let ceiling = production_chain_ceiling(&[a.clone(), b.clone()]);
+        let direct_meet = a.meet(&b);
+        assert_eq!(
+            ceiling.capabilities, direct_meet.capabilities,
+            "2-hop ceiling caps must equal meet(a,b) caps"
+        );
+        assert_eq!(
+            ceiling.obligations, direct_meet.obligations,
+            "2-hop ceiling obligations must equal meet(a,b) obligations"
+        );
+    }
+}
+
+// E7.6 CONFORMANCE: Trifecta is monotone through ceiling.
+//
+// If the ceiling is NOT trifecta-complete, then it doesn't matter that
+// individual links had trifecta — the ceiling's reduced capabilities
+// break it.
+#[test]
+fn conformance_e7_trifecta_monotone_through_ceiling() {
+    // Chain where individual links have trifecta but ceiling doesn't
+    let full_trifecta = CapabilityLattice {
+        read_files: CapabilityLevel::Always, // private
+        web_fetch: CapabilityLevel::Always,  // untrusted
+        run_bash: CapabilityLevel::Always,   // exfil
+        ..CapabilityLattice::default()
+    };
+    let no_exfil = CapabilityLattice {
+        read_files: CapabilityLevel::Always,
+        web_fetch: CapabilityLevel::Always,
+        run_bash: CapabilityLevel::Never, // blocks exfil
+        git_push: CapabilityLevel::Never,
+        create_pr: CapabilityLevel::Never,
+        ..CapabilityLattice::default()
+    };
+
+    let chain = vec![
+        perm_from_caps_enforcing(full_trifecta),
+        perm_from_caps_enforcing(no_exfil),
+    ];
+    let ceiling = production_chain_ceiling(&chain);
+
+    // Ceiling should have no exfiltration (meet of Always and Never = Never)
+    let constraint = IncompatibilityConstraint::enforcing();
+    let risk = constraint.trifecta_risk(&ceiling.capabilities);
+    assert!(
+        risk != TrifectaRisk::Complete,
+        "ceiling should not have complete trifecta when one link blocks exfil"
+    );
+}
+
+// E7.7 CONFORMANCE: Chain ceiling is associative — order of folding doesn't matter
+// for the final result (since meet is associative and commutative).
+#[test]
+fn conformance_e7_fold_associativity() {
+    let caps_a = CapabilityLattice {
+        read_files: CapabilityLevel::Always,
+        run_bash: CapabilityLevel::LowRisk,
+        ..CapabilityLattice::default()
+    };
+    let caps_b = CapabilityLattice {
+        web_fetch: CapabilityLevel::Always,
+        git_push: CapabilityLevel::LowRisk,
+        ..CapabilityLattice::default()
+    };
+    let caps_c = CapabilityLattice {
+        read_files: CapabilityLevel::LowRisk,
+        write_files: CapabilityLevel::Always,
+        ..CapabilityLattice::default()
+    };
+
+    let a = perm_from_caps_enforcing(caps_a);
+    let b = perm_from_caps_enforcing(caps_b);
+    let c = perm_from_caps_enforcing(caps_c);
+
+    // (a meet b) meet c
+    let left = a.meet(&b).meet(&c);
+    // a meet (b meet c)
+    let right = a.meet(&b.meet(&c));
+
+    assert_eq!(
+        left.capabilities, right.capabilities,
+        "chain ceiling must be associative in caps"
+    );
+}
