@@ -160,6 +160,79 @@ impl<E: std::fmt::Display> std::fmt::Display for GuardError<E> {
 
 impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for GuardError<E> {}
 
+// ---------------------------------------------------------------------------
+// CheckProof — linear proof token for typestate protocol enforcement
+// ---------------------------------------------------------------------------
+
+/// Proof that [`ToolCallGuard::check`] succeeded.
+///
+/// This token is:
+/// - **Linear**: non-`Clone`, non-`Copy` — cannot be reused
+/// - **`#[must_use]`**: compiler warns if dropped without consumption
+/// - **Sealed**: the private `_seal` field prevents external construction
+///
+/// Rust's ownership system enforces at compile time that every
+/// `execute_and_record` call is preceded by exactly one `check`.
+/// This eliminates the TOCTOU gap between check and record that existed
+/// in the previous two-method protocol.
+#[must_use = "CheckProof must be consumed by execute_and_record()"]
+pub struct CheckProof {
+    /// The operation that was checked and approved.
+    operation: Operation,
+    /// Taint state at check time, for optimistic TOCTOU detection.
+    taint_snapshot: TaintSet,
+    /// Prevents external construction.
+    _seal: (),
+}
+
+impl CheckProof {
+    /// Get the operation this proof authorizes.
+    pub fn operation(&self) -> Operation {
+        self.operation
+    }
+}
+
+impl std::fmt::Debug for CheckProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckProof")
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExecuteError — error from execute_and_record
+// ---------------------------------------------------------------------------
+
+/// Error from [`ToolCallGuard::execute_and_record`].
+///
+/// Distinguishes between the closure failing (operation not recorded) and
+/// a TOCTOU race detected during record (operation executed but taint grew
+/// concurrently, making the operation retroactively denied).
+#[derive(Debug)]
+pub enum ExecuteError<E> {
+    /// The closure returned an error. Operation was NOT recorded.
+    OperationFailed(E),
+    /// TOCTOU detected: taint grew between check and record.
+    /// The operation DID execute, and its taint WAS recorded for consistency,
+    /// but the caller should treat this as a denial.
+    TocTouDenied {
+        /// Human-readable reason for the TOCTOU denial.
+        reason: String,
+    },
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ExecuteError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OperationFailed(e) => write!(f, "{}", e),
+            Self::TocTouDenied { reason } => write!(f, "TOCTOU: {}", reason),
+        }
+    }
+}
+
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for ExecuteError<E> {}
+
 /// Type-safe permission enforcement trait.
 ///
 /// Implementors of this trait provide runtime permission checks that
@@ -370,7 +443,7 @@ impl GradedGuard {
 // Runtime tool-call interposition
 // ---------------------------------------------------------------------------
 
-/// Runtime tool-call interposition guard.
+/// Runtime tool-call interposition guard with typestate protocol enforcement.
 ///
 /// Called before every tool invocation at execution time (not just delegation
 /// time). This closes the gap between static permission checking and runtime
@@ -380,18 +453,43 @@ impl GradedGuard {
 /// risk, `ToolCallGuard` checks if the *execution sequence* would complete
 /// the trifecta — catching read→fetch→exfil attack chains even when
 /// individual operations pass their static permission checks.
+///
+/// # Typestate Protocol
+///
+/// The two-phase protocol is enforced at compile time via [`CheckProof`]:
+///
+/// 1. `check(operation)` → returns `CheckProof` (linear, non-Clone token)
+/// 2. `execute_and_record(proof, closure)` → consumes the proof, runs the
+///    closure, and records taint atomically on success
+///
+/// Rust's ownership system guarantees that `execute_and_record` cannot be
+/// called without a preceding `check`, and the proof cannot be reused.
+/// This eliminates the TOCTOU gap of the previous check/record protocol.
 pub trait ToolCallGuard: Send + Sync {
     /// Check if a tool call is permitted given the current session state.
     ///
-    /// Returns `Ok(())` if allowed. The guard may project future risk but
-    /// does NOT update accumulated state — call [`record`] after success.
-    fn check(&self, operation: Operation) -> Result<(), GuardError>;
+    /// Returns a [`CheckProof`] token on success. The token captures a
+    /// snapshot of the taint state for optimistic TOCTOU detection.
+    /// The token MUST be consumed by [`execute_and_record`].
+    fn check(&self, operation: Operation) -> Result<CheckProof, GuardError>;
 
-    /// Record that an operation was successfully executed.
+    /// Execute an operation and record its taint atomically.
     ///
-    /// Updates accumulated risk. Must be called *after* a tool call succeeds,
-    /// not before (to avoid phantom risk from failed operations).
-    fn record(&self, operation: Operation);
+    /// Consumes the [`CheckProof`] token (compile-time linearity).
+    /// Runs the closure without holding any lock. On closure success:
+    ///
+    /// 1. Acquires write lock
+    /// 2. TOCTOU check: compares taint snapshot against current state
+    /// 3. If taint grew and re-projection would now deny → records taint
+    ///    (for consistency) but returns [`ExecuteError::TocTouDenied`]
+    /// 4. Otherwise records taint and returns `Ok(value)`
+    ///
+    /// On closure failure: does NOT record taint (no phantom risk).
+    fn execute_and_record<T, E>(
+        &self,
+        proof: CheckProof,
+        f: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, ExecuteError<E>>;
 
     /// Get the current accumulated trifecta risk for this session.
     fn accumulated_risk(&self) -> TrifectaRisk;
@@ -473,10 +571,23 @@ impl RuntimeTrifectaGuard {
             _ => TrifectaRisk::Complete,
         }
     }
+
+    /// Compute the equivalent TaintSet from a list of executed operations.
+    ///
+    /// Used to create taint snapshots for TOCTOU detection in `CheckProof`.
+    fn ops_to_taint(ops: &[Operation]) -> TaintSet {
+        let mut taint = TaintSet::empty();
+        for op in ops {
+            if let Some(label) = operation_taint(*op) {
+                taint = taint.union(&TaintSet::singleton(label));
+            }
+        }
+        taint
+    }
 }
 
 impl ToolCallGuard for RuntimeTrifectaGuard {
-    fn check(&self, operation: Operation) -> Result<(), GuardError> {
+    fn check(&self, operation: Operation) -> Result<CheckProof, GuardError> {
         use crate::CapabilityLevel;
 
         // 1. Check capability level (is the operation allowed at all?)
@@ -506,14 +617,60 @@ impl ToolCallGuard for RuntimeTrifectaGuard {
             });
         }
 
-        Ok(())
+        // Snapshot taint for TOCTOU detection
+        let taint_snapshot = Self::ops_to_taint(&ops);
+
+        Ok(CheckProof {
+            operation,
+            taint_snapshot,
+            _seal: (),
+        })
     }
 
-    fn record(&self, operation: Operation) {
+    fn execute_and_record<T, E>(
+        &self,
+        proof: CheckProof,
+        f: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, ExecuteError<E>> {
+        // Run the closure without holding any lock
+        let value = match f() {
+            Ok(v) => v,
+            Err(e) => return Err(ExecuteError::OperationFailed(e)),
+        };
+
+        // Acquire write lock for atomic TOCTOU check + record
         let mut ops = self.executed_ops.write().expect("lock poisoned");
-        ops.push(operation);
+
+        // TOCTOU detection: check if taint grew since check()
+        let current_taint = Self::ops_to_taint(&ops);
+        if current_taint != proof.taint_snapshot {
+            // Taint grew — re-validate with the new taint
+            let mut projected = ops.clone();
+            projected.push(proof.operation);
+            let projected_risk = Self::compute_session_risk(&projected);
+
+            if projected_risk == TrifectaRisk::Complete
+                && self.perms.requires_approval(proof.operation)
+            {
+                // Record anyway (operation DID execute) for taint consistency
+                ops.push(proof.operation);
+                let new_risk = Self::compute_session_risk(&ops);
+                *self.accumulated_risk_state.write().expect("lock poisoned") = new_risk;
+                return Err(ExecuteError::TocTouDenied {
+                    reason: format!(
+                        "{:?}: concurrent taint growth detected; operation would now be denied",
+                        proof.operation,
+                    ),
+                });
+            }
+        }
+
+        // Record the operation
+        ops.push(proof.operation);
         let new_risk = Self::compute_session_risk(&ops);
         *self.accumulated_risk_state.write().expect("lock poisoned") = new_risk;
+
+        Ok(value)
     }
 
     fn accumulated_risk(&self) -> TrifectaRisk {
@@ -742,7 +899,7 @@ impl GradedTaintGuard {
 }
 
 impl ToolCallGuard for GradedTaintGuard {
-    fn check(&self, operation: Operation) -> Result<(), GuardError> {
+    fn check(&self, operation: Operation) -> Result<CheckProof, GuardError> {
         use crate::CapabilityLevel;
 
         // Layer 1: Capability level check (is the operation allowed at all?)
@@ -774,12 +931,52 @@ impl ToolCallGuard for GradedTaintGuard {
             });
         }
 
-        Ok(())
+        // Snapshot taint for TOCTOU detection
+        let taint_snapshot = self.taint.read().expect("taint lock poisoned").clone();
+
+        Ok(CheckProof {
+            operation,
+            taint_snapshot,
+            _seal: (),
+        })
     }
 
-    fn record(&self, operation: Operation) {
+    fn execute_and_record<T, E>(
+        &self,
+        proof: CheckProof,
+        f: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, ExecuteError<E>> {
+        // Run the closure without holding any lock
+        let value = match f() {
+            Ok(v) => v,
+            Err(e) => return Err(ExecuteError::OperationFailed(e)),
+        };
+
+        // Acquire write lock for atomic TOCTOU check + record
         let mut taint = self.taint.write().expect("taint lock poisoned");
-        *taint = crate::taint_core::apply_record(&taint, operation);
+
+        // TOCTOU detection: check if taint grew since check()
+        if *taint != proof.taint_snapshot && self.perms.trifecta_constraint {
+            // Re-check with current (grown) taint using taint_core
+            let projected = crate::taint_core::project_taint(&taint, proof.operation);
+
+            if projected.is_trifecta_complete() && self.perms.requires_approval(proof.operation) {
+                // Record taint anyway (operation DID execute) for consistency
+                *taint = crate::taint_core::apply_record(&taint, proof.operation);
+                return Err(ExecuteError::TocTouDenied {
+                    reason: format!(
+                        "{:?}: concurrent taint growth detected ({} → {}); \
+                         operation would now be denied (projected: {})",
+                        proof.operation, proof.taint_snapshot, *taint, projected,
+                    ),
+                });
+            }
+        }
+
+        // Record the operation's taint via taint_core
+        *taint = crate::taint_core::apply_record(&taint, proof.operation);
+
+        Ok(value)
     }
 
     fn accumulated_risk(&self) -> TrifectaRisk {
@@ -804,6 +1001,15 @@ impl ToolCallGuard for GradedTaintGuard {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Test helper: check and record an operation in one call.
+    /// Panics if check or execute_and_record fails.
+    fn check_and_record(guard: &impl ToolCallGuard, op: Operation) {
+        let proof = guard.check(op).expect("check failed");
+        guard
+            .execute_and_record(proof, || Ok::<_, String>(()))
+            .expect("execute_and_record failed");
+    }
 
     struct TestPathGuard {
         blocked: Vec<String>,
@@ -1078,13 +1284,11 @@ mod tests {
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
 
         // Read (private data leg)
-        assert!(guard.check(Operation::ReadFiles).is_ok());
-        guard.record(Operation::ReadFiles);
+        check_and_record(&guard, Operation::ReadFiles);
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
 
         // Fetch (untrusted content leg)
-        assert!(guard.check(Operation::WebFetch).is_ok());
-        guard.record(Operation::WebFetch);
+        check_and_record(&guard, Operation::WebFetch);
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
 
         // RunBash (exfil leg) — should be BLOCKED because it completes trifecta
@@ -1102,13 +1306,13 @@ mod tests {
     fn test_no_phantom_risk() {
         let guard = RuntimeTrifectaGuard::new(trifecta_perms(), "[]");
 
-        // check() alone does NOT increase risk
-        assert!(guard.check(Operation::ReadFiles).is_ok());
-        assert!(guard.check(Operation::WebFetch).is_ok());
+        // check() alone does NOT increase risk (proof is dropped, not consumed)
+        let _proof1 = guard.check(Operation::ReadFiles).unwrap();
+        let _proof2 = guard.check(Operation::WebFetch).unwrap();
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
 
-        // Only record() increases risk
-        guard.record(Operation::ReadFiles);
+        // Only execute_and_record increases risk
+        check_and_record(&guard, Operation::ReadFiles);
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
     }
 
@@ -1117,9 +1321,9 @@ mod tests {
         let guard = RuntimeTrifectaGuard::new(trifecta_perms(), "[]");
 
         // Read, glob, grep — all private data, only 1 trifecta component
-        guard.record(Operation::ReadFiles);
-        guard.record(Operation::GlobSearch);
-        guard.record(Operation::GrepSearch);
+        check_and_record(&guard, Operation::ReadFiles);
+        check_and_record(&guard, Operation::GlobSearch);
+        check_and_record(&guard, Operation::GrepSearch);
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
 
         // More reads are always fine
@@ -1157,10 +1361,9 @@ mod tests {
 
         let guard = RuntimeTrifectaGuard::new(perms, "[]");
 
-        guard.record(Operation::ReadFiles);
+        check_and_record(&guard, Operation::ReadFiles);
         // RunBash should be allowed — no untrusted content present
-        assert!(guard.check(Operation::RunBash).is_ok());
-        guard.record(Operation::RunBash);
+        check_and_record(&guard, Operation::RunBash);
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
     }
 
@@ -1321,14 +1524,12 @@ mod tests {
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
 
         // Read (private data)
-        assert!(guard.check(Operation::ReadFiles).is_ok());
-        guard.record(Operation::ReadFiles);
+        check_and_record(&guard, Operation::ReadFiles);
         assert!(guard.taint().contains(TaintLabel::PrivateData));
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
 
         // Fetch (untrusted content)
-        assert!(guard.check(Operation::WebFetch).is_ok());
-        guard.record(Operation::WebFetch);
+        check_and_record(&guard, Operation::WebFetch);
         assert!(guard.taint().contains(TaintLabel::UntrustedContent));
         assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
 
@@ -1345,13 +1546,13 @@ mod tests {
     fn test_graded_taint_guard_no_phantom_taint() {
         let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
 
-        // check() alone does NOT taint the session
-        assert!(guard.check(Operation::ReadFiles).is_ok());
-        assert!(guard.check(Operation::WebFetch).is_ok());
+        // check() alone does NOT taint the session (proofs are dropped)
+        let _proof1 = guard.check(Operation::ReadFiles).unwrap();
+        let _proof2 = guard.check(Operation::WebFetch).unwrap();
         assert_eq!(guard.taint(), TaintSet::empty());
 
-        // Only record() taints
-        guard.record(Operation::ReadFiles);
+        // Only execute_and_record taints
+        check_and_record(&guard, Operation::ReadFiles);
         assert!(guard.taint().contains(TaintLabel::PrivateData));
     }
 
@@ -1359,9 +1560,9 @@ mod tests {
     fn test_graded_taint_guard_neutral_ops_no_taint() {
         let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
 
-        guard.record(Operation::WriteFiles);
-        guard.record(Operation::EditFiles);
-        guard.record(Operation::GitCommit);
+        check_and_record(&guard, Operation::WriteFiles);
+        check_and_record(&guard, Operation::EditFiles);
+        check_and_record(&guard, Operation::GitCommit);
 
         // Neutral ops don't contribute to taint
         assert_eq!(guard.taint(), TaintSet::empty());
@@ -1414,9 +1615,13 @@ mod tests {
             let r2 = graded.check(*op);
             assert_eq!(r1.is_ok(), r2.is_ok(), "disagreement on {:?}", op);
 
-            if r1.is_ok() {
-                runtime.record(*op);
-                graded.record(*op);
+            if let (Ok(p1), Ok(p2)) = (r1, r2) {
+                runtime
+                    .execute_and_record(p1, || Ok::<_, String>(()))
+                    .unwrap();
+                graded
+                    .execute_and_record(p2, || Ok::<_, String>(()))
+                    .unwrap();
             }
         }
 
@@ -1465,8 +1670,8 @@ mod tests {
 
         // This is exactly what the guard does internally, but with
         // RwLock state instead of pure functional composition
-        guard.record(Operation::ReadFiles);
-        guard.record(Operation::WebFetch);
+        check_and_record(&guard, Operation::ReadFiles);
+        check_and_record(&guard, Operation::WebFetch);
         assert!(guard.check(Operation::RunBash).is_err());
     }
 
@@ -1482,8 +1687,7 @@ mod tests {
         let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
 
         // Step 1: Read untrusted content (GitHub issue via WebFetch)
-        assert!(guard.check(Operation::WebFetch).is_ok());
-        guard.record(Operation::WebFetch);
+        check_and_record(&guard, Operation::WebFetch);
 
         // Step 2: Attempt RunBash (npm install from attacker).
         // RunBash projects PrivateData + ExfilVector (omnibus),
@@ -1506,13 +1710,27 @@ mod tests {
         let guard = RuntimeTrifectaGuard::new(perms, "[]");
 
         // WebFetch then RunBash — should complete trifecta
-        assert!(guard.check(Operation::WebFetch).is_ok());
-        guard.record(Operation::WebFetch);
+        check_and_record(&guard, Operation::WebFetch);
 
         let result = guard.check(Operation::RunBash);
         assert!(
             result.is_err(),
             "Clinejection: RuntimeTrifectaGuard must also block WebFetch → RunBash"
         );
+    }
+
+    /// Verify that execute_and_record does NOT record on closure failure
+    /// (no phantom taint from failed operations).
+    #[test]
+    fn test_execute_and_record_no_phantom_on_failure() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        let proof = guard.check(Operation::ReadFiles).unwrap();
+        let result = guard.execute_and_record(proof, || Err::<(), _>("io error"));
+        assert!(result.is_err());
+
+        // Taint should be empty — failed operation not recorded
+        assert_eq!(guard.taint(), TaintSet::empty());
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
     }
 }

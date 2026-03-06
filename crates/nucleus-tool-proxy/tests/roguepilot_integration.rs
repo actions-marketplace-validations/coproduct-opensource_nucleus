@@ -16,6 +16,14 @@ use portcullis::{
     CapabilityLevel, GradedTaintGuard, Operation, PermissionLattice, TaintLabel, TaintSet,
     ToolCallGuard, TrifectaRisk,
 };
+
+/// Test helper: check and record an operation in one call.
+fn check_and_record(guard: &impl ToolCallGuard, op: Operation) {
+    let proof = guard.check(op).expect("check failed");
+    guard
+        .execute_and_record(proof, || Ok::<_, String>(()))
+        .expect("execute_and_record failed");
+}
 use tempfile::tempdir;
 
 // ---------------------------------------------------------------------------
@@ -100,7 +108,8 @@ fn test_symlink_read_mcp_parity() {
     let guard = GradedTaintGuard::new(policy, "[]");
 
     // Guard allows the operation (capability check passes)
-    assert!(guard.check(Operation::ReadFiles).is_ok());
+    let _proof = guard.check(Operation::ReadFiles);
+    assert!(_proof.is_ok());
 
     // But cap-std blocks the symlink escape
     let result = sandbox.read_to_string("escape.txt");
@@ -194,14 +203,12 @@ fn test_trifecta_blocks_exfiltration_sequence() {
     assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
 
     // Step 1: Read files (private data leg)
-    assert!(guard.check(Operation::ReadFiles).is_ok());
-    guard.record(Operation::ReadFiles);
+    check_and_record(&guard, Operation::ReadFiles);
     assert!(guard.taint().contains(TaintLabel::PrivateData));
     assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
 
     // Step 2: Web fetch (untrusted content leg)
-    assert!(guard.check(Operation::WebFetch).is_ok());
-    guard.record(Operation::WebFetch);
+    check_and_record(&guard, Operation::WebFetch);
     assert!(guard.taint().contains(TaintLabel::UntrustedContent));
     assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
 
@@ -315,12 +322,11 @@ fn test_full_rogue_pilot_chain() {
     // ── Attack Step 1c: Read a legitimate file (succeeds) ──
     let result = sandbox.read_to_string("src/main.rs");
     assert!(result.is_ok(), "legit read should work");
-    guard.record(Operation::ReadFiles);
+    check_and_record(&guard, Operation::ReadFiles);
 
     // ── Attack Step 2: Web fetch (ingests untrusted content) ──
     // The guard allows this (only 2 trifecta legs so far)
-    assert!(guard.check(Operation::WebFetch).is_ok());
-    guard.record(Operation::WebFetch);
+    check_and_record(&guard, Operation::WebFetch);
     assert_eq!(guard.accumulated_risk(), TrifectaRisk::Medium);
 
     // ── Attack Step 3: Exfiltrate via curl/bash ──

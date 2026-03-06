@@ -2128,3 +2128,128 @@ mod structural_bisimulation {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFORMANCE P: Protocol Linearity (typestate automaton)
+//
+// These tests verify that the production GradedTaintGuard and
+// RuntimeTrifectaGuard enforce the check → execute_and_record protocol,
+// matching the Verus 2-state automaton proofs (P1–P5).
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod protocol_conformance {
+    use portcullis::{
+        CapabilityLevel, GradedTaintGuard, Operation, PermissionLattice, RuntimeTrifectaGuard,
+        ToolCallGuard, TrifectaRisk,
+    };
+
+    fn trifecta_perms() -> PermissionLattice {
+        let mut perms = PermissionLattice::default();
+        perms.capabilities.read_files = CapabilityLevel::Always;
+        perms.capabilities.web_fetch = CapabilityLevel::LowRisk;
+        perms.capabilities.run_bash = CapabilityLevel::LowRisk;
+        perms.trifecta_constraint = true;
+        perms.normalize()
+    }
+
+    /// P1 conformance: execute_and_record requires a CheckProof.
+    /// This is enforced at compile time — if you comment out the check(),
+    /// the code won't compile. This test verifies the runtime behavior
+    /// matches: check() produces a proof, execute_and_record() consumes it.
+    #[test]
+    fn conformance_p1_check_before_record() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        // Must call check() first to get a proof
+        let proof = guard.check(Operation::ReadFiles).unwrap();
+        // Proof is consumed by execute_and_record
+        let result = guard.execute_and_record(proof, || Ok::<_, String>(()));
+        assert!(result.is_ok());
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
+    }
+
+    /// P2/P3 conformance: check → execute_and_record cycle works for both guards.
+    #[test]
+    fn conformance_p2_p3_cycle_both_guards() {
+        let perms = trifecta_perms();
+        let graded = GradedTaintGuard::new(perms.clone(), "[]");
+        let runtime = RuntimeTrifectaGuard::new(perms, "[]");
+
+        // Both guards should support the check → execute_and_record cycle
+        let p1 = graded.check(Operation::ReadFiles).unwrap();
+        graded
+            .execute_and_record(p1, || Ok::<_, String>(()))
+            .unwrap();
+
+        let p2 = runtime.check(Operation::ReadFiles).unwrap();
+        runtime
+            .execute_and_record(p2, || Ok::<_, String>(()))
+            .unwrap();
+
+        assert_eq!(graded.accumulated_risk(), runtime.accumulated_risk());
+    }
+
+    /// P4 conformance: dropping a CheckProof without consuming it does NOT
+    /// record taint (no phantom risk from unconsumed proofs).
+    #[test]
+    fn conformance_p4_dropped_proof_no_phantom() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        // Get a proof but don't consume it
+        let _proof = guard.check(Operation::ReadFiles).unwrap();
+        // Drop the proof (goes out of scope)
+        drop(_proof);
+
+        // Taint should be empty — proof was not consumed
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
+    }
+
+    /// P5 conformance: the protocol is deterministic — check always
+    /// succeeds or fails consistently given the same taint state.
+    #[test]
+    fn conformance_p5_deterministic_check() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        // Two checks for the same operation should both succeed
+        let proof1 = guard.check(Operation::ReadFiles);
+        let proof2 = guard.check(Operation::ReadFiles);
+        assert!(proof1.is_ok());
+        assert!(proof2.is_ok());
+
+        // Consume one, drop the other
+        guard
+            .execute_and_record(proof1.unwrap(), || Ok::<_, String>(()))
+            .unwrap();
+        drop(proof2);
+
+        // After tainting with WebFetch, RunBash check consistently fails
+        let proof3 = guard.check(Operation::WebFetch).unwrap();
+        guard
+            .execute_and_record(proof3, || Ok::<_, String>(()))
+            .unwrap();
+
+        let r1 = guard.check(Operation::RunBash);
+        let r2 = guard.check(Operation::RunBash);
+        assert!(r1.is_err());
+        assert!(r2.is_err());
+    }
+
+    /// Execute_and_record with failed closure does NOT record taint.
+    #[test]
+    fn conformance_closure_failure_no_taint() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        let proof = guard.check(Operation::ReadFiles).unwrap();
+        let result = guard.execute_and_record(proof, || Err::<(), _>("simulated IO error"));
+        assert!(result.is_err());
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::None);
+
+        // Can still do a successful check → record
+        let proof2 = guard.check(Operation::ReadFiles).unwrap();
+        guard
+            .execute_and_record(proof2, || Ok::<_, String>(()))
+            .unwrap();
+        assert_eq!(guard.accumulated_risk(), TrifectaRisk::Low);
+    }
+}
