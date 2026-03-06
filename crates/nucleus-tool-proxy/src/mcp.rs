@@ -150,19 +150,17 @@ impl NucleusMcpServer {
         &self,
         Parameters(params): Parameters<ReadParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = self.guard.check(Operation::ReadFiles) {
-            return Ok(err_result(e));
-        }
+        let proof = match self.guard.check(Operation::ReadFiles) {
+            Ok(p) => p,
+            Err(e) => return Ok(err_result(e)),
+        };
 
-        let result = tokio::task::block_in_place(|| {
-            self.state.runtime.sandbox().read_to_string(&params.path)
-        });
-
-        match result {
-            Ok(contents) => {
-                self.guard.record(Operation::ReadFiles);
-                Ok(CallToolResult::success(vec![Content::text(contents)]))
-            }
+        match self.guard.execute_and_record(proof, || {
+            tokio::task::block_in_place(|| {
+                self.state.runtime.sandbox().read_to_string(&params.path)
+            })
+        }) {
+            Ok(contents) => Ok(CallToolResult::success(vec![Content::text(contents)])),
             Err(e) => Ok(err_result(e)),
         }
     }
@@ -176,22 +174,20 @@ impl NucleusMcpServer {
         &self,
         Parameters(params): Parameters<WriteParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = self.guard.check(Operation::WriteFiles) {
-            return Ok(err_result(e));
-        }
+        let proof = match self.guard.check(Operation::WriteFiles) {
+            Ok(p) => p,
+            Err(e) => return Ok(err_result(e)),
+        };
 
-        let result = tokio::task::block_in_place(|| {
-            self.state
-                .runtime
-                .sandbox()
-                .write(&params.path, params.contents.as_bytes())
-        });
-
-        match result {
-            Ok(()) => {
-                self.guard.record(Operation::WriteFiles);
-                Ok(CallToolResult::success(vec![Content::text("ok")]))
-            }
+        match self.guard.execute_and_record(proof, || {
+            tokio::task::block_in_place(|| {
+                self.state
+                    .runtime
+                    .sandbox()
+                    .write(&params.path, params.contents.as_bytes())
+            })
+        }) {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text("ok")])),
             Err(e) => Ok(err_result(e)),
         }
     }
@@ -211,21 +207,21 @@ impl NucleusMcpServer {
             return Ok(err_result("args must not be empty"));
         }
 
-        if let Err(e) = self.guard.check(Operation::RunBash) {
-            return Ok(err_result(e));
-        }
+        let proof = match self.guard.check(Operation::RunBash) {
+            Ok(p) => p,
+            Err(e) => return Ok(err_result(e)),
+        };
 
-        let result = tokio::task::block_in_place(|| {
-            self.state.runtime.executor().run_args(
-                &params.args,
-                params.stdin.as_deref(),
-                params.directory.as_deref(),
-            )
-        });
-
-        match result {
+        match self.guard.execute_and_record(proof, || {
+            tokio::task::block_in_place(|| {
+                self.state.runtime.executor().run_args(
+                    &params.args,
+                    params.stdin.as_deref(),
+                    params.directory.as_deref(),
+                )
+            })
+        }) {
             Ok(output) => {
-                self.guard.record(Operation::RunBash);
                 let run_result = RunResult {
                     exit_code: output.status.code().unwrap_or(-1),
                     stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -247,9 +243,10 @@ impl NucleusMcpServer {
         &self,
         Parameters(params): Parameters<GlobParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = self.guard.check(Operation::GlobSearch) {
-            return Ok(err_result(e));
-        }
+        let proof = match self.guard.check(Operation::GlobSearch) {
+            Ok(p) => p,
+            Err(e) => return Ok(err_result(e)),
+        };
 
         // Check capability level
         let level = self.state.runtime.policy().capabilities.glob_search;
@@ -258,61 +255,58 @@ impl NucleusMcpServer {
         }
 
         let state = self.state.clone();
-        let result = tokio::task::block_in_place(move || -> Result<Vec<String>, String> {
-            let sandbox_root = state.runtime.sandbox().root_path();
-            let sandbox_canonical = sandbox_root
-                .canonicalize()
-                .map_err(|e| format!("sandbox root error: {e}"))?;
-
-            // Resolve search root within sandbox
-            let search_root = if let Some(ref root) = params.root {
-                let root_path = std::path::Path::new(root);
-                if root_path.is_absolute() {
-                    return Err(format!("absolute paths not allowed: {root}"));
-                }
-                let resolved = sandbox_root.join(root);
-                let canonical = resolved
+        match self.guard.execute_and_record(proof, || {
+            tokio::task::block_in_place(move || -> Result<Vec<String>, String> {
+                let sandbox_root = state.runtime.sandbox().root_path();
+                let sandbox_canonical = sandbox_root
                     .canonicalize()
-                    .map_err(|e| format!("path resolution error: {e}"))?;
-                if !canonical.starts_with(&sandbox_canonical) {
-                    return Err(format!("path escapes sandbox: {root}"));
-                }
-                canonical
-            } else {
-                sandbox_canonical.clone()
-            };
+                    .map_err(|e| format!("sandbox root error: {e}"))?;
 
-            let full_pattern = search_root.join(&params.pattern);
-            let pattern_str = full_pattern.to_string_lossy();
+                // Resolve search root within sandbox
+                let search_root = if let Some(ref root) = params.root {
+                    let root_path = std::path::Path::new(root);
+                    if root_path.is_absolute() {
+                        return Err(format!("absolute paths not allowed: {root}"));
+                    }
+                    let resolved = sandbox_root.join(root);
+                    let canonical = resolved
+                        .canonicalize()
+                        .map_err(|e| format!("path resolution error: {e}"))?;
+                    if !canonical.starts_with(&sandbox_canonical) {
+                        return Err(format!("path escapes sandbox: {root}"));
+                    }
+                    canonical
+                } else {
+                    sandbox_canonical.clone()
+                };
 
-            let mut results = Vec::new();
-            let entries =
-                glob::glob(&pattern_str).map_err(|e| format!("invalid glob pattern: {e}"))?;
+                let full_pattern = search_root.join(&params.pattern);
+                let pattern_str = full_pattern.to_string_lossy();
 
-            for entry in entries {
-                if let Ok(path) = entry {
-                    if let Ok(canonical) = path.canonicalize() {
-                        if canonical.starts_with(&sandbox_canonical) {
-                            if let Ok(relative) = canonical.strip_prefix(&sandbox_canonical) {
-                                results.push(relative.to_string_lossy().to_string());
+                let mut results = Vec::new();
+                let entries =
+                    glob::glob(&pattern_str).map_err(|e| format!("invalid glob pattern: {e}"))?;
+
+                for entry in entries {
+                    if let Ok(path) = entry {
+                        if let Ok(canonical) = path.canonicalize() {
+                            if canonical.starts_with(&sandbox_canonical) {
+                                if let Ok(relative) = canonical.strip_prefix(&sandbox_canonical) {
+                                    results.push(relative.to_string_lossy().to_string());
+                                }
                             }
                         }
                     }
+                    if results.len() >= 1000 {
+                        break;
+                    }
                 }
-                if results.len() >= 1000 {
-                    break;
-                }
-            }
-            Ok(results)
-        });
-
-        match result {
-            Ok(paths) => {
-                self.guard.record(Operation::GlobSearch);
-                Ok(CallToolResult::success(vec![Content::text(
-                    paths.join("\n"),
-                )]))
-            }
+                Ok(results)
+            })
+        }) {
+            Ok(paths) => Ok(CallToolResult::success(vec![Content::text(
+                paths.join("\n"),
+            )])),
             Err(e) => Ok(err_result(e)),
         }
     }
@@ -326,9 +320,10 @@ impl NucleusMcpServer {
         &self,
         Parameters(params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = self.guard.check(Operation::GrepSearch) {
-            return Ok(err_result(e));
-        }
+        let proof = match self.guard.check(Operation::GrepSearch) {
+            Ok(p) => p,
+            Err(e) => return Ok(err_result(e)),
+        };
 
         let level = self.state.runtime.policy().capabilities.grep_search;
         if level == CapabilityLevel::Never {
@@ -336,119 +331,119 @@ impl NucleusMcpServer {
         }
 
         let state = self.state.clone();
-        let result = tokio::task::block_in_place(move || -> Result<String, String> {
-            let sandbox_root = state.runtime.sandbox().root_path();
-            let sandbox_canonical = sandbox_root
-                .canonicalize()
-                .map_err(|e| format!("sandbox root error: {e}"))?;
-
-            // Resolve search path within sandbox
-            let search_path = if let Some(ref path) = params.path {
-                let p = std::path::Path::new(path);
-                if p.is_absolute() {
-                    return Err(format!("absolute paths not allowed: {path}"));
-                }
-                let resolved = sandbox_root.join(path);
-                let canonical = resolved
+        match self.guard.execute_and_record(proof, || {
+            tokio::task::block_in_place(move || -> Result<String, String> {
+                let sandbox_root = state.runtime.sandbox().root_path();
+                let sandbox_canonical = sandbox_root
                     .canonicalize()
-                    .map_err(|e| format!("path resolution error: {e}"))?;
-                if !canonical.starts_with(&sandbox_canonical) {
-                    return Err(format!("path escapes sandbox: {path}"));
-                }
-                canonical
-            } else {
-                sandbox_canonical.clone()
-            };
+                    .map_err(|e| format!("sandbox root error: {e}"))?;
 
-            let re =
-                regex::Regex::new(&params.pattern).map_err(|e| format!("invalid regex: {e}"))?;
-
-            let include_glob = params.include.as_deref();
-            let ctx = params.context_lines.unwrap_or(0) as usize;
-            let mut output = String::new();
-            let mut match_count = 0usize;
-            const MAX_MATCHES: usize = 5000;
-
-            for entry in walkdir::WalkDir::new(&search_path)
-                .follow_links(false) // Never follow symlinks
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                // Skip symlinks explicitly
-                if entry.file_type().is_symlink() {
-                    continue;
-                }
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-
-                // Verify canonical path is within sandbox
-                let canonical = match entry.path().canonicalize() {
-                    Ok(c) => c,
-                    Err(_) => continue,
+                // Resolve search path within sandbox
+                let search_path = if let Some(ref path) = params.path {
+                    let p = std::path::Path::new(path);
+                    if p.is_absolute() {
+                        return Err(format!("absolute paths not allowed: {path}"));
+                    }
+                    let resolved = sandbox_root.join(path);
+                    let canonical = resolved
+                        .canonicalize()
+                        .map_err(|e| format!("path resolution error: {e}"))?;
+                    if !canonical.starts_with(&sandbox_canonical) {
+                        return Err(format!("path escapes sandbox: {path}"));
+                    }
+                    canonical
+                } else {
+                    sandbox_canonical.clone()
                 };
-                if !canonical.starts_with(&sandbox_canonical) {
-                    continue;
-                }
 
-                // Apply include filter
-                if let Some(glob_pat) = include_glob {
-                    let name = entry.file_name().to_string_lossy();
-                    if !glob::Pattern::new(glob_pat)
-                        .map(|p| p.matches(&name))
-                        .unwrap_or(false)
-                    {
+                let re = regex::Regex::new(&params.pattern)
+                    .map_err(|e| format!("invalid regex: {e}"))?;
+
+                let include_glob = params.include.as_deref();
+                let ctx = params.context_lines.unwrap_or(0) as usize;
+                let mut output = String::new();
+                let mut match_count = 0usize;
+                const MAX_MATCHES: usize = 5000;
+
+                for entry in walkdir::WalkDir::new(&search_path)
+                    .follow_links(false) // Never follow symlinks
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    // Skip symlinks explicitly
+                    if entry.file_type().is_symlink() {
                         continue;
                     }
-                }
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
 
-                // Read and search
-                let contents = match std::fs::read_to_string(entry.path()) {
-                    Ok(c) => c,
-                    Err(_) => continue, // Skip binary/unreadable files
-                };
+                    // Verify canonical path is within sandbox
+                    let canonical = match entry.path().canonicalize() {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    if !canonical.starts_with(&sandbox_canonical) {
+                        continue;
+                    }
 
-                let lines: Vec<&str> = contents.lines().collect();
-                let relative = canonical
-                    .strip_prefix(&sandbox_canonical)
-                    .unwrap_or(&canonical);
-
-                for (i, line) in lines.iter().enumerate() {
-                    if re.is_match(line) {
-                        // Print context lines
-                        let start = i.saturating_sub(ctx);
-                        let end = std::cmp::min(i + ctx + 1, lines.len());
-                        for (j, line_text) in lines[start..end].iter().enumerate() {
-                            let abs_j = start + j;
-                            let sep = if abs_j == i { ':' } else { '-' };
-                            output.push_str(&format!(
-                                "{}{}{}:{}\n",
-                                relative.display(),
-                                sep,
-                                abs_j + 1,
-                                line_text
-                            ));
+                    // Apply include filter
+                    if let Some(glob_pat) = include_glob {
+                        let name = entry.file_name().to_string_lossy();
+                        if !glob::Pattern::new(glob_pat)
+                            .map(|p| p.matches(&name))
+                            .unwrap_or(false)
+                        {
+                            continue;
                         }
-                        if ctx > 0 && end < lines.len() {
-                            output.push_str("--\n");
-                        }
-                        match_count += 1;
-                        if match_count >= MAX_MATCHES {
-                            output.push_str(&format!("\n(truncated at {} matches)\n", MAX_MATCHES));
-                            return Ok(output);
+                    }
+
+                    // Read and search
+                    let contents = match std::fs::read_to_string(entry.path()) {
+                        Ok(c) => c,
+                        Err(_) => continue, // Skip binary/unreadable files
+                    };
+
+                    let lines: Vec<&str> = contents.lines().collect();
+                    let relative = canonical
+                        .strip_prefix(&sandbox_canonical)
+                        .unwrap_or(&canonical);
+
+                    for (i, line) in lines.iter().enumerate() {
+                        if re.is_match(line) {
+                            // Print context lines
+                            let start = i.saturating_sub(ctx);
+                            let end = std::cmp::min(i + ctx + 1, lines.len());
+                            for (j, line_text) in lines[start..end].iter().enumerate() {
+                                let abs_j = start + j;
+                                let sep = if abs_j == i { ':' } else { '-' };
+                                output.push_str(&format!(
+                                    "{}{}{}:{}\n",
+                                    relative.display(),
+                                    sep,
+                                    abs_j + 1,
+                                    line_text
+                                ));
+                            }
+                            if ctx > 0 && end < lines.len() {
+                                output.push_str("--\n");
+                            }
+                            match_count += 1;
+                            if match_count >= MAX_MATCHES {
+                                output.push_str(&format!(
+                                    "\n(truncated at {} matches)\n",
+                                    MAX_MATCHES
+                                ));
+                                return Ok(output);
+                            }
                         }
                     }
                 }
-            }
 
-            Ok(output)
-        });
-
-        match result {
-            Ok(matches) => {
-                self.guard.record(Operation::GrepSearch);
-                Ok(CallToolResult::success(vec![Content::text(matches)]))
-            }
+                Ok(output)
+            })
+        }) {
+            Ok(matches) => Ok(CallToolResult::success(vec![Content::text(matches)])),
             Err(e) => Ok(err_result(e)),
         }
     }
@@ -462,9 +457,10 @@ impl NucleusMcpServer {
         &self,
         Parameters(params): Parameters<WebFetchParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = self.guard.check(Operation::WebFetch) {
-            return Ok(err_result(e));
-        }
+        let proof = match self.guard.check(Operation::WebFetch) {
+            Ok(p) => p,
+            Err(e) => return Ok(err_result(e)),
+        };
 
         let level = self.state.runtime.policy().capabilities.web_fetch;
         if level == CapabilityLevel::Never {
@@ -506,26 +502,28 @@ impl NucleusMcpServer {
             _ => return Ok(err_result(format!("unsupported method: {method}"))),
         };
 
-        match request.send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let max_bytes = self.state.web_fetch_max_bytes;
-                match resp.bytes().await {
-                    Ok(bytes) => {
-                        self.guard.record(Operation::WebFetch);
-                        let truncated = bytes.len() > max_bytes;
-                        let body = String::from_utf8_lossy(
-                            &bytes[..std::cmp::min(bytes.len(), max_bytes)],
-                        );
-                        let suffix = if truncated { "\n(truncated)" } else { "" };
-                        Ok(CallToolResult::success(vec![Content::text(format!(
-                            "HTTP {status}\n\n{body}{suffix}"
-                        ))]))
-                    }
-                    Err(e) => Ok(err_result(format!("body read failed: {e}"))),
-                }
-            }
-            Err(e) => Ok(err_result(format!("fetch failed: {e}"))),
+        // Perform async fetch, then feed result through execute_and_record
+        let max_bytes = self.state.web_fetch_max_bytes;
+        let fetch_result: Result<String, String> = async {
+            let resp = request
+                .send()
+                .await
+                .map_err(|e| format!("fetch failed: {e}"))?;
+            let status = resp.status().as_u16();
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| format!("body read failed: {e}"))?;
+            let truncated = bytes.len() > max_bytes;
+            let body = String::from_utf8_lossy(&bytes[..std::cmp::min(bytes.len(), max_bytes)]);
+            let suffix = if truncated { "\n(truncated)" } else { "" };
+            Ok(format!("HTTP {status}\n\n{body}{suffix}"))
+        }
+        .await;
+
+        match self.guard.execute_and_record(proof, || fetch_result) {
+            Ok(response) => Ok(CallToolResult::success(vec![Content::text(response)])),
+            Err(e) => Ok(err_result(e)),
         }
     }
 }

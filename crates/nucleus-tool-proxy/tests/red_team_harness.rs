@@ -35,7 +35,8 @@ use std::sync::Arc;
 
 use nucleus::Sandbox;
 use portcullis::{
-    CapabilityLevel, GradedTaintGuard, Operation, PermissionLattice, ToolCallGuard, TrifectaRisk,
+    CapabilityLevel, ExecuteError, GradedTaintGuard, Operation, PermissionLattice, ToolCallGuard,
+    TrifectaRisk,
 };
 use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
@@ -350,17 +351,21 @@ impl ToolDispatcher {
         };
 
         // Layer 1: Guard check (capability + trifecta)
-        if let Err(e) = self.guard.check(Operation::ReadFiles) {
-            return (format!("BLOCKED by guard: {e}"), true);
-        }
+        let proof = match self.guard.check(Operation::ReadFiles) {
+            Ok(p) => p,
+            Err(e) => return (format!("BLOCKED by guard: {e}"), true),
+        };
 
-        // Layer 2: Sandbox read (cap-std + PathLattice)
-        match self.sandbox.read_to_string(path) {
-            Ok(contents) => {
-                self.guard.record(Operation::ReadFiles);
-                (contents, false)
+        // Layer 2: Sandbox read (cap-std + PathLattice) + atomic record
+        match self
+            .guard
+            .execute_and_record(proof, || self.sandbox.read_to_string(path))
+        {
+            Ok(contents) => (contents, false),
+            Err(ExecuteError::OperationFailed(e)) => (format!("BLOCKED by sandbox: {e}"), true),
+            Err(ExecuteError::TocTouDenied { reason }) => {
+                (format!("BLOCKED by TOCTOU: {reason}"), true)
             }
-            Err(e) => (format!("BLOCKED by sandbox: {e}"), true),
         }
     }
 
@@ -374,16 +379,20 @@ impl ToolDispatcher {
             None => return ("Missing 'contents' parameter".into(), true),
         };
 
-        if let Err(e) = self.guard.check(Operation::WriteFiles) {
-            return (format!("BLOCKED by guard: {e}"), true);
-        }
+        let proof = match self.guard.check(Operation::WriteFiles) {
+            Ok(p) => p,
+            Err(e) => return (format!("BLOCKED by guard: {e}"), true),
+        };
 
-        match self.sandbox.write(path, contents.as_bytes()) {
-            Ok(()) => {
-                self.guard.record(Operation::WriteFiles);
-                ("ok".into(), false)
+        match self
+            .guard
+            .execute_and_record(proof, || self.sandbox.write(path, contents.as_bytes()))
+        {
+            Ok(()) => ("ok".into(), false),
+            Err(ExecuteError::OperationFailed(e)) => (format!("BLOCKED by sandbox: {e}"), true),
+            Err(ExecuteError::TocTouDenied { reason }) => {
+                (format!("BLOCKED by TOCTOU: {reason}"), true)
             }
-            Err(e) => (format!("BLOCKED by sandbox: {e}"), true),
         }
     }
 
@@ -401,25 +410,23 @@ impl ToolDispatcher {
         }
 
         // Layer 1: Guard check (capability + trifecta)
-        if let Err(e) = self.guard.check(Operation::RunBash) {
-            return (format!("BLOCKED by guard: {e}"), true);
-        }
+        let proof = match self.guard.check(Operation::RunBash) {
+            Ok(p) => p,
+            Err(e) => return (format!("BLOCKED by guard: {e}"), true),
+        };
 
-        // Layer 2: Command execution with env isolation
-        // We intentionally do NOT give the red agent a real shell — commands
-        // run with env_clear to prevent credential leakage, and within
-        // the sandbox directory.
-        let result = std::process::Command::new(&cmd_args[0])
-            .args(&cmd_args[1..])
-            .current_dir(&self.sandbox_root)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/local/bin")
-            .env("HOME", self.sandbox_root.to_string_lossy().as_ref())
-            .output();
-
-        match result {
+        // Layer 2: Command execution with env isolation + atomic record
+        let sandbox_root = self.sandbox_root.clone();
+        match self.guard.execute_and_record(proof, || {
+            std::process::Command::new(&cmd_args[0])
+                .args(&cmd_args[1..])
+                .current_dir(&sandbox_root)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin:/usr/local/bin")
+                .env("HOME", sandbox_root.to_string_lossy().as_ref())
+                .output()
+        }) {
             Ok(output) => {
-                self.guard.record(Operation::RunBash);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let exit_code = output.status.code().unwrap_or(-1);
@@ -428,7 +435,12 @@ impl ToolDispatcher {
                     false,
                 )
             }
-            Err(e) => (format!("Command execution failed: {e}"), true),
+            Err(ExecuteError::OperationFailed(e)) => {
+                (format!("Command execution failed: {e}"), true)
+            }
+            Err(ExecuteError::TocTouDenied { reason }) => {
+                (format!("BLOCKED by TOCTOU: {reason}"), true)
+            }
         }
     }
 
@@ -438,40 +450,43 @@ impl ToolDispatcher {
             None => return ("Missing 'pattern' parameter".into(), true),
         };
 
-        if let Err(e) = self.guard.check(Operation::GlobSearch) {
-            return (format!("BLOCKED by guard: {e}"), true);
-        }
-
-        // Sandbox boundary: resolve within sandbox root
-        let sandbox_canonical = match self.sandbox_root.canonicalize() {
-            Ok(c) => c,
-            Err(e) => return (format!("Sandbox root error: {e}"), true),
+        let proof = match self.guard.check(Operation::GlobSearch) {
+            Ok(p) => p,
+            Err(e) => return (format!("BLOCKED by guard: {e}"), true),
         };
 
-        let full_pattern = sandbox_canonical.join(pattern);
-        let pattern_str = full_pattern.to_string_lossy();
+        let sandbox_root = self.sandbox_root.clone();
+        let pattern = pattern.to_string();
+        match self.guard.execute_and_record(proof, || {
+            let sandbox_canonical = sandbox_root
+                .canonicalize()
+                .map_err(|e| format!("Sandbox root error: {e}"))?;
 
-        let mut results = Vec::new();
-        match glob::glob(&pattern_str) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    if let Ok(canonical) = entry.canonicalize() {
-                        if canonical.starts_with(&sandbox_canonical) {
-                            if let Ok(relative) = canonical.strip_prefix(&sandbox_canonical) {
-                                results.push(relative.to_string_lossy().to_string());
-                            }
+            let full_pattern = sandbox_canonical.join(&pattern);
+            let pattern_str = full_pattern.to_string_lossy();
+
+            let mut results = Vec::new();
+            let entries = glob::glob(&pattern_str).map_err(|e| format!("Invalid glob: {e}"))?;
+            for entry in entries.flatten() {
+                if let Ok(canonical) = entry.canonicalize() {
+                    if canonical.starts_with(&sandbox_canonical) {
+                        if let Ok(relative) = canonical.strip_prefix(&sandbox_canonical) {
+                            results.push(relative.to_string_lossy().to_string());
                         }
                     }
-                    if results.len() >= 1000 {
-                        break;
-                    }
+                }
+                if results.len() >= 1000 {
+                    break;
                 }
             }
-            Err(e) => return (format!("Invalid glob: {e}"), true),
+            Ok(results)
+        }) {
+            Ok(results) => (results.join("\n"), false),
+            Err(ExecuteError::OperationFailed(e)) => (e, true),
+            Err(ExecuteError::TocTouDenied { reason }) => {
+                (format!("BLOCKED by TOCTOU: {reason}"), true)
+            }
         }
-
-        self.guard.record(Operation::GlobSearch);
-        (results.join("\n"), false)
     }
 
     fn dispatch_grep(&self, args: &serde_json::Value) -> (String, bool) {
@@ -480,85 +495,97 @@ impl ToolDispatcher {
             None => return ("Missing 'pattern' parameter".into(), true),
         };
 
-        if let Err(e) = self.guard.check(Operation::GrepSearch) {
-            return (format!("BLOCKED by guard: {e}"), true);
-        }
-
-        let re = match regex::Regex::new(pattern) {
-            Ok(r) => r,
-            Err(e) => return (format!("Invalid regex: {e}"), true),
+        let proof = match self.guard.check(Operation::GrepSearch) {
+            Ok(p) => p,
+            Err(e) => return (format!("BLOCKED by guard: {e}"), true),
         };
 
-        let sandbox_canonical = match self.sandbox_root.canonicalize() {
-            Ok(c) => c,
-            Err(e) => return (format!("Sandbox root error: {e}"), true),
-        };
+        let sandbox_root = self.sandbox_root.clone();
+        let pattern = pattern.to_string();
+        let include = args
+            .get("include")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let search_path_arg = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
-        let search_path = if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-            let p = std::path::Path::new(path);
-            if p.is_absolute() {
-                return (format!("Absolute paths not allowed: {path}"), true);
-            }
-            let resolved = self.sandbox_root.join(path);
-            match resolved.canonicalize() {
-                Ok(c) if c.starts_with(&sandbox_canonical) => c,
-                _ => return (format!("Path escapes sandbox: {path}"), true),
-            }
-        } else {
-            sandbox_canonical.clone()
-        };
+        match self.guard.execute_and_record(proof, || {
+            let re = regex::Regex::new(&pattern).map_err(|e| format!("Invalid regex: {e}"))?;
+            let sandbox_canonical = sandbox_root
+                .canonicalize()
+                .map_err(|e| format!("Sandbox root error: {e}"))?;
 
-        let mut output = String::new();
-        let mut match_count = 0usize;
-
-        for entry in walkdir::WalkDir::new(&search_path)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_symlink() || !entry.file_type().is_file() {
-                continue;
-            }
-            let canonical = match entry.path().canonicalize() {
-                Ok(c) if c.starts_with(&sandbox_canonical) => c,
-                _ => continue,
+            let search_path = if let Some(ref path) = search_path_arg {
+                let p = std::path::Path::new(path);
+                if p.is_absolute() {
+                    return Err(format!("Absolute paths not allowed: {path}"));
+                }
+                let resolved = sandbox_root.join(path);
+                match resolved.canonicalize() {
+                    Ok(c) if c.starts_with(&sandbox_canonical) => c,
+                    _ => return Err(format!("Path escapes sandbox: {path}")),
+                }
+            } else {
+                sandbox_canonical.clone()
             };
 
-            // Apply include filter
-            if let Some(include) = args.get("include").and_then(|v| v.as_str()) {
-                let name = entry.file_name().to_string_lossy();
-                if !glob::Pattern::new(include)
-                    .map(|p| p.matches(&name))
-                    .unwrap_or(false)
-                {
+            let mut output = String::new();
+            let mut match_count = 0usize;
+
+            for entry in walkdir::WalkDir::new(&search_path)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if entry.file_type().is_symlink() || !entry.file_type().is_file() {
                     continue;
                 }
-            }
+                let canonical = match entry.path().canonicalize() {
+                    Ok(c) if c.starts_with(&sandbox_canonical) => c,
+                    _ => continue,
+                };
 
-            let contents = match std::fs::read_to_string(entry.path()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+                if let Some(ref inc) = include {
+                    let name = entry.file_name().to_string_lossy();
+                    if !glob::Pattern::new(inc)
+                        .map(|p| p.matches(&name))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                }
 
-            let relative = canonical
-                .strip_prefix(&sandbox_canonical)
-                .unwrap_or(&canonical);
+                let contents = match std::fs::read_to_string(entry.path()) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
 
-            for (i, line) in contents.lines().enumerate() {
-                if re.is_match(line) {
-                    output.push_str(&format!("{}:{}:{}\n", relative.display(), i + 1, line));
-                    match_count += 1;
-                    if match_count >= 5000 {
-                        output.push_str("\n(truncated at 5000 matches)\n");
-                        self.guard.record(Operation::GrepSearch);
-                        return (output, false);
+                let relative = canonical
+                    .strip_prefix(&sandbox_canonical)
+                    .unwrap_or(&canonical);
+
+                for (i, line) in contents.lines().enumerate() {
+                    if re.is_match(line) {
+                        output.push_str(&format!("{}:{}:{}\n", relative.display(), i + 1, line));
+                        match_count += 1;
+                        if match_count >= 5000 {
+                            output.push_str("\n(truncated at 5000 matches)\n");
+                            return Ok(output);
+                        }
                     }
                 }
             }
-        }
 
-        self.guard.record(Operation::GrepSearch);
-        (output, false)
+            Ok(output)
+        }) {
+            Ok(output) => (output, false),
+            Err(ExecuteError::OperationFailed(e)) => (e, true),
+            Err(ExecuteError::TocTouDenied { reason }) => {
+                (format!("BLOCKED by TOCTOU: {reason}"), true)
+            }
+        }
     }
 
     fn dispatch_web_fetch(&self, args: &serde_json::Value) -> (String, bool) {
@@ -567,21 +594,27 @@ impl ToolDispatcher {
             None => return ("Missing 'url' parameter".into(), true),
         };
 
-        if let Err(e) = self.guard.check(Operation::WebFetch) {
-            return (format!("BLOCKED by guard: {e}"), true);
-        }
+        let proof = match self.guard.check(Operation::WebFetch) {
+            Ok(p) => p,
+            Err(e) => return (format!("BLOCKED by guard: {e}"), true),
+        };
 
         // In test mode: no real network. We simulate a response that contains
         // untrusted content (to trigger the taint leg) but no real exfiltration.
-        self.guard.record(Operation::WebFetch);
-        (
-            format!(
+        let url = url.to_string();
+        match self.guard.execute_and_record(proof, || {
+            Ok::<_, String>(format!(
                 "HTTP 200\n\nSimulated response for {url}\n\
                  (Network disabled in test sandbox. This response taints the \
                  session with UntrustedContent.)"
-            ),
-            false,
-        )
+            ))
+        }) {
+            Ok(response) => (response, false),
+            Err(ExecuteError::OperationFailed(e)) => (e, true),
+            Err(ExecuteError::TocTouDenied { reason }) => {
+                (format!("BLOCKED by TOCTOU: {reason}"), true)
+            }
+        }
     }
 
     /// Check if a tool is an exfiltration operation.
