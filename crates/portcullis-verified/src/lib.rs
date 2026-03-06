@@ -77,6 +77,17 @@
 //! - Graded monad: (grade, value) pair with max-monoid grading
 //! - ML1-ML3: left identity, right identity, associativity of monadic bind
 //!
+//! ## Fail-Closed Auth Boundary (Phase 2: E4)
+//! - AuthResult: {0=PassThrough, 1=Authenticated, 2=Rejected}
+//! - auth_decision(is_health, has_spiffe, hmac_ok, is_approve, drand_ok) → AuthResult
+//! - Health is the ONLY pass-through path (no auth check)
+//! - Non-health with no credentials always rejects (fail-closed)
+//! - Non-health result is always authenticated OR rejected (never pass-through)
+//! - SPIFFE mTLS is always sufficient (highest precedence after health)
+//! - HMAC is sufficient for non-approve paths
+//! - Approve path in strict drand mode requires drand anchoring
+//! - Decision function is total over all 2^5=32 input combinations
+//!
 //! ## Capability-Operation Coverage (Phase 2: E5)
 //! - cap_level_for_op(caps, op): extracts the capability level for a given operation
 //! - Bijective mapping: operations 0-11 ↔ CapLattice fields f0-f11
@@ -5685,6 +5696,164 @@ proof fn proof_e3_denial_monotone(
         assert(taint_is_trifecta_complete(taint_i) ==> taint_is_trifecta_complete(taint_j));
     }
 }
+
+// ============================================================================
+// E4: Fail-Closed Auth Boundary
+//
+// Models the auth_middleware decision function from nucleus-tool-proxy.
+// The auth middleware is the outermost perimeter — if it passes an
+// unauthenticated request through, all lattice enforcement is bypassed.
+//
+// The model captures the decision tree:
+//   1. Health path → pass-through (no auth check)
+//   2. SPIFFE mTLS → authenticated (highest precedence for real requests)
+//   3. Approve path + HMAC + drand → authenticated
+//   4. Approve path + HMAC - drand → rejected (strict drand mode)
+//   5. Non-approve + HMAC → authenticated
+//   6. No credentials → rejected (fail-closed)
+//
+// AuthResult encoding:
+//   0 = PassThrough (health only)
+//   1 = Authenticated
+//   2 = Rejected
+// ============================================================================
+
+/// Auth decision function modeling the tool-proxy auth_middleware.
+///
+/// Returns 0 (pass-through), 1 (authenticated), or 2 (rejected).
+pub open spec fn auth_decision(
+    is_health: bool,
+    has_spiffe: bool,
+    hmac_ok: bool,
+    is_approve: bool,
+    drand_ok: bool,
+) -> u8 {
+    if is_health {
+        0  // Health path always passes through
+    } else if has_spiffe {
+        1  // SPIFFE mTLS always authenticates
+    } else if is_approve {
+        if hmac_ok && drand_ok { 1 } else { 2 }  // Approve needs both HMAC + drand
+    } else {
+        if hmac_ok { 1 } else { 2 }  // Non-approve needs just HMAC
+    }
+}
+
+/// Executable mirror of auth_decision for conformance testing.
+pub fn auth_decision_exec(
+    is_health: bool,
+    has_spiffe: bool,
+    hmac_ok: bool,
+    is_approve: bool,
+    drand_ok: bool,
+) -> (result: u8)
+    ensures
+        result == auth_decision(is_health, has_spiffe, hmac_ok, is_approve, drand_ok),
+{
+    if is_health {
+        0
+    } else if has_spiffe {
+        1
+    } else if is_approve {
+        if hmac_ok && drand_ok { 1 } else { 2 }
+    } else {
+        if hmac_ok { 1 } else { 2 }
+    }
+}
+
+/// E4.1: Health path is the ONLY pass-through.
+///
+/// AuthResult 0 (pass-through) can only happen for health paths.
+/// All non-health paths return 1 or 2.
+proof fn proof_e4_health_only_passthrough(
+    has_spiffe: bool,
+    hmac_ok: bool,
+    is_approve: bool,
+    drand_ok: bool,
+)
+    ensures
+        auth_decision(false, has_spiffe, hmac_ok, is_approve, drand_ok) >= 1,
+{}
+
+/// E4.2: Non-health with no credentials always rejects.
+///
+/// Fail-closed: if is_health=false, has_spiffe=false, hmac_ok=false,
+/// the result is always 2 (rejected), regardless of other flags.
+proof fn proof_e4_fail_closed(is_approve: bool, drand_ok: bool)
+    ensures
+        auth_decision(false, false, false, is_approve, drand_ok) == 2,
+{}
+
+/// E4.3: Non-health result is always 1 or 2.
+///
+/// No non-health path ever produces 0 (pass-through).
+proof fn proof_e4_non_health_binary(
+    has_spiffe: bool,
+    hmac_ok: bool,
+    is_approve: bool,
+    drand_ok: bool,
+)
+    ensures ({
+        let r = auth_decision(false, has_spiffe, hmac_ok, is_approve, drand_ok);
+        r == 1 || r == 2
+    }),
+{}
+
+/// E4.4: SPIFFE mTLS is always sufficient.
+///
+/// Regardless of HMAC, approve, or drand state, SPIFFE authenticates.
+proof fn proof_e4_spiffe_sufficient(hmac_ok: bool, is_approve: bool, drand_ok: bool)
+    ensures
+        auth_decision(false, true, hmac_ok, is_approve, drand_ok) == 1,
+{}
+
+/// E4.5: Decision function is total over all valid inputs.
+///
+/// For any combination of 5 booleans, the result is 0, 1, or 2.
+proof fn proof_e4_total(
+    is_health: bool,
+    has_spiffe: bool,
+    hmac_ok: bool,
+    is_approve: bool,
+    drand_ok: bool,
+)
+    ensures ({
+        let r = auth_decision(is_health, has_spiffe, hmac_ok, is_approve, drand_ok);
+        r <= 2
+    }),
+{}
+
+/// E4.6: Approve path with HMAC but no drand is rejected.
+///
+/// This captures DrandFailMode::Strict — approve requests MUST have
+/// a valid drand round, even if HMAC is valid.
+proof fn proof_e4_approve_needs_drand(has_spiffe: bool)
+    ensures
+        auth_decision(false, false, true, true, false) == 2,
+{}
+
+/// E4.7: Non-approve path doesn't need drand.
+///
+/// For non-approve paths, HMAC alone is sufficient — drand is irrelevant.
+proof fn proof_e4_non_approve_hmac_sufficient(drand_ok: bool)
+    ensures
+        auth_decision(false, false, true, false, drand_ok) == 1,
+{}
+
+/// E4.8: SPIFFE overrides any rejection.
+///
+/// Even if the same flags would cause rejection without SPIFFE,
+/// adding SPIFFE always results in authentication.
+proof fn proof_e4_spiffe_overrides_rejection(
+    hmac_ok: bool,
+    is_approve: bool,
+    drand_ok: bool,
+)
+    requires
+        auth_decision(false, false, hmac_ok, is_approve, drand_ok) == 2,
+    ensures
+        auth_decision(false, true, hmac_ok, is_approve, drand_ok) == 1,
+{}
 
 // ============================================================================
 // E5: Capability-Operation Coverage
