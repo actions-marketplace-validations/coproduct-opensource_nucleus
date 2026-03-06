@@ -4204,8 +4204,16 @@ proof fn proof_trace_composition(
             trace_taint(s2_prefix),
             last,
         );
-        // apply_event(tt(s2_prefix), last) == trace_taint(s2)   [by definition]
-        assert(apply_event_taint(trace_taint(s2_prefix), last) == trace_taint(s2));
+        // Connect trace_taint_at(s2, n2-1) to trace_taint(s2_prefix):
+        // s2_prefix = s2.subrange(0, n2-1), so s2[i] == s2_prefix[i] for i < n2-1
+        assert forall|i: int| 0 <= i < s2_prefix.len()
+            implies #[trigger] s2[i] == s2_prefix[i]
+        by { }
+        lemma_trace_taint_eq_on_prefix(s2, s2_prefix);
+        assert(trace_taint_at(s2, s2_prefix.len()) == trace_taint(s2_prefix));
+        // trace_taint(s2) = trace_taint_at(s2, n2) = apply_event(trace_taint_at(s2, n2-1), s2[n2-1])
+        // Since trace_taint_at(s2, n2-1) == trace_taint(s2_prefix) and s2[n2-1] == last:
+        assert(trace_taint(s2) == apply_event_taint(trace_taint(s2_prefix), last));
     }
 }
 
@@ -4231,19 +4239,30 @@ proof fn lemma_trace_taint_eq_on_prefix(
             assert(b_prefix[i] == b[i]);
         }
         lemma_trace_taint_eq_on_prefix(a, b_prefix);
-        // Explicit chain for Z3 stability:
         // IH gives: trace_taint_at(a, n-1) == trace_taint(b_prefix)
         let taint_before_a = trace_taint_at(a, (n - 1) as nat);
         let taint_before_b = trace_taint(b_prefix);
         assert(taint_before_a == taint_before_b);
+
+        // Connect trace_taint_at(b, n-1) to trace_taint(b_prefix):
+        // b_prefix = b.subrange(0, n-1), so b[i] == b_prefix[i] for i < n-1
+        assert forall|i: int| 0 <= i < b_prefix.len()
+            implies #[trigger] b[i] == b_prefix[i]
+        by { }
+        lemma_trace_taint_eq_on_prefix(b, b_prefix);
+        let taint_b_before = trace_taint_at(b, (n - 1) as nat);
+        assert(taint_b_before == taint_before_b);
+
         // Precondition gives: a[n-1] == b[n-1]
         assert(a[(n - 1) as int] == b[(n - 1) as int]);
-        // Therefore apply_event on both sides yields the same result:
-        // trace_taint_at(a, n) == apply_event(taint_before_a, a[n-1])
-        //                      == apply_event(taint_before_b, b[n-1])
-        //                      == trace_taint_at(b, n) == trace_taint(b)
-        assert(apply_event_taint(taint_before_a, a[(n - 1) as int])
-            == apply_event_taint(taint_before_b, b[(n - 1) as int]));
+
+        // Unfold both sides:
+        // trace_taint_at(a, n) = apply_event(taint_before_a, a[n-1])
+        // trace_taint_at(b, n) = apply_event(taint_b_before, b[n-1])
+        // Since taint_before_a == taint_b_before and a[n-1] == b[n-1]:
+        assert(trace_taint_at(a, n) == trace_taint_at(b, n));
+        // trace_taint(b) == trace_taint_at(b, b.len()) == trace_taint_at(b, n)
+        assert(trace_taint(b) == trace_taint_at(b, n));
     }
 }
 
