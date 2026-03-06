@@ -3422,6 +3422,7 @@ proof fn proof_market_cost_commutative(a: Cost, b: Cost)
 
 /// Spec mirror of portcullis::guard::TaintSet.
 /// Three booleans tracking which trifecta legs have been touched.
+#[derive(Clone, Copy)]
 pub struct SpecTaintSet {
     pub private_data: bool,
     pub untrusted_content: bool,
