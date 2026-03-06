@@ -66,8 +66,8 @@ Status key: `DONE`, `PARTIAL`, `TODO`.
 
 - **No privilege relaxation after creation**
   - Pass: permission state can only tighten or the pod is terminated.
-  - Current: `PARTIAL` (policy normalization enforced; no runtime guardrail).
-  - Evidence: `crates/portcullis/src/lattice.rs`, `crates/nucleus-cli/src/run.rs`
+  - Current: `DONE` (Verus-proven E1-E3 enforcement boundary + runtime debug_assert).
+  - Evidence: `crates/portcullis-verified/src/lib.rs` (E1: taint monotonicity, E2: trace monotonicity, E3: denial monotonicity), `crates/portcullis/src/guard.rs` (debug_assert in execute_and_record)
 - **Network policy drift detection**
   - Pass: host checks iptables drift and fails closed on deviation.
   - Current: `DONE`.
