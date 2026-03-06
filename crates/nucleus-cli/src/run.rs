@@ -3,10 +3,14 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use nucleus_client::sign_http_headers;
-use nucleus_spec::{ImageSpec, PodSpec as SpecPodSpec, PodSpecInner, PolicySpec, VsockSpec};
+use nucleus_spec::{
+    CredentialsSpec, ImageSpec, PodSpec as SpecPodSpec, PodSpecInner, PolicySpec, VsockSpec,
+};
 use portcullis::{BudgetLattice, CapabilityLevel, PermissionLattice};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -28,27 +32,39 @@ struct ResolvedConfig {
     rootfs_path: String,
 }
 
-/// Resolve configuration from multiple sources (args > keychain > config > defaults)
-fn resolve_config(args: &RunArgs, config: &Config) -> Result<ResolvedConfig> {
+/// Resolve configuration from multiple sources (args > keychain > config > defaults).
+///
+/// Returns `None` when `--local` is set (no node config needed).
+fn resolve_config(args: &RunArgs, config: &Config) -> Result<Option<ResolvedConfig>> {
+    if args.local {
+        return Ok(None);
+    }
+
     // Node URL: args > config > error
-    let node_url = if !args.node_url.is_empty() {
-        args.node_url.clone()
+    let node_url = if let Some(ref url) = args.node_url {
+        if !url.is_empty() {
+            url.clone()
+        } else {
+            config.node.url.clone()
+        }
     } else if !config.node.url.is_empty() {
         config.node.url.clone()
     } else {
-        return Err(anyhow!("missing --node-url (NUCLEUS_NODE_URL)"));
+        return Err(anyhow!(
+            "missing --node-url (NUCLEUS_NODE_URL). Use --local for CI mode."
+        ));
     };
 
     // Node auth secret: args > keychain > error
-    let node_auth_secret = if !args.node_auth_secret.is_empty() {
-        args.node_auth_secret.clone()
+    let node_auth_secret = if let Some(ref secret) = args.node_auth_secret {
+        if !secret.is_empty() {
+            secret.clone()
+        } else {
+            return Err(anyhow!("--node-auth-secret is empty"));
+        }
     } else if config.auth.use_keychain {
-        // Try to get from Keychain
         match SecretStore::get(SecretKind::NodeAuthSecret)? {
-            Some(secret) => {
-                // Convert bytes to hex string for HMAC signing
-                hex::encode(secret)
-            }
+            Some(secret) => hex::encode(secret),
             None => {
                 return Err(anyhow!(
                     "Node auth secret not found in Keychain.\n\
@@ -58,7 +74,7 @@ fn resolve_config(args: &RunArgs, config: &Config) -> Result<ResolvedConfig> {
         }
     } else {
         return Err(anyhow!(
-            "missing --node-auth-secret (NUCLEUS_NODE_AUTH_SECRET)"
+            "missing --node-auth-secret (NUCLEUS_NODE_AUTH_SECRET). Use --local for CI mode."
         ));
     };
 
@@ -83,16 +99,19 @@ fn resolve_config(args: &RunArgs, config: &Config) -> Result<ResolvedConfig> {
         config.rootfs_path()?.display().to_string()
     };
 
-    Ok(ResolvedConfig {
+    Ok(Some(ResolvedConfig {
         node_url,
         node_auth_secret,
         node_actor,
         kernel_path,
         rootfs_path,
-    })
+    }))
 }
 
-/// Run a task with tool-level enforcement via nucleus-node (Firecracker only).
+/// Run a task with tool-level enforcement.
+///
+/// By default, requires a running nucleus-node with Firecracker. Use `--local`
+/// to run the tool-proxy as a local subprocess instead (suitable for CI).
 #[derive(Args, Debug)]
 pub struct RunArgs {
     /// Task prompt (use - for stdin)
@@ -130,17 +149,35 @@ pub struct RunArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Run locally without Firecracker (spawns tool-proxy as subprocess).
+    /// Suitable for CI environments like GitHub Actions.
+    #[arg(long)]
+    pub local: bool,
+
+    /// Environment variables to pass as credentials (KEY=VALUE).
+    /// Can be specified multiple times: --env FOO=bar --env BAZ=qux
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub envs: Vec<String>,
+
     /// Path to nucleus-mcp binary (enforced mode)
     #[arg(long, env = "NUCLEUS_MCP_PATH", default_value = "nucleus-mcp")]
     pub mcp_path: String,
 
-    /// nucleus-node base URL (Firecracker required).
+    /// Path to nucleus-tool-proxy binary (local mode only)
+    #[arg(
+        long,
+        env = "NUCLEUS_TOOL_PROXY_PATH",
+        default_value = "nucleus-tool-proxy"
+    )]
+    pub tool_proxy_path: String,
+
+    /// nucleus-node base URL (required for Firecracker mode).
     #[arg(long, env = "NUCLEUS_NODE_URL")]
-    pub node_url: String,
+    pub node_url: Option<String>,
 
     /// Auth secret for nucleus-node API (HMAC).
     #[arg(long, env = "NUCLEUS_NODE_AUTH_SECRET")]
-    pub node_auth_secret: String,
+    pub node_auth_secret: Option<String>,
 
     /// Actor name for signed node requests.
     #[arg(long, env = "NUCLEUS_NODE_ACTOR", default_value = "nucleus-cli")]
@@ -234,14 +271,20 @@ pub async fn execute(args: RunArgs, global_config_path: &str) -> Result<()> {
         println!("Dry run - would execute with:");
         println!("  Working directory: {}", work_dir.display());
         println!("  Profile: {}", args.profile);
+        println!(
+            "  Mode: {}",
+            if args.local { "local" } else { "firecracker" }
+        );
         println!("  Budget: ${:.2}", policy.budget.max_cost_usd);
         println!("  Timeout: {}s", args.timeout);
         println!("  Trifecta constraint: {}", policy.trifecta_constraint);
-        println!("  Node URL: {}", resolved.node_url);
-        println!("  Kernel: {}", resolved.kernel_path);
-        println!("  Rootfs: {}", resolved.rootfs_path);
-        println!("  Vsock: cid={} port={}", args.vsock_cid, args.vsock_port);
-        println!("  Rootfs read-only: {}", args.rootfs_read_only);
+        if let Some(ref resolved) = resolved {
+            println!("  Node URL: {}", resolved.node_url);
+            println!("  Kernel: {}", resolved.kernel_path);
+            println!("  Rootfs: {}", resolved.rootfs_path);
+            println!("  Vsock: cid={} port={}", args.vsock_cid, args.vsock_port);
+            println!("  Rootfs read-only: {}", args.rootfs_read_only);
+        }
         println!();
         println!("Capabilities:");
         println!("  read_files: {:?}", policy.capabilities.read_files);
@@ -252,7 +295,14 @@ pub async fn execute(args: RunArgs, global_config_path: &str) -> Result<()> {
         return Ok(());
     }
 
-    run_enforced(&args, &resolved, &policy, &work_dir, &prompt).await
+    if args.local {
+        run_local(&args, &policy, &work_dir, &prompt).await
+    } else {
+        let resolved = resolved.ok_or_else(|| {
+            anyhow!("node config required for Firecracker mode. Use --local for CI.")
+        })?;
+        run_enforced(&args, &resolved, &policy, &work_dir, &prompt).await
+    }
 }
 
 /// Load permission config from a TOML file
@@ -318,6 +368,185 @@ impl Drop for TmpDirGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+/// Run in local mode: spawn tool-proxy as a subprocess (no Firecracker).
+///
+/// This gives lattice enforcement via tool-proxy intercept without needing a
+/// Firecracker VM. Suitable for CI environments like GitHub Actions.
+async fn run_local(
+    args: &RunArgs,
+    policy: &PermissionLattice,
+    work_dir: &Path,
+    prompt: &str,
+) -> Result<()> {
+    warn_unimplemented_caps(policy);
+
+    let run_id = Uuid::new_v4();
+    let tmp_dir = std::env::temp_dir().join(format!("nucleus-local-{run_id}"));
+    fs::create_dir_all(&tmp_dir)?;
+    let _tmp_guard = TmpDirGuard::new(tmp_dir.clone());
+
+    // Generate per-run auth secrets
+    let auth_secret = hex::encode(rand::random::<[u8; 32]>());
+    let approval_secret = hex::encode(rand::random::<[u8; 32]>());
+
+    // Build minimal PodSpec (no image/vsock)
+    let spec_path = tmp_dir.join("pod.yaml");
+    let pod_spec = build_local_pod_spec(args, policy, work_dir)?;
+    write_pod_spec(&spec_path, &pod_spec)?;
+
+    // Generate sandbox token (Tier 3 OrchestratorToken)
+    let spec_contents = fs::read_to_string(&spec_path)?;
+    let spec_hash = hex::encode(Sha256::digest(spec_contents.as_bytes()));
+    let sandbox_token = nucleus_client::generate_sandbox_token(
+        auth_secret.as_bytes(),
+        &run_id.to_string(),
+        &spec_hash,
+    );
+
+    let announce_path = tmp_dir.join("proxy.addr");
+    let audit_path = tmp_dir.join("audit.log");
+
+    // Resolve tool-proxy binary
+    let proxy_bin = resolve_binary_path(&args.tool_proxy_path)?;
+
+    info!(
+        proxy_bin = %proxy_bin.display(),
+        profile = %args.profile,
+        "Spawning local tool-proxy"
+    );
+
+    // Spawn tool-proxy as subprocess
+    let mut proxy_child = tokio::process::Command::new(&proxy_bin)
+        .arg("--spec")
+        .arg(&spec_path)
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--announce-path")
+        .arg(&announce_path)
+        .arg("--auth-secret")
+        .arg(&auth_secret)
+        .arg("--approval-secret")
+        .arg(&approval_secret)
+        .arg("--audit-log")
+        .arg(&audit_path)
+        .env("NUCLEUS_SANDBOX_TOKEN", &sandbox_token)
+        .env("NUCLEUS_TOOL_PROXY_DRAND_ENABLED", "false")
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn nucleus-tool-proxy")?;
+
+    // Wait for proxy readiness
+    let proxy_addr = wait_for_proxy_ready(&announce_path, Duration::from_secs(10)).await?;
+    let proxy_url = format!("http://{proxy_addr}");
+
+    info!(proxy_url = %proxy_url, "Tool-proxy ready");
+
+    // Build MCP config and spawn Claude
+    let mcp_config_path = tmp_dir.join("mcp.json");
+    let mcp_command_path = resolve_binary_path(&args.mcp_path)?;
+
+    write_mcp_config(
+        &mcp_config_path,
+        &mcp_command_path,
+        &proxy_url,
+        Some(&auth_secret),
+        &spec_path,
+    )?;
+
+    let allowed_tools = build_mcp_allowed_tools(policy);
+    if allowed_tools.is_empty() {
+        return Err(anyhow!(
+            "no allowed MCP tools for this profile (policy is too restrictive)"
+        ));
+    }
+
+    info!(
+        allowed_tools = %allowed_tools.join(","),
+        model = %args.model,
+        "Spawning Claude Code (local enforced mode)"
+    );
+
+    let start = Instant::now();
+    let output = run_claude_mcp(
+        args,
+        policy,
+        &mcp_config_path,
+        &allowed_tools,
+        prompt,
+        work_dir,
+    )?;
+    let duration = start.elapsed();
+
+    // Kill tool-proxy
+    let _ = proxy_child.kill().await;
+
+    render_output(&output, duration, args.output.as_str())
+}
+
+/// Poll the announce_path file until the proxy writes its bound address.
+async fn wait_for_proxy_ready(announce_path: &Path, timeout: Duration) -> Result<String> {
+    let start = Instant::now();
+    loop {
+        if announce_path.exists() {
+            let addr = fs::read_to_string(announce_path)?.trim().to_string();
+            if !addr.is_empty() {
+                return Ok(addr);
+            }
+        }
+        if start.elapsed() > timeout {
+            return Err(anyhow!(
+                "tool-proxy did not become ready within {:?}",
+                timeout
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Build a PodSpec for local mode (no image/vsock, credentials from --env).
+fn build_local_pod_spec(
+    args: &RunArgs,
+    policy: &PermissionLattice,
+    work_dir: &Path,
+) -> Result<SpecPodSpec> {
+    let mut env = BTreeMap::new();
+    for env_str in &args.envs {
+        if let Some((key, value)) = env_str.split_once('=') {
+            env.insert(key.to_string(), value.to_string());
+        } else {
+            return Err(anyhow!(
+                "invalid --env format (expected KEY=VALUE): {}",
+                env_str
+            ));
+        }
+    }
+
+    let credentials = if env.is_empty() {
+        None
+    } else {
+        Some(CredentialsSpec { env })
+    };
+
+    Ok(SpecPodSpec::new(PodSpecInner {
+        work_dir: work_dir.to_path_buf(),
+        timeout_seconds: args.timeout,
+        policy: PolicySpec::Inline {
+            lattice: Box::new(policy.clone()),
+        },
+        budget_model: None,
+        resources: None,
+        network: None,
+        image: None,
+        vsock: None,
+        seccomp: None,
+        cgroup: None,
+        audit_sink: None,
+        credentials,
+    }))
 }
 
 async fn run_enforced(

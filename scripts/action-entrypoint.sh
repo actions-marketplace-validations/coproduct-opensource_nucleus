@@ -43,14 +43,14 @@ ${ISSUE_BODY}
 
 After fixing, commit your changes with a clear commit message referencing issue #${ISSUE_NUMBER}."
 
-# Run under lattice enforcement
+# Run under lattice enforcement (local mode — no Firecracker needed in CI)
 nucleus run \
+  --local \
   --profile "$NUCLEUS_PROFILE" \
   --timeout "$NUCLEUS_TIMEOUT" \
+  --model "$LLM_MODEL" \
   --env "LLM_API_TOKEN=${LLM_API_TOKEN}" \
-  --env "LLM_MODEL=${LLM_MODEL}" \
-  -- \
-  echo "$PROMPT"
+  "$PROMPT"
 echo "::endgroup::"
 
 # Check if the agent made any commits
