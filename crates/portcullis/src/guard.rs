@@ -752,6 +752,16 @@ impl TaintSet {
     pub fn count(&self) -> u8 {
         self.private_data as u8 + self.untrusted_content as u8 + self.exfil_vector as u8
     }
+
+    /// Check if this taint set is a superset of another.
+    ///
+    /// Corresponds to `taint_subset(other, self)` in the Verus model.
+    /// Used by the E1 monotonicity invariant assertion.
+    pub fn is_superset_of(&self, other: &Self) -> bool {
+        (!other.private_data || self.private_data)
+            && (!other.untrusted_content || self.untrusted_content)
+            && (!other.exfil_vector || self.exfil_vector)
+    }
 }
 
 impl std::fmt::Display for TaintSet {
@@ -940,7 +950,20 @@ impl ToolCallGuard for GradedTaintGuard {
         }
 
         // Record the operation's taint via taint_core
+        //
+        // INVARIANT (E1, proven in Verus): apply_event_taint(t, e) ⊇ t
+        // Taint only grows — permissions only tighten. This debug assertion
+        // catches any regression where taint could shrink, which would
+        // constitute a privilege escalation vulnerability.
+        let old_taint = taint.clone();
         *taint = crate::taint_core::apply_record(&taint, proof.operation);
+        debug_assert!(
+            taint.is_superset_of(&old_taint),
+            "E1 violation: taint shrank after recording {:?} ({} → {})",
+            proof.operation,
+            old_taint,
+            *taint,
+        );
 
         Ok(value)
     }

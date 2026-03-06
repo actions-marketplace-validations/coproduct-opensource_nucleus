@@ -2595,3 +2595,267 @@ mod galois_conformance {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFORMANCE E: Enforcement Boundary — Permission Monotonicity
+//
+// These tests verify the Phase 2 enforcement properties proven in Verus:
+// E1 (event taint monotone), E2 (trace taint monotone), E3 (denial monotone).
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod enforcement_monotonicity {
+    use portcullis::{
+        CapabilityLevel, GradedTaintGuard, Operation, PermissionLattice, TaintLabel, TaintSet,
+        ToolCallGuard,
+    };
+
+    fn trifecta_perms() -> PermissionLattice {
+        let mut perms = PermissionLattice::default();
+        perms.capabilities.read_files = CapabilityLevel::Always;
+        perms.capabilities.web_fetch = CapabilityLevel::LowRisk;
+        perms.capabilities.run_bash = CapabilityLevel::LowRisk;
+        perms.capabilities.glob_search = CapabilityLevel::Always;
+        perms.capabilities.grep_search = CapabilityLevel::Always;
+        perms.capabilities.web_search = CapabilityLevel::LowRisk;
+        perms.capabilities.git_push = CapabilityLevel::LowRisk;
+        perms.capabilities.create_pr = CapabilityLevel::LowRisk;
+        perms.trifecta_constraint = true;
+        perms.normalize()
+    }
+
+    /// All operations for exhaustive testing.
+    const ALL_OPS: [Operation; 12] = [
+        Operation::ReadFiles,
+        Operation::WriteFiles,
+        Operation::EditFiles,
+        Operation::RunBash,
+        Operation::GlobSearch,
+        Operation::GrepSearch,
+        Operation::WebSearch,
+        Operation::WebFetch,
+        Operation::GitCommit,
+        Operation::GitPush,
+        Operation::CreatePr,
+        Operation::ManagePods,
+    ];
+
+    /// E1 conformance: apply_record always produces a superset.
+    ///
+    /// For every operation, taint_core::apply_record(t, op) ⊇ t.
+    #[test]
+    fn conformance_e1_event_taint_monotone() {
+        use portcullis::taint_core;
+
+        // Test with every possible starting taint set (2^3 = 8 combinations)
+        let labels = [
+            TaintLabel::PrivateData,
+            TaintLabel::UntrustedContent,
+            TaintLabel::ExfilVector,
+        ];
+
+        for pd in [false, true] {
+            for uc in [false, true] {
+                for ev in [false, true] {
+                    let mut starting = TaintSet::empty();
+                    if pd {
+                        starting = starting.union(&TaintSet::singleton(labels[0]));
+                    }
+                    if uc {
+                        starting = starting.union(&TaintSet::singleton(labels[1]));
+                    }
+                    if ev {
+                        starting = starting.union(&TaintSet::singleton(labels[2]));
+                    }
+
+                    for &op in &ALL_OPS {
+                        let result = taint_core::apply_record(&starting, op);
+                        assert!(
+                            result.is_superset_of(&starting),
+                            "E1 violation: apply_record({}, {:?}) = {} is NOT a superset",
+                            starting,
+                            op,
+                            result,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// E2 conformance: trace taint is monotone through guard operations.
+    ///
+    /// Feed a sequence of operations through GradedTaintGuard and verify
+    /// that accumulated_risk never decreases.
+    #[test]
+    fn conformance_e2_trace_taint_monotone() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        let ops = vec![
+            Operation::ReadFiles,
+            Operation::GlobSearch,
+            Operation::WebFetch,
+            Operation::WriteFiles,
+            Operation::EditFiles,
+            Operation::GitCommit,
+        ];
+
+        let mut prev_risk = guard.accumulated_risk();
+        let mut prev_taint = guard.taint();
+
+        for &op in &ops {
+            if let Ok(proof) = guard.check(op) {
+                let _ = guard.execute_and_record(proof, || Ok::<_, String>(()));
+            }
+
+            let new_risk = guard.accumulated_risk();
+            let new_taint = guard.taint();
+
+            assert!(
+                new_risk >= prev_risk,
+                "E2 violation: risk decreased from {:?} to {:?} after {:?}",
+                prev_risk,
+                new_risk,
+                op,
+            );
+            assert!(
+                new_taint.is_superset_of(&prev_taint),
+                "E2 violation: taint shrank from {} to {} after {:?}",
+                prev_taint,
+                new_taint,
+                op,
+            );
+
+            prev_risk = new_risk;
+            prev_taint = new_taint;
+        }
+    }
+
+    /// E3 conformance: once denied, always denied.
+    ///
+    /// After the trifecta is reached, verify that the denied operation
+    /// remains denied regardless of what other operations are recorded.
+    #[test]
+    fn conformance_e3_denial_monotone() {
+        let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+        // Build up to trifecta: read + fetch → RunBash would complete it
+        let proof = guard.check(Operation::ReadFiles).unwrap();
+        guard
+            .execute_and_record(proof, || Ok::<_, String>(()))
+            .unwrap();
+
+        let proof = guard.check(Operation::WebFetch).unwrap();
+        guard
+            .execute_and_record(proof, || Ok::<_, String>(()))
+            .unwrap();
+
+        // RunBash should now be denied (trifecta would complete)
+        assert!(
+            guard.check(Operation::RunBash).is_err(),
+            "RunBash should be denied with ReadFiles + WebFetch taint"
+        );
+
+        // Record more neutral operations
+        for &op in &[
+            Operation::WriteFiles,
+            Operation::EditFiles,
+            Operation::GitCommit,
+        ] {
+            let proof = guard.check(op).unwrap();
+            guard
+                .execute_and_record(proof, || Ok::<_, String>(()))
+                .unwrap();
+        }
+
+        // RunBash should STILL be denied (taint only grew)
+        assert!(
+            guard.check(Operation::RunBash).is_err(),
+            "E3 violation: RunBash allowed after taint growth (should stay denied)"
+        );
+
+        // Also check that GitPush/CreatePr are denied (same trifecta legs)
+        assert!(
+            guard.check(Operation::GitPush).is_err(),
+            "E3 violation: GitPush allowed after trifecta (should be denied)"
+        );
+        assert!(
+            guard.check(Operation::CreatePr).is_err(),
+            "E3 violation: CreatePr allowed after trifecta (should be denied)"
+        );
+    }
+
+    /// E3+ conformance: denial is permanent across all operation permutations.
+    ///
+    /// For every possible 2-operation prefix that creates a trifecta denial,
+    /// verify that the denied operation stays denied after recording neutral ops.
+    #[test]
+    fn conformance_e3_exhaustive() {
+        let trifecta_creators: [(Operation, Operation, Operation); 3] = [
+            (
+                Operation::ReadFiles,
+                Operation::WebFetch,
+                Operation::RunBash,
+            ),
+            (
+                Operation::ReadFiles,
+                Operation::WebFetch,
+                Operation::GitPush,
+            ),
+            (
+                Operation::GlobSearch,
+                Operation::WebSearch,
+                Operation::CreatePr,
+            ),
+        ];
+
+        let neutral_ops = [
+            Operation::WriteFiles,
+            Operation::EditFiles,
+            Operation::GitCommit,
+            Operation::ManagePods,
+        ];
+
+        for (leg1, leg2, denied_op) in &trifecta_creators {
+            let guard = GradedTaintGuard::new(trifecta_perms(), "[]");
+
+            // Record the two trifecta legs
+            let proof = guard.check(*leg1).unwrap();
+            guard
+                .execute_and_record(proof, || Ok::<_, String>(()))
+                .unwrap();
+
+            let proof = guard.check(*leg2).unwrap();
+            guard
+                .execute_and_record(proof, || Ok::<_, String>(()))
+                .unwrap();
+
+            // Verify denial
+            assert!(
+                guard.check(*denied_op).is_err(),
+                "{:?} should be denied after [{:?}, {:?}]",
+                denied_op,
+                leg1,
+                leg2,
+            );
+
+            // Record all neutral operations (skip if capability-denied)
+            for &neutral in &neutral_ops {
+                if let Ok(proof) = guard.check(neutral) {
+                    guard
+                        .execute_and_record(proof, || Ok::<_, String>(()))
+                        .unwrap();
+                }
+            }
+
+            // Denial must persist
+            assert!(
+                guard.check(*denied_op).is_err(),
+                "E3 violation: {:?} became allowed after neutral ops (was denied after [{:?}, {:?}])",
+                denied_op,
+                leg1,
+                leg2,
+            );
+        }
+    }
+}

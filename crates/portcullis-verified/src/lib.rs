@@ -5527,6 +5527,156 @@ proof fn proof_g7_gamma_monotone(r1: nat, r2: nat, threshold: nat)
 {
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 2 START: Enforcement Boundary — Permission Monotonicity
+//
+// North Star Phase 2: "Every code path either enforces the lattice or panics."
+// The hardening checklist marks "No privilege relaxation after creation" as
+// PARTIAL. These proofs establish the foundational property:
+//
+//   Taint only grows → permissions only tighten → no privilege escalation.
+//
+// E1: Taint monotonicity — apply_event_taint always produces a superset
+// E2: Trace taint monotonicity — trace_taint_at(trace, i) ⊆ trace_taint_at(trace, j) for i ≤ j
+// E3: Denial monotonicity — once denied, always denied (corollary of E1+E2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// E1: Taint monotonicity — apply_event_taint(t, e) ⊇ t
+///
+/// For any event e, the taint after applying e is a superset of the taint
+/// before. This is the fundamental property: taint only grows, never shrinks.
+///
+/// This holds because apply_event_taint either:
+///   - adds a singleton (union with singleton ⊇ original), or
+///   - returns the taint unchanged (neutral/failed events)
+proof fn proof_e1_event_taint_monotone(taint: SpecTaintSet, event: McpEvent)
+    requires valid_event(event),
+    ensures taint_subset(taint, apply_event_taint(taint, event)),
+{
+    // Case 1: succeeded and non-neutral → union with singleton
+    // Case 2: failed or neutral → identity
+    // In both cases, result ⊇ taint (union is inflationary)
+}
+
+/// E2: Trace taint monotonicity — trace_taint_at(trace, i) ⊆ trace_taint_at(trace, j) for i ≤ j
+///
+/// Accumulated taint at any point in a trace is a subset of accumulated
+/// taint at any later point. This is the inductive consequence of E1:
+/// each step either grows taint or leaves it unchanged.
+proof fn proof_e2_trace_taint_monotone(trace: Seq<McpEvent>, i: nat, j: nat)
+    requires
+        i <= j,
+        j <= trace.len(),
+        trace_valid(trace),
+    ensures
+        taint_subset(trace_taint_at(trace, i), trace_taint_at(trace, j)),
+    decreases j - i,
+{
+    if i == j {
+        // Base case: taint_subset(t, t) is trivially true
+    } else {
+        // Inductive step: show trace_taint_at(trace, i) ⊆ trace_taint_at(trace, j)
+        // by: trace_taint_at(trace, i) ⊆ trace_taint_at(trace, j-1) (IH)
+        //     trace_taint_at(trace, j-1) ⊆ trace_taint_at(trace, j) (E1)
+        //     ⊆ is transitive
+
+        // IH: i ⊆ j-1
+        proof_e2_trace_taint_monotone(trace, i, (j - 1) as nat);
+
+        // E1: j-1 ⊆ j
+        let taint_before = trace_taint_at(trace, (j - 1) as nat);
+        let event = trace[(j - 1) as int];
+        proof_e1_event_taint_monotone(taint_before, event);
+
+        // Transitivity of taint_subset
+        let taint_i = trace_taint_at(trace, i);
+        let taint_j1 = trace_taint_at(trace, (j - 1) as nat);
+        let taint_j = trace_taint_at(trace, j);
+
+        // Assert the chain: taint_i ⊆ taint_j1 ⊆ taint_j
+        assert(taint_subset(taint_i, taint_j1));
+        assert(taint_subset(taint_j1, taint_j));
+
+        // Unfolding taint_subset transitivity for Z3
+        assert(taint_i.private_data ==> taint_j1.private_data);
+        assert(taint_j1.private_data ==> taint_j.private_data);
+        assert(taint_i.untrusted_content ==> taint_j1.untrusted_content);
+        assert(taint_j1.untrusted_content ==> taint_j.untrusted_content);
+        assert(taint_i.exfil_vector ==> taint_j1.exfil_vector);
+        assert(taint_j1.exfil_vector ==> taint_j.exfil_vector);
+    }
+}
+
+/// E3: Denial monotonicity — once denied, always denied.
+///
+/// If an operation would be denied at time i in a trace, it will also be
+/// denied at all later times j > i. This follows from:
+///   - taint only grows (E2)
+///   - guard_would_deny is monotone in taint: more taint → more denials
+///
+/// This is the formal statement of "no privilege escalation":
+/// once the guard blocks an operation, no future events can unblock it.
+proof fn proof_e3_denial_monotone(
+    obs: Obs,
+    trace: Seq<McpEvent>,
+    op: nat,
+    i: nat,
+    j: nat,
+)
+    requires
+        i <= j,
+        j <= trace.len(),
+        trace_valid(trace),
+        valid_operation(op),
+        guard_would_deny(obs, trace_taint_at(trace, i), op),
+    ensures
+        guard_would_deny(obs, trace_taint_at(trace, j), op),
+{
+    // From E2: trace_taint_at(trace, i) ⊆ trace_taint_at(trace, j)
+    proof_e2_trace_taint_monotone(trace, i, j);
+
+    let taint_i = trace_taint_at(trace, i);
+    let taint_j = trace_taint_at(trace, j);
+
+    // guard_would_deny checks if projected taint is trifecta-complete.
+    // Projected taint = union(current, singleton(label(op))).
+    // Since taint_i ⊆ taint_j:
+    //   projected_i ⊆ projected_j
+    //   trifecta_complete(projected_i) ⟹ trifecta_complete(projected_j)
+    //
+    // For RunBash (op=3), projected = union(union(current, singleton(0)), singleton(2))
+    // For others: projected = union(current, singleton(label(op)))
+    // In both cases, monotonicity of union ensures projected_i ⊆ projected_j.
+
+    assert(taint_subset(taint_i, taint_j));
+
+    // Unfold the projection for Z3 to see monotonicity
+    if op == 3 {
+        // RunBash omnibus case
+        let proj_i = taint_union(taint_union(taint_i, taint_singleton(0)), taint_singleton(2));
+        let proj_j = taint_union(taint_union(taint_j, taint_singleton(0)), taint_singleton(2));
+
+        // proj_i ⊆ proj_j because taint_i ⊆ taint_j and union is monotone
+        assert(proj_i.private_data ==> proj_j.private_data);
+        assert(proj_i.untrusted_content ==> proj_j.untrusted_content);
+        assert(proj_i.exfil_vector ==> proj_j.exfil_vector);
+        assert(taint_is_trifecta_complete(proj_i) ==> taint_is_trifecta_complete(proj_j));
+    } else if operation_taint_label(op) <= 2 {
+        // Normal tainted operation
+        let label = operation_taint_label(op);
+        let proj_i = taint_union(taint_i, taint_singleton(label));
+        let proj_j = taint_union(taint_j, taint_singleton(label));
+
+        assert(proj_i.private_data ==> proj_j.private_data);
+        assert(proj_i.untrusted_content ==> proj_j.untrusted_content);
+        assert(proj_i.exfil_vector ==> proj_j.exfil_vector);
+        assert(taint_is_trifecta_complete(proj_i) ==> taint_is_trifecta_complete(proj_j));
+    } else {
+        // Neutral operation — projected == current, so same logic
+        assert(taint_is_trifecta_complete(taint_i) ==> taint_is_trifecta_complete(taint_j));
+    }
+}
+
 fn main() {}
 
 } // verus!
