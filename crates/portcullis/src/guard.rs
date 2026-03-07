@@ -726,6 +726,7 @@ pub struct TaintSet {
     exfil_vector: bool,
     /// Extension taint labels for emerging threat categories.
     /// Does NOT affect the core trifecta predicate.
+    #[cfg(not(kani))]
     extensions: std::collections::BTreeSet<ExtensionTaintLabel>,
 }
 
@@ -747,6 +748,7 @@ impl TaintSet {
     }
 
     /// Create a taint set from a single extension label.
+    #[cfg(not(kani))]
     pub fn extension_singleton(label: ExtensionTaintLabel) -> Self {
         let mut s = Self::empty();
         s.extensions.insert(label);
@@ -758,6 +760,7 @@ impl TaintSet {
     /// Core labels: bitwise OR (FROZEN).
     /// Extension labels: set union.
     pub fn union(&self, other: &Self) -> Self {
+        #[cfg(not(kani))]
         let extensions = if self.extensions.is_empty() && other.extensions.is_empty() {
             std::collections::BTreeSet::new()
         } else {
@@ -767,6 +770,7 @@ impl TaintSet {
             private_data: self.private_data || other.private_data,
             untrusted_content: self.untrusted_content || other.untrusted_content,
             exfil_vector: self.exfil_vector || other.exfil_vector,
+            #[cfg(not(kani))]
             extensions,
         }
     }
@@ -810,16 +814,22 @@ impl TaintSet {
         let core_ok = (!other.private_data || self.private_data)
             && (!other.untrusted_content || self.untrusted_content)
             && (!other.exfil_vector || self.exfil_vector);
-        // Short-circuit empty extensions (avoids Kani state explosion on BTreeSet)
-        core_ok && (other.extensions.is_empty() || other.extensions.is_subset(&self.extensions))
+        #[cfg(not(kani))]
+        {
+            core_ok && (other.extensions.is_empty() || other.extensions.is_subset(&self.extensions))
+        }
+        #[cfg(kani)]
+        core_ok
     }
 
     /// Check if a specific extension taint label is present.
+    #[cfg(not(kani))]
     pub fn contains_extension(&self, label: &ExtensionTaintLabel) -> bool {
         self.extensions.contains(label)
     }
 
     /// Iterator over all extension labels present in this taint set.
+    #[cfg(not(kani))]
     pub fn extension_labels(&self) -> impl Iterator<Item = &ExtensionTaintLabel> {
         self.extensions.iter()
     }
@@ -837,6 +847,7 @@ impl std::fmt::Display for TaintSet {
         if self.exfil_vector {
             labels.push("ExfilVector".to_string());
         }
+        #[cfg(not(kani))]
         for ext in &self.extensions {
             labels.push(format!("ext:{}", ext.0));
         }

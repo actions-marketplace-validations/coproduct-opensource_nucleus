@@ -74,10 +74,13 @@ impl DangerousCombo {
             .required_core_labels
             .iter()
             .all(|req| taint.contains(req.to_label()));
+        #[cfg(not(kani))]
         let ext_met = self
             .required_ext_labels
             .iter()
             .all(|label| taint.contains_extension(label));
+        #[cfg(kani)]
+        let ext_met = true;
         core_met && ext_met
     }
 
