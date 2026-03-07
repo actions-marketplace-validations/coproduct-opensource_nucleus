@@ -35,6 +35,11 @@ echo "Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
 echo "::endgroup::"
 
 echo "::group::Create branch"
+# Delete remote branch if it exists from a previous run (stale plan-only attempt)
+if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+  echo "Branch $BRANCH exists on remote — deleting stale branch"
+  git push origin --delete "$BRANCH" || true
+fi
 git checkout -b "$BRANCH"
 echo "::endgroup::"
 
@@ -59,15 +64,23 @@ nucleus run \
 echo "::endgroup::"
 
 # Check if the agent made any commits
-if git diff --quiet HEAD origin/main 2>/dev/null; then
+DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print $NF}')
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+if git diff --quiet "HEAD" "origin/${DEFAULT_BRANCH}" 2>/dev/null; then
   echo "::warning::Agent made no changes. No PR created."
   exit 0
 fi
 
 echo "::group::Push and create PR"
 # The TRUSTED CI script pushes — not the agent
+git push origin --delete "nucleus/fix-issue-${ISSUE_NUMBER}" 2>/dev/null || true
 git push origin "$BRANCH"
 
+# Always output branch — even if PR creation fails
+echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+# PR creation is non-fatal: some orgs block Actions from creating PRs
+set +e
 PR_URL=$(gh pr create \
   --title "fix: ${ISSUE_TITLE} (nucleus #${ISSUE_NUMBER})" \
   --body "$(cat <<EOF
@@ -90,8 +103,13 @@ Automated fix for #${ISSUE_NUMBER} by Nucleus safe PR fixer.
 EOF
 )" \
   --head "$BRANCH")
+PR_EXIT=$?
+set -e
 
-echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
-echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
-echo "Created PR: ${PR_URL}"
+if [ $PR_EXIT -eq 0 ]; then
+  echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+  echo "Created PR: ${PR_URL}"
+else
+  echo "::warning::gh pr create failed (exit $PR_EXIT). Branch '${BRANCH}' was pushed — create the PR manually."
+fi
 echo "::endgroup::"
