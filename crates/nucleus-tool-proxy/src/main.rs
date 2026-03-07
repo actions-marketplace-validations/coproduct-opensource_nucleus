@@ -39,6 +39,7 @@ mod node_client;
 mod policy;
 mod sandbox_proof;
 mod validation;
+mod web_fetch_policy;
 
 use attestation::{AttestationConfig, AttestationVerifier};
 use auth::{AuthConfig, AuthError};
@@ -94,6 +95,24 @@ struct Args {
     /// Entries are POSTed as JSON with HMAC signature in X-Nucleus-Signature header.
     #[arg(long, env = "NUCLEUS_TOOL_PROXY_AUDIT_WEBHOOK")]
     audit_webhook: Option<String>,
+    /// S3 bucket for deletion-resistant audit storage.
+    /// Each audit entry is stored as a separate object with `if_none_match("*")`
+    /// to enforce append-only semantics. Compatible with AWS S3, MinIO, R2, Tigris.
+    #[cfg(feature = "remote-audit")]
+    #[arg(long, env = "NUCLEUS_TOOL_PROXY_AUDIT_S3_BUCKET")]
+    audit_s3_bucket: Option<String>,
+    /// Key prefix for audit objects in S3 (e.g. "audit/pod-name").
+    #[cfg(feature = "remote-audit")]
+    #[arg(long, env = "NUCLEUS_TOOL_PROXY_AUDIT_S3_PREFIX")]
+    audit_s3_prefix: Option<String>,
+    /// AWS region for the audit S3 bucket.
+    #[cfg(feature = "remote-audit")]
+    #[arg(long, env = "NUCLEUS_TOOL_PROXY_AUDIT_S3_REGION")]
+    audit_s3_region: Option<String>,
+    /// Custom S3 endpoint URL (for MinIO, R2, Tigris, etc.).
+    #[cfg(feature = "remote-audit")]
+    #[arg(long, env = "NUCLEUS_TOOL_PROXY_AUDIT_S3_ENDPOINT")]
+    audit_s3_endpoint: Option<String>,
     /// Timeout in seconds for web fetch requests.
     #[arg(
         long,
@@ -241,6 +260,8 @@ pub(crate) struct AppState {
     pub(crate) web_client: reqwest::Client,
     web_fetch_max_bytes: usize,
     dns_allow: Vec<String>,
+    /// URL pattern allowlist for web_fetch. If non-empty, URLs must match.
+    url_allow: Vec<String>,
     attestation_verifier: AttestationVerifier,
     policy_engine: PolicyEngine,
     /// Node client for pod management (orchestrator mode only).
@@ -380,6 +401,51 @@ fn is_expired(expires_at_unix: Option<u64>) -> bool {
         Some(ts) => ts <= now_unix(),
         None => false,
     }
+}
+
+/// Simple URL glob matcher for `url_allow` patterns.
+///
+/// - `*` matches any sequence of characters except `/`
+/// - `**` matches any sequence of characters including `/`
+/// - All other characters match literally.
+pub(crate) fn url_glob_match(pattern: &str, url: &str) -> bool {
+    url_glob_match_inner(pattern.as_bytes(), url.as_bytes())
+}
+
+fn url_glob_match_inner(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    if pattern.len() >= 2 && pattern[0] == b'*' && pattern[1] == b'*' {
+        // `**` — match any number of chars (including `/`)
+        let rest = &pattern[2..];
+        for i in 0..=text.len() {
+            if url_glob_match_inner(rest, &text[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if pattern[0] == b'*' {
+        // `*` — match any number of non-`/` chars
+        let rest = &pattern[1..];
+        for i in 0..=text.len() {
+            if i > 0 && text[i - 1] == b'/' {
+                break;
+            }
+            if url_glob_match_inner(rest, &text[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if text.is_empty() {
+        return false;
+    }
+    if pattern[0] == text[0] {
+        return url_glob_match_inner(&pattern[1..], &text[1..]);
+    }
+    false
 }
 
 /// Load and verify a signed approval bundle from the NUCLEUS_APPROVAL_BUNDLE env var.
@@ -958,7 +1024,7 @@ async fn main() -> Result<(), ApiError> {
         }
     };
 
-    let audit = build_audit_log(&args, &auth)?;
+    let audit = build_audit_log(&args, &auth).await?;
 
     // Build HTTP client for web fetch
     let web_client = reqwest::Client::builder()
@@ -967,12 +1033,18 @@ async fn main() -> Result<(), ApiError> {
         .build()
         .map_err(|e| ApiError::Spec(format!("failed to build HTTP client: {e}")))?;
 
-    // Extract DNS allow list from spec
+    // Extract DNS and URL allow lists from spec
     let dns_allow = spec
         .spec
         .network
         .as_ref()
         .map(|n| n.dns_allow.clone())
+        .unwrap_or_default();
+    let url_allow = spec
+        .spec
+        .network
+        .as_ref()
+        .map(|n| n.url_allow.clone())
         .unwrap_or_default();
 
     // Build attestation verifier
@@ -1091,6 +1163,7 @@ async fn main() -> Result<(), ApiError> {
         web_client,
         web_fetch_max_bytes: args.web_fetch_max_bytes,
         dns_allow,
+        url_allow,
         attestation_verifier,
         policy_engine,
         node_client,
@@ -2025,23 +2098,19 @@ async fn web_fetch(
     let url =
         url::Url::parse(&url_str).map_err(|e| ApiError::WebFetch(format!("invalid URL: {e}")))?;
 
-    // Check DNS allow list (if configured)
-    if !state.dns_allow.is_empty() {
+    // Check DNS allow list (if configured) — shared with MCP path
+    {
         let host = url
             .host_str()
             .ok_or_else(|| ApiError::WebFetch("URL has no host".into()))?;
         let port = url.port_or_known_default().unwrap_or(443);
-        let host_port = format!("{}:{}", host, port);
-
-        let allowed = state.dns_allow.iter().any(|pattern| {
-            // Match exact host:port or host (any port)
-            pattern == &host_port || pattern == host || pattern.starts_with(&format!("{}:", host))
-        });
-
-        if !allowed {
-            return Err(ApiError::DnsNotAllowed(host_port));
-        }
+        web_fetch_policy::check_dns_allowlist(&state.dns_allow, host, port)
+            .map_err(ApiError::DnsNotAllowed)?;
     }
+
+    // Check URL allow list (if configured) — shared with MCP path
+    web_fetch_policy::check_url_allowlist(&state.url_allow, url.as_str())
+        .map_err(ApiError::WebFetch)?;
 
     // Build the request
     let method = req.method.as_deref().unwrap_or("GET").to_uppercase();
@@ -2070,8 +2139,22 @@ async fn web_fetch(
 
     let status = response.status().as_u16();
 
-    // Collect response headers
-    let response_headers: HashMap<String, String> = response
+    // Verify the final URL after redirects is still in the allowlist.
+    // Prevents open-redirect bypass attacks on allowlisted domains.
+    let final_url = response.url().clone();
+    web_fetch_policy::check_redirect_target(&state.dns_allow, &state.url_allow, &final_url)
+        .map_err(|e| ApiError::WebFetch(format!("redirect target blocked: {e}")))?;
+
+    // MIME type gating — shared with MCP path
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    web_fetch_policy::check_mime_type(content_type).map_err(ApiError::WebFetch)?;
+
+    // Collect response headers + add taint metadata
+    let mut response_headers: HashMap<String, String> = response
         .headers()
         .iter()
         .filter_map(|(k, v)| {
@@ -2080,6 +2163,19 @@ async fn web_fetch(
                 .map(|v| (k.as_str().to_string(), v.to_string()))
         })
         .collect();
+
+    // Taint provenance: mark all web-fetched content as untrusted.
+    // Downstream tool calls can use these headers for taint tracking.
+    response_headers.insert(
+        "x-nucleus-taint".to_string(),
+        "UntrustedContent".to_string(),
+    );
+    if let Some(host) = url::Url::parse(&url_str)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_string()))
+    {
+        response_headers.insert("x-nucleus-source-domain".to_string(), host);
+    }
 
     // Read body with size limit
     let bytes = response
@@ -3307,7 +3403,7 @@ impl axum::serve::Listener for VsockAxumListener {
     }
 }
 
-fn build_audit_log(args: &Args, auth: &AuthConfig) -> Result<Arc<AuditLog>, ApiError> {
+async fn build_audit_log(args: &Args, auth: &AuthConfig) -> Result<Arc<AuditLog>, ApiError> {
     use nucleus_client::drand::{DrandClient, DrandConfig, DrandFailMode};
 
     let path = args.audit_log.clone();
@@ -3358,6 +3454,34 @@ fn build_audit_log(args: &Args, auth: &AuthConfig) -> Result<Arc<AuditLog>, ApiE
         None
     };
 
+    // Set up S3 sink for deletion-resistant audit storage
+    #[cfg(feature = "remote-audit")]
+    let s3_sink = if let Some(bucket) = args.audit_s3_bucket.as_ref() {
+        let region = args.audit_s3_region.as_deref().unwrap_or("us-east-1");
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.to_string()));
+        if let Some(endpoint) = args.audit_s3_endpoint.as_ref() {
+            config_loader = config_loader.endpoint_url(endpoint);
+        }
+        let sdk_config = config_loader.load().await;
+        let s3_client = aws_sdk_s3::Client::new(&sdk_config);
+        let prefix = args
+            .audit_s3_prefix
+            .clone()
+            .unwrap_or_else(|| "audit".to_string());
+        info!(
+            "S3 audit sink configured: bucket={}, prefix={}",
+            bucket, prefix
+        );
+        Some(Arc::new(S3Sink {
+            client: s3_client,
+            bucket: bucket.clone(),
+            prefix,
+        }))
+    } else {
+        None
+    };
+
     Ok(Arc::new(AuditLog {
         path,
         secret,
@@ -3365,6 +3489,8 @@ fn build_audit_log(args: &Args, auth: &AuthConfig) -> Result<Arc<AuditLog>, ApiE
         entry_count: std::sync::atomic::AtomicU64::new(0),
         webhook,
         drand_client,
+        #[cfg(feature = "remote-audit")]
+        s3_sink,
     }))
 }
 
@@ -3533,11 +3659,55 @@ struct AuditLog {
     webhook: Option<WebhookSink>,
     /// Optional drand client for cryptographic time anchoring.
     drand_client: Option<Arc<nucleus_client::drand::DrandClient>>,
+    /// Optional S3-compatible sink for deletion-resistant audit storage.
+    #[cfg(feature = "remote-audit")]
+    s3_sink: Option<Arc<S3Sink>>,
 }
 
 struct WebhookSink {
     url: String,
     client: reqwest::Client,
+}
+
+/// S3-compatible append-only audit sink.
+///
+/// Each audit entry is stored as a separate S3 object. The `if_none_match("*")`
+/// precondition prevents overwriting existing entries. Combined with a bucket
+/// policy that denies `s3:DeleteObject`, this provides a deletion-resistant
+/// audit trail that a compromised pod cannot erase.
+#[cfg(feature = "remote-audit")]
+struct S3Sink {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    prefix: String,
+}
+
+#[cfg(feature = "remote-audit")]
+impl S3Sink {
+    /// Put a single audit line as an S3 object.
+    ///
+    /// Key format: `{prefix}/{timestamp_unix}-{hash_prefix}.jsonl`
+    /// Uses `if_none_match("*")` for append-only semantics: S3 returns 412
+    /// if an object with this key already exists.
+    async fn put_entry(&self, timestamp_unix: u64, hash: &str, line: &str) {
+        let hash_prefix = if hash.len() >= 8 { &hash[..8] } else { hash };
+        let key = format!("{}/{}-{}.jsonl", self.prefix, timestamp_unix, hash_prefix);
+
+        let result = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(line.as_bytes().to_vec().into())
+            .content_type("application/jsonl")
+            .if_none_match("*")
+            .send()
+            .await;
+
+        if let Err(e) = result {
+            tracing::warn!("failed to write audit entry to S3 (key={key}): {e}");
+        }
+    }
 }
 
 impl AuditLog {
@@ -3617,6 +3787,18 @@ impl AuditLog {
                 if let Err(e) = result {
                     tracing::warn!("failed to send audit entry to webhook: {e}");
                 }
+            });
+        }
+
+        // Send to S3 if configured (fire-and-forget, like webhook)
+        #[cfg(feature = "remote-audit")]
+        if let Some(s3) = &self.s3_sink {
+            let s3 = Arc::clone(s3);
+            let body = line.clone();
+            let ts = entry.timestamp_unix;
+            let h = entry.hash.clone();
+            tokio::spawn(async move {
+                s3.put_entry(ts, &h, &body).await;
             });
         }
 

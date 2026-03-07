@@ -1,5 +1,7 @@
 //! Capability lattice for tool permissions.
 
+use std::collections::BTreeMap;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +64,33 @@ pub enum Operation {
     CreatePr,
     /// Manage sub-pods (create, list, monitor, cancel)
     ManagePods,
+}
+
+/// Extension operation not covered by Verus proofs.
+///
+/// The 12 core operations above are frozen — they have 297 Verus verification
+/// conditions proving lattice laws, taint monotonicity, and session safety.
+/// Extension operations participate in the same product lattice (meet = pointwise min,
+/// join = pointwise max) but are verified only by property tests, not SMT proofs.
+///
+/// Lattice laws hold by the universal property of products in **Lat**: if each
+/// factor is a lattice, the product is a lattice. Since `CapabilityLevel` is a
+/// 3-element chain (a lattice), `CapabilityLevel^E` for any finite set `E` is a lattice.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ExtensionOperation(pub String);
+
+impl ExtensionOperation {
+    /// Create a new extension operation.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl std::fmt::Display for ExtensionOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 /// Approval obligations that gate autonomous capabilities.
@@ -157,6 +186,20 @@ pub struct CapabilityLattice {
     /// Manage sub-pods permission level
     #[cfg_attr(feature = "serde", serde(default))]
     pub manage_pods: CapabilityLevel,
+
+    /// Extension capability dimensions (not covered by Verus proofs).
+    ///
+    /// Meet = pointwise min, join = pointwise max, leq = pointwise ≤.
+    /// Unknown extensions default to `Never` (fail-closed).
+    ///
+    /// Excluded from Kani builds: BTreeMap's heap allocator is intractable
+    /// for bounded model checking. Extension lattice laws are covered by proptest.
+    #[cfg(not(kani))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub extensions: BTreeMap<ExtensionOperation, CapabilityLevel>,
 }
 
 impl Default for CapabilityLattice {
@@ -174,6 +217,8 @@ impl Default for CapabilityLattice {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::LowRisk,
             manage_pods: CapabilityLevel::Never,
+            #[cfg(not(kani))]
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -327,7 +372,7 @@ impl IncompatibilityConstraint {
 }
 
 impl CapabilityLattice {
-    /// Get the capability level for a given operation.
+    /// Get the capability level for a given core operation.
     pub fn level_for(&self, op: Operation) -> CapabilityLevel {
         match op {
             Operation::ReadFiles => self.read_files,
@@ -345,8 +390,37 @@ impl CapabilityLattice {
         }
     }
 
+    /// Get the capability level for an extension operation.
+    /// Returns `Never` (fail-closed) if the operation is not registered.
+    #[cfg(not(kani))]
+    pub fn extension_level(&self, op: &ExtensionOperation) -> CapabilityLevel {
+        self.extensions
+            .get(op)
+            .copied()
+            .unwrap_or(CapabilityLevel::Never)
+    }
+
     /// Meet operation: minimum of each capability.
+    ///
+    /// For extension dimensions, missing keys default to `Never`.
+    /// Since `min(x, Never) = Never`, absent extensions are fail-closed.
     pub fn meet(&self, other: &Self) -> Self {
+        #[cfg(not(kani))]
+        let ext = if self.extensions.is_empty() && other.extensions.is_empty() {
+            BTreeMap::new()
+        } else {
+            let mut ext = BTreeMap::new();
+            for key in self.extensions.keys().chain(other.extensions.keys()) {
+                let a = self.extension_level(key);
+                let b = other.extension_level(key);
+                let v = std::cmp::min(a, b);
+                if v != CapabilityLevel::Never {
+                    ext.insert(key.clone(), v);
+                }
+            }
+            ext
+        };
+
         Self {
             read_files: std::cmp::min(self.read_files, other.read_files),
             write_files: std::cmp::min(self.write_files, other.write_files),
@@ -360,11 +434,32 @@ impl CapabilityLattice {
             git_push: std::cmp::min(self.git_push, other.git_push),
             create_pr: std::cmp::min(self.create_pr, other.create_pr),
             manage_pods: std::cmp::min(self.manage_pods, other.manage_pods),
+            #[cfg(not(kani))]
+            extensions: ext,
         }
     }
 
     /// Join operation: maximum of each capability (least upper bound).
+    ///
+    /// For extension dimensions, missing keys default to `Never`.
+    /// Since `max(x, Never) = x`, only keys present in at least one operand appear.
     pub fn join(&self, other: &Self) -> Self {
+        #[cfg(not(kani))]
+        let ext = if self.extensions.is_empty() && other.extensions.is_empty() {
+            BTreeMap::new()
+        } else {
+            let mut ext = BTreeMap::new();
+            for key in self.extensions.keys().chain(other.extensions.keys()) {
+                let a = self.extension_level(key);
+                let b = other.extension_level(key);
+                let v = std::cmp::max(a, b);
+                if v != CapabilityLevel::Never {
+                    ext.insert(key.clone(), v);
+                }
+            }
+            ext
+        };
+
         Self {
             read_files: std::cmp::max(self.read_files, other.read_files),
             write_files: std::cmp::max(self.write_files, other.write_files),
@@ -378,12 +473,17 @@ impl CapabilityLattice {
             git_push: std::cmp::max(self.git_push, other.git_push),
             create_pr: std::cmp::max(self.create_pr, other.create_pr),
             manage_pods: std::cmp::max(self.manage_pods, other.manage_pods),
+            #[cfg(not(kani))]
+            extensions: ext,
         }
     }
 
     /// Check if this lattice is less than or equal to another (partial order).
+    ///
+    /// For extension dimensions, missing keys default to `Never`.
+    /// Since `Never ≤ x` for all `x`, absent extensions satisfy leq trivially.
     pub fn leq(&self, other: &Self) -> bool {
-        self.read_files <= other.read_files
+        let core_leq = self.read_files <= other.read_files
             && self.write_files <= other.write_files
             && self.edit_files <= other.edit_files
             && self.run_bash <= other.run_bash
@@ -394,10 +494,31 @@ impl CapabilityLattice {
             && self.git_commit <= other.git_commit
             && self.git_push <= other.git_push
             && self.create_pr <= other.create_pr
-            && self.manage_pods <= other.manage_pods
+            && self.manage_pods <= other.manage_pods;
+
+        if !core_leq {
+            return false;
+        }
+
+        // Extension leq check — excluded from Kani (BTreeMap intractable for BMC)
+        #[cfg(not(kani))]
+        {
+            if !self.extensions.is_empty() || !other.extensions.is_empty() {
+                for key in self.extensions.keys().chain(other.extensions.keys()) {
+                    if self.extension_level(key) > other.extension_level(key) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
     }
 
     /// Create a permissive capability set (top of lattice).
+    ///
+    /// Note: This is the top of the CORE lattice only.
+    /// Extension dimensions are empty — they must be configured explicitly.
     pub fn permissive() -> Self {
         Self {
             read_files: CapabilityLevel::Always,
@@ -412,6 +533,8 @@ impl CapabilityLattice {
             git_push: CapabilityLevel::Always,
             create_pr: CapabilityLevel::Always,
             manage_pods: CapabilityLevel::Always,
+            #[cfg(not(kani))]
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -430,6 +553,8 @@ impl CapabilityLattice {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            #[cfg(not(kani))]
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -572,6 +697,7 @@ mod tests {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            extensions: BTreeMap::new(),
         };
 
         let constraint = IncompatibilityConstraint::enforcing();

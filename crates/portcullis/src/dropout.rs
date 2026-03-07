@@ -383,6 +383,8 @@ fn project_capabilities(
         } else {
             CapabilityLevel::Always
         },
+        #[cfg(not(kani))]
+        extensions: std::collections::BTreeMap::new(),
     }
 }
 
@@ -855,6 +857,7 @@ mod tests {
                     git_push: gp,
                     create_pr: cp,
                     manage_pods: mp,
+                    extensions: std::collections::BTreeMap::new(),
                 }
             })
     }

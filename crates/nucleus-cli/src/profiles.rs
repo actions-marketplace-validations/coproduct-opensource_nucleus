@@ -21,6 +21,8 @@ pub enum Profile {
     LocalDev,
     /// Fix issue: write + bash + git commit (no push/PR)
     FixIssue,
+    /// Safe PR fixer: write + bash + git commit + web fetch (no push/PR/search)
+    SafePrFixer,
     /// Release: full dev + git push/PR with approvals
     Release,
     /// Database client: limited CLI access for DB tools
@@ -45,6 +47,7 @@ impl Profile {
             "edit-only" | "edit" => Some(Self::EditOnly),
             "local-dev" | "local" => Some(Self::LocalDev),
             "fix-issue" | "fixissue" | "fix" => Some(Self::FixIssue),
+            "safe-pr-fixer" | "safe_pr_fixer" | "safe-pr" => Some(Self::SafePrFixer),
             "release" | "publish" => Some(Self::Release),
             "database-client" | "db-client" | "database" => Some(Self::DatabaseClient),
             "demo" => Some(Self::Demo),
@@ -65,6 +68,7 @@ impl Profile {
             Self::EditOnly => PermissionLattice::edit_only(),
             Self::LocalDev => PermissionLattice::local_dev(),
             Self::FixIssue => PermissionLattice::fix_issue(),
+            Self::SafePrFixer => PermissionLattice::safe_pr_fixer(),
             Self::Release => PermissionLattice::release(),
             Self::DatabaseClient => PermissionLattice::database_client(),
             Self::Demo => PermissionLattice::demo(),
@@ -85,6 +89,7 @@ impl Profile {
             "edit-only",
             "local-dev",
             "fix-issue",
+            "safe-pr-fixer",
             "release",
             "database-client",
             "demo",
@@ -107,6 +112,7 @@ pub fn list() -> Result<()> {
     println!("  edit-only      Write + edit without exec or web");
     println!("  local-dev      Write + shell without web");
     println!("  fix-issue      Write + bash + git commit (no push/PR)");
+    println!("  safe-pr-fixer  Write + bash + commit + web fetch (no push/PR/search)");
     println!("  release        Full dev + git push/PR with approvals");
     println!("  database-client  DB CLI only (psql/mysql/redis)");
     println!("  demo           Demo-friendly permissions with approvals");

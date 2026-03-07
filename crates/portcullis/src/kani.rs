@@ -114,6 +114,7 @@ fn build_ordered_permissions() -> (PermissionLattice, PermissionLattice) {
         git_push: push_lo,
         create_pr: pr_lo,
         manage_pods: pods_lo,
+        // extensions field excluded via #[cfg(not(kani))]
     };
     lhs.obligations = superset_obligations;
     lhs.trifecta_constraint = trifecta;
@@ -132,6 +133,7 @@ fn build_ordered_permissions() -> (PermissionLattice, PermissionLattice) {
         git_push: push_hi,
         create_pr: pr_hi,
         manage_pods: pods_hi,
+        // extensions field excluded via #[cfg(not(kani))]
     };
     rhs.obligations = base_obligations;
     rhs.trifecta_constraint = trifecta;
@@ -182,6 +184,7 @@ fn arbitrary_caps() -> CapabilityLattice {
         git_push: level_from_u8(kani::any::<u8>()),
         create_pr: level_from_u8(kani::any::<u8>()),
         manage_pods: level_from_u8(kani::any::<u8>()),
+        // extensions field excluded via #[cfg(not(kani))]
     }
 }
 

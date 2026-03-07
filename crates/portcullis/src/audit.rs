@@ -46,9 +46,22 @@ use crate::weakening::{WeakeningCost, WeakeningRequest};
 use crate::CapabilityLevel;
 
 /// An audit entry recording a permission-related event.
+///
+/// ## Versioning
+///
+/// v1 fields (sequence through prev_hash) are FROZEN. The `content_hash()`
+/// method only hashes v1 fields, so v1 verifiers can validate the hash chain
+/// even when extension fields are present.
+///
+/// `schema_version` is always 1 for v1.0 entries. Future versions add fields
+/// to `extensions` or as named fields with schema_version bumps.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AuditEntry {
+    /// Schema version. Always 1 for v1.0 entries.
+    #[cfg_attr(feature = "serde", serde(default = "default_schema_version"))]
+    pub schema_version: u32,
+    // === v1.0 FROZEN ===
     /// Unique identifier for this entry (monotonic).
     pub sequence: u64,
     /// Timestamp when the event occurred.
@@ -64,12 +77,26 @@ pub struct AuditEntry {
     /// SHA-256 hash of the previous entry, forming a tamper-evident chain.
     /// `None` for the first entry in the log.
     pub prev_hash: Option<String>,
+    // === Forward-compatible extensions ===
+    /// Extension data for future schema versions.
+    /// Not included in v1 `content_hash()` — v1 verifiers ignore this.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")
+    )]
+    pub extensions: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(feature = "serde")]
+fn default_schema_version() -> u32 {
+    1
 }
 
 impl AuditEntry {
     /// Create a new audit entry with the current timestamp.
     pub fn new(identity: impl Into<String>, event: PermissionEvent) -> Self {
         Self {
+            schema_version: 1,
             sequence: 0, // Set by the log
             timestamp: SystemTime::now(),
             identity: identity.into(),
@@ -77,6 +104,7 @@ impl AuditEntry {
             correlation_id: None,
             session_id: None,
             prev_hash: None, // Set by the log during record()
+            extensions: std::collections::BTreeMap::new(),
         }
     }
 

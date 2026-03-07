@@ -1224,6 +1224,32 @@ async fn spawn_local_pod(
         audit_path.to_string_lossy().as_ref(),
     );
 
+    // Pass audit sink config from PodSpec for deletion-resistant remote storage
+    if let Some(ref sink) = spec.spec.audit_sink {
+        command.env("NUCLEUS_TOOL_PROXY_AUDIT_S3_BUCKET", &sink.s3_bucket);
+        if let Some(ref prefix) = sink.s3_prefix {
+            command.env("NUCLEUS_TOOL_PROXY_AUDIT_S3_PREFIX", prefix);
+        }
+        if let Some(ref region) = sink.s3_region {
+            command.env("NUCLEUS_TOOL_PROXY_AUDIT_S3_REGION", region);
+        }
+        if let Some(ref endpoint) = sink.s3_endpoint {
+            command.env("NUCLEUS_TOOL_PROXY_AUDIT_S3_ENDPOINT", endpoint);
+        }
+        // Forward ambient AWS credentials so the tool-proxy's aws_config chain works.
+        // Operators set these on nucleus-node; they flow through to the S3 sink.
+        for key in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_DEFAULT_REGION",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                command.env(key, val);
+            }
+        }
+    }
+
     // Inject sandbox proof token so tool-proxy can verify it's in a managed sandbox.
     let sandbox_token = nucleus_client::generate_sandbox_token(
         state.proxy_auth_secret.as_bytes(),
@@ -1364,6 +1390,34 @@ async fn spawn_container_pod(
             state.proxy_approval_secret
         ));
         env.push("NUCLEUS_TOOL_PROXY_AUDIT_LOG=/data/pod/audit.log".to_string());
+
+        // Pass audit sink config from PodSpec for deletion-resistant remote storage
+        if let Some(ref sink) = spec.spec.audit_sink {
+            env.push(format!(
+                "NUCLEUS_TOOL_PROXY_AUDIT_S3_BUCKET={}",
+                sink.s3_bucket
+            ));
+            if let Some(ref prefix) = sink.s3_prefix {
+                env.push(format!("NUCLEUS_TOOL_PROXY_AUDIT_S3_PREFIX={prefix}"));
+            }
+            if let Some(ref region) = sink.s3_region {
+                env.push(format!("NUCLEUS_TOOL_PROXY_AUDIT_S3_REGION={region}"));
+            }
+            if let Some(ref endpoint) = sink.s3_endpoint {
+                env.push(format!("NUCLEUS_TOOL_PROXY_AUDIT_S3_ENDPOINT={endpoint}"));
+            }
+            // Forward ambient AWS credentials for the S3 sink
+            for key in [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_DEFAULT_REGION",
+            ] {
+                if let Ok(val) = std::env::var(key) {
+                    env.push(format!("{key}={val}"));
+                }
+            }
+        }
     }
 
     // Pass credentials from PodSpec (if any)
@@ -1801,6 +1855,25 @@ async fn spawn_firecracker_pod(
             }
         };
         let pid = child.id();
+
+        // Verify seccomp is active on the Firecracker process (unless explicitly disabled).
+        // Seccomp mode 2 = SECCOMP_MODE_FILTER (BPF filter active).
+        if !matches!(spec.spec.seccomp, Some(nucleus_spec::SeccompSpec::Disabled)) {
+            if let Some(fc_pid) = pid {
+                match verify_seccomp_active(fc_pid) {
+                    Ok(()) => {
+                        tracing::info!(
+                            pid = fc_pid,
+                            "seccomp filter verified active on firecracker process"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(pid = fc_pid, error = %e, "seccomp verification failed (may not be readable in some environments)");
+                    }
+                }
+            }
+        }
+
         let mut netns_baseline: Option<String> = None;
         let mut netns_pid: Option<u32> = None;
 
@@ -1809,6 +1882,9 @@ async fn spawn_firecracker_pod(
                 allow: Vec::new(),
                 deny: Vec::new(),
                 dns_allow: Vec::new(),
+                url_allow: Vec::new(),
+                mime_allow: None,
+                max_response_bytes: None,
             };
             let policy = spec.spec.network.as_ref().unwrap_or(&default_policy);
             let pid = match pid {
@@ -2592,6 +2668,19 @@ impl NodeService for GrpcService {
         let manifest_hash =
             nucleus_identity::approval_bundle::compute_manifest_hash(spec_yaml.as_bytes());
 
+        // Compute v1 content hash: SHA-256 of canonical v1 fields
+        let v1_content_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(id.as_bytes());
+            hasher.update(report.workspace_hash.as_bytes());
+            hasher.update(report.audit_tail_hash.as_bytes());
+            hasher.update(report.audit_entry_count.to_le_bytes());
+            hasher.update(report.timestamp_unix.to_le_bytes());
+            hasher.update(manifest_hash.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
         Ok(GrpcResponse::new(proto::GetReceiptResponse {
             receipt: Some(proto::ExecutionReceipt {
                 pod_id: id.to_string(),
@@ -2602,6 +2691,9 @@ impl NodeService for GrpcService {
                 manifest_hash,
                 sandbox_tier: String::new(), // TODO: extract from pod metadata
                 spiffe_id: String::new(),    // TODO: extract from pod metadata
+                version: 1,
+                v1_content_hash,
+                extensions: std::collections::HashMap::new(),
             }),
         }))
     }
@@ -2897,6 +2989,42 @@ impl FirecrackerConfig {
             };
         }
 
+        // Inject audit S3 sink config and AWS credentials via kernel args
+        if let Some(ref sink) = spec.spec.audit_sink {
+            boot_args = match boot_args.take() {
+                Some(args) => Some(format!("{args} nucleus.audit_s3_bucket={}", sink.s3_bucket)),
+                None => Some(format!("nucleus.audit_s3_bucket={}", sink.s3_bucket)),
+            };
+            if let Some(ref prefix) = sink.s3_prefix {
+                if let Some(ref mut args) = boot_args {
+                    args.push_str(&format!(" nucleus.audit_s3_prefix={prefix}"));
+                }
+            }
+            if let Some(ref region) = sink.s3_region {
+                if let Some(ref mut args) = boot_args {
+                    args.push_str(&format!(" nucleus.audit_s3_region={region}"));
+                }
+            }
+            if let Some(ref endpoint) = sink.s3_endpoint {
+                if let Some(ref mut args) = boot_args {
+                    args.push_str(&format!(" nucleus.audit_s3_endpoint={endpoint}"));
+                }
+            }
+            // Forward ambient AWS credentials for S3 audit sink
+            for (env_key, arg_key) in [
+                ("AWS_ACCESS_KEY_ID", "nucleus.aws_access_key_id"),
+                ("AWS_SECRET_ACCESS_KEY", "nucleus.aws_secret_access_key"),
+                ("AWS_SESSION_TOKEN", "nucleus.aws_session_token"),
+                ("AWS_DEFAULT_REGION", "nucleus.aws_default_region"),
+            ] {
+                if let Ok(val) = std::env::var(env_key) {
+                    if let Some(ref mut args) = boot_args {
+                        args.push_str(&format!(" {arg_key}={val}"));
+                    }
+                }
+            }
+        }
+
         // Inject sandbox proof token so tool-proxy inside the VM can verify it's managed.
         // This is a fallback — tier 1 (SVID with attestation) is preferred in Firecracker.
         {
@@ -2977,6 +3105,35 @@ fn build_drive_config(image: &nucleus_spec::ImageSpec) -> Vec<DriveConfig> {
     }
 
     drives
+}
+
+/// Verify that seccomp is active on a Firecracker process by reading /proc/{pid}/status.
+/// Returns Ok(()) if seccomp mode is 2 (SECCOMP_MODE_FILTER).
+#[cfg(target_os = "linux")]
+fn verify_seccomp_active(pid: u32) -> Result<(), String> {
+    let status_path = format!("/proc/{}/status", pid);
+    let status = std::fs::read_to_string(&status_path)
+        .map_err(|e| format!("cannot read {}: {}", status_path, e))?;
+    let seccomp_line = status
+        .lines()
+        .find(|l| l.starts_with("Seccomp:"))
+        .ok_or_else(|| format!("no Seccomp field in {}", status_path))?;
+    let mode: u8 = seccomp_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if mode < 2 {
+        return Err(format!("seccomp mode {} (expected 2 = filter)", mode));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+fn verify_seccomp_active(_pid: u32) -> Result<(), String> {
+    // Seccomp is Linux-only; skip verification on other platforms.
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

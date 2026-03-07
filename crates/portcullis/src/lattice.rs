@@ -479,6 +479,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             commands: CommandLattice::restrictive(),
@@ -513,6 +515,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             budget: BudgetLattice::with_cost_limit(1.0),
@@ -541,6 +545,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             budget: BudgetLattice::with_cost_limit(1.5),
@@ -571,6 +577,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations,
             budget: BudgetLattice::with_cost_limit(1.0),
@@ -598,6 +606,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             paths: PathLattice::block_sensitive(),
@@ -626,6 +636,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             paths: PathLattice::block_sensitive(),
@@ -662,11 +674,58 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::LowRisk,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations,
             paths: PathLattice::block_sensitive(),
             budget: BudgetLattice::with_cost_limit(2.0),
             time: TimeLattice::hours(1),
+            ..Default::default()
+        };
+
+        lattice.normalize()
+    }
+
+    /// Create a permission set for safe PR fixing in CI.
+    ///
+    /// This is the "killer workflow" profile for GitHub Actions adoption:
+    /// - Read all files, write/edit/test with LowRisk
+    /// - Commit locally (git_write=LowRisk)
+    /// - **Cannot push or create PRs** — the CI script does that
+    /// - Web fetch allowed (docs lookup), but no broad web search
+    ///
+    /// **Trifecta Analysis**: private data (read=Always) + untrusted content
+    /// (web_fetch=LowRisk) present, but exfiltration absent (git_push=Never,
+    /// create_pr=Never, run_bash=LowRisk but constrained). Two of three
+    /// components → no approval escalation needed.
+    ///
+    /// The key security invariant: the agent can fix code and commit, but
+    /// only the trusted CI wrapper script can push the branch and open a PR.
+    pub fn safe_pr_fixer() -> Self {
+        let lattice = Self {
+            description: "Safe PR fixer permissions (no push, no PR creation)".to_string(),
+            capabilities: CapabilityLattice {
+                read_files: CapabilityLevel::Always,
+                write_files: CapabilityLevel::LowRisk,
+                edit_files: CapabilityLevel::LowRisk,
+                run_bash: CapabilityLevel::LowRisk,
+                glob_search: CapabilityLevel::Always,
+                grep_search: CapabilityLevel::Always,
+                web_search: CapabilityLevel::Never,
+                web_fetch: CapabilityLevel::LowRisk,
+                git_commit: CapabilityLevel::LowRisk,
+                git_push: CapabilityLevel::Never,
+                create_pr: CapabilityLevel::Never,
+                manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
+            },
+            obligations: Obligations::default(),
+            paths: PathLattice::block_sensitive(),
+            commands: CommandLattice::permissive(),
+            budget: BudgetLattice::with_cost_limit(5.0),
+            time: TimeLattice::hours(2),
             ..Default::default()
         };
 
@@ -694,6 +753,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::LowRisk,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations,
             paths: PathLattice::block_sensitive(),
@@ -731,6 +792,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             commands,
@@ -786,6 +849,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::LowRisk,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations,
             commands,
@@ -826,6 +891,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             paths: PathLattice::block_sensitive(),
@@ -863,6 +930,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             paths: PathLattice::block_sensitive(),
@@ -901,6 +970,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             paths: PathLattice::block_sensitive(),
@@ -943,6 +1014,8 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Always,
+                #[cfg(not(kani))]
+                extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             budget: BudgetLattice::with_cost_limit(50.0),
@@ -1372,6 +1445,7 @@ mod tests {
             PermissionLattice::pr_review(),
             PermissionLattice::codegen(),
             PermissionLattice::pr_approve(),
+            PermissionLattice::safe_pr_fixer(),
         ];
 
         for perms in &profiles {
@@ -1408,6 +1482,49 @@ mod tests {
             perms.capabilities.create_pr,
             CapabilityLevel::Never,
             "codegen cannot create PRs (create_pr=Never)"
+        );
+    }
+
+    #[test]
+    fn test_safe_pr_fixer_no_push_no_pr() {
+        let perms = PermissionLattice::safe_pr_fixer();
+
+        // Key security invariant: cannot push or create PRs
+        assert_eq!(
+            perms.capabilities.git_push,
+            CapabilityLevel::Never,
+            "safe_pr_fixer cannot push (CI script does that)"
+        );
+        assert_eq!(
+            perms.capabilities.create_pr,
+            CapabilityLevel::Never,
+            "safe_pr_fixer cannot create PRs (CI script does that)"
+        );
+
+        // Can read, write, edit, commit, run bash
+        assert_eq!(perms.capabilities.read_files, CapabilityLevel::Always);
+        assert_eq!(perms.capabilities.write_files, CapabilityLevel::LowRisk);
+        assert_eq!(perms.capabilities.edit_files, CapabilityLevel::LowRisk);
+        assert_eq!(perms.capabilities.run_bash, CapabilityLevel::LowRisk);
+        assert_eq!(perms.capabilities.git_commit, CapabilityLevel::LowRisk);
+
+        // Web fetch allowed (docs lookup) but no broad search
+        assert_eq!(perms.capabilities.web_fetch, CapabilityLevel::LowRisk);
+        assert_eq!(perms.capabilities.web_search, CapabilityLevel::Never);
+
+        // No pod management
+        assert_eq!(perms.capabilities.manage_pods, CapabilityLevel::Never);
+
+        // Trifecta IS triggered (read + web_fetch + run_bash), and normalize()
+        // correctly adds approval obligations on bash. This is the right behavior:
+        // bash requires human approval, while git_push/create_pr are fully blocked.
+        assert!(
+            perms.is_trifecta_vulnerable(),
+            "safe_pr_fixer has trifecta (bash is exfil vector), obligations mitigate"
+        );
+        assert!(
+            perms.requires_approval(Operation::RunBash),
+            "run_bash should require approval (trifecta mitigation)"
         );
     }
 

@@ -63,6 +63,7 @@ fn arb_capability_lattice() -> impl Strategy<Value = CapabilityLattice> {
                     git_push,
                     create_pr,
                     manage_pods,
+                    extensions: std::collections::BTreeMap::new(),
                 }
             },
         )

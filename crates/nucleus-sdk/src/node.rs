@@ -48,8 +48,18 @@ impl From<nucleus_node::PodInfo> for PodInfo {
 }
 
 /// Execution receipt — cryptographic proof of pod execution outcome.
+///
+/// ## Versioning
+///
+/// v1 fields (pod_id through spiffe_id) are FROZEN. The `v1_content_hash`
+/// is a SHA-256 of the canonical serialization of these fields, allowing
+/// v1-only verifiers to validate receipts even when extensions are present.
+///
+/// New fields in v2+ go into `extensions` or as named fields with schema
+/// version bumps.
 #[derive(Debug, Clone)]
 pub struct ExecutionReceipt {
+    // === v1.0 FROZEN ===
     /// Pod identifier.
     pub pod_id: String,
     /// SHA-256 hash of workspace contents at exit.
@@ -66,6 +76,13 @@ pub struct ExecutionReceipt {
     pub sandbox_tier: String,
     /// SPIFFE ID of the pod's workload identity.
     pub spiffe_id: String,
+    // === v1.0 versioning ===
+    /// Schema version. v1 = 1.
+    pub version: u32,
+    /// SHA-256 of canonical v1 fields — verifiable even by v1-only verifiers.
+    pub v1_content_hash: String,
+    /// Forward-compatible extension data.
+    pub extensions: std::collections::BTreeMap<String, String>,
 }
 
 impl From<nucleus_node::ExecutionReceipt> for ExecutionReceipt {
@@ -79,6 +96,9 @@ impl From<nucleus_node::ExecutionReceipt> for ExecutionReceipt {
             manifest_hash: r.manifest_hash,
             sandbox_tier: r.sandbox_tier,
             spiffe_id: r.spiffe_id,
+            version: r.version,
+            v1_content_hash: r.v1_content_hash,
+            extensions: r.extensions.into_iter().collect(),
         }
     }
 }
