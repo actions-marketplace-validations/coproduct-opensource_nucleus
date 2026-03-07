@@ -172,8 +172,8 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build, build-musl, upload-lima-templates]
-    if: always() && needs.build.result == 'success' && needs.build-musl.result == 'success'
+    needs: [build, build-musl, build-rootfs, upload-lima-templates]
+    if: always() && needs.build-musl.result == 'success'
     permissions:
       contents: write
     steps:
