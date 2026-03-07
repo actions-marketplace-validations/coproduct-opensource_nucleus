@@ -21,6 +21,11 @@ set -euo pipefail
 : "${NUCLEUS_TIMEOUT:=3600}"
 : "${LLM_MODEL:=claude-sonnet-4-20250514}"
 
+# Export ANTHROPIC_API_KEY so Claude CLI can authenticate.
+# The action input is vendor-agnostic (api-key → LLM_API_TOKEN),
+# but the Claude CLI looks for ANTHROPIC_API_KEY in the environment.
+export ANTHROPIC_API_KEY="${LLM_API_TOKEN}"
+
 BRANCH="nucleus/fix-issue-${ISSUE_NUMBER}"
 
 echo "::group::Fetch issue details"
