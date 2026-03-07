@@ -191,6 +191,10 @@ pub struct CapabilityLattice {
     ///
     /// Meet = pointwise min, join = pointwise max, leq = pointwise ≤.
     /// Unknown extensions default to `Never` (fail-closed).
+    ///
+    /// Excluded from Kani builds: BTreeMap's heap allocator is intractable
+    /// for bounded model checking. Extension lattice laws are covered by proptest.
+    #[cfg(not(kani))]
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
@@ -213,6 +217,7 @@ impl Default for CapabilityLattice {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::LowRisk,
             manage_pods: CapabilityLevel::Never,
+            #[cfg(not(kani))]
             extensions: BTreeMap::new(),
         }
     }
@@ -387,6 +392,7 @@ impl CapabilityLattice {
 
     /// Get the capability level for an extension operation.
     /// Returns `Never` (fail-closed) if the operation is not registered.
+    #[cfg(not(kani))]
     pub fn extension_level(&self, op: &ExtensionOperation) -> CapabilityLevel {
         self.extensions
             .get(op)
@@ -399,8 +405,7 @@ impl CapabilityLattice {
     /// For extension dimensions, missing keys default to `Never`.
     /// Since `min(x, Never) = Never`, absent extensions are fail-closed.
     pub fn meet(&self, other: &Self) -> Self {
-        // Extension meet: union of all keys, min of each value.
-        // Short-circuit when both empty (common case, and avoids Kani state explosion).
+        #[cfg(not(kani))]
         let ext = if self.extensions.is_empty() && other.extensions.is_empty() {
             BTreeMap::new()
         } else {
@@ -429,6 +434,7 @@ impl CapabilityLattice {
             git_push: std::cmp::min(self.git_push, other.git_push),
             create_pr: std::cmp::min(self.create_pr, other.create_pr),
             manage_pods: std::cmp::min(self.manage_pods, other.manage_pods),
+            #[cfg(not(kani))]
             extensions: ext,
         }
     }
@@ -438,6 +444,7 @@ impl CapabilityLattice {
     /// For extension dimensions, missing keys default to `Never`.
     /// Since `max(x, Never) = x`, only keys present in at least one operand appear.
     pub fn join(&self, other: &Self) -> Self {
+        #[cfg(not(kani))]
         let ext = if self.extensions.is_empty() && other.extensions.is_empty() {
             BTreeMap::new()
         } else {
@@ -466,6 +473,7 @@ impl CapabilityLattice {
             git_push: std::cmp::max(self.git_push, other.git_push),
             create_pr: std::cmp::max(self.create_pr, other.create_pr),
             manage_pods: std::cmp::max(self.manage_pods, other.manage_pods),
+            #[cfg(not(kani))]
             extensions: ext,
         }
     }
@@ -492,15 +500,15 @@ impl CapabilityLattice {
             return false;
         }
 
-        // Short-circuit when both empty (common case, avoids Kani state explosion).
-        if self.extensions.is_empty() && other.extensions.is_empty() {
-            return true;
-        }
-
-        // Check all extension keys from both sides
-        for key in self.extensions.keys().chain(other.extensions.keys()) {
-            if self.extension_level(key) > other.extension_level(key) {
-                return false;
+        // Extension leq check — excluded from Kani (BTreeMap intractable for BMC)
+        #[cfg(not(kani))]
+        {
+            if !self.extensions.is_empty() || !other.extensions.is_empty() {
+                for key in self.extensions.keys().chain(other.extensions.keys()) {
+                    if self.extension_level(key) > other.extension_level(key) {
+                        return false;
+                    }
+                }
             }
         }
 
@@ -525,6 +533,7 @@ impl CapabilityLattice {
             git_push: CapabilityLevel::Always,
             create_pr: CapabilityLevel::Always,
             manage_pods: CapabilityLevel::Always,
+            #[cfg(not(kani))]
             extensions: BTreeMap::new(),
         }
     }
@@ -544,6 +553,7 @@ impl CapabilityLattice {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            #[cfg(not(kani))]
             extensions: BTreeMap::new(),
         }
     }
