@@ -399,16 +399,22 @@ impl CapabilityLattice {
     /// For extension dimensions, missing keys default to `Never`.
     /// Since `min(x, Never) = Never`, absent extensions are fail-closed.
     pub fn meet(&self, other: &Self) -> Self {
-        // Extension meet: union of all keys, min of each value
-        let mut ext = BTreeMap::new();
-        for key in self.extensions.keys().chain(other.extensions.keys()) {
-            let a = self.extension_level(key);
-            let b = other.extension_level(key);
-            let v = std::cmp::min(a, b);
-            if v != CapabilityLevel::Never {
-                ext.insert(key.clone(), v);
+        // Extension meet: union of all keys, min of each value.
+        // Short-circuit when both empty (common case, and avoids Kani state explosion).
+        let ext = if self.extensions.is_empty() && other.extensions.is_empty() {
+            BTreeMap::new()
+        } else {
+            let mut ext = BTreeMap::new();
+            for key in self.extensions.keys().chain(other.extensions.keys()) {
+                let a = self.extension_level(key);
+                let b = other.extension_level(key);
+                let v = std::cmp::min(a, b);
+                if v != CapabilityLevel::Never {
+                    ext.insert(key.clone(), v);
+                }
             }
-        }
+            ext
+        };
 
         Self {
             read_files: std::cmp::min(self.read_files, other.read_files),
@@ -432,15 +438,20 @@ impl CapabilityLattice {
     /// For extension dimensions, missing keys default to `Never`.
     /// Since `max(x, Never) = x`, only keys present in at least one operand appear.
     pub fn join(&self, other: &Self) -> Self {
-        let mut ext = BTreeMap::new();
-        for key in self.extensions.keys().chain(other.extensions.keys()) {
-            let a = self.extension_level(key);
-            let b = other.extension_level(key);
-            let v = std::cmp::max(a, b);
-            if v != CapabilityLevel::Never {
-                ext.insert(key.clone(), v);
+        let ext = if self.extensions.is_empty() && other.extensions.is_empty() {
+            BTreeMap::new()
+        } else {
+            let mut ext = BTreeMap::new();
+            for key in self.extensions.keys().chain(other.extensions.keys()) {
+                let a = self.extension_level(key);
+                let b = other.extension_level(key);
+                let v = std::cmp::max(a, b);
+                if v != CapabilityLevel::Never {
+                    ext.insert(key.clone(), v);
+                }
             }
-        }
+            ext
+        };
 
         Self {
             read_files: std::cmp::max(self.read_files, other.read_files),
@@ -479,6 +490,11 @@ impl CapabilityLattice {
 
         if !core_leq {
             return false;
+        }
+
+        // Short-circuit when both empty (common case, avoids Kani state explosion).
+        if self.extensions.is_empty() && other.extensions.is_empty() {
+            return true;
         }
 
         // Check all extension keys from both sides

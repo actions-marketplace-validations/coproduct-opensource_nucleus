@@ -758,11 +758,16 @@ impl TaintSet {
     /// Core labels: bitwise OR (FROZEN).
     /// Extension labels: set union.
     pub fn union(&self, other: &Self) -> Self {
+        let extensions = if self.extensions.is_empty() && other.extensions.is_empty() {
+            std::collections::BTreeSet::new()
+        } else {
+            &self.extensions | &other.extensions
+        };
         Self {
             private_data: self.private_data || other.private_data,
             untrusted_content: self.untrusted_content || other.untrusted_content,
             exfil_vector: self.exfil_vector || other.exfil_vector,
-            extensions: &self.extensions | &other.extensions,
+            extensions,
         }
     }
 
@@ -802,10 +807,11 @@ impl TaintSet {
     /// Corresponds to `taint_subset(other, self)` in the Verus model.
     /// Used by the E1 monotonicity invariant assertion.
     pub fn is_superset_of(&self, other: &Self) -> bool {
-        (!other.private_data || self.private_data)
+        let core_ok = (!other.private_data || self.private_data)
             && (!other.untrusted_content || self.untrusted_content)
-            && (!other.exfil_vector || self.exfil_vector)
-            && other.extensions.is_subset(&self.extensions)
+            && (!other.exfil_vector || self.exfil_vector);
+        // Short-circuit empty extensions (avoids Kani state explosion on BTreeSet)
+        core_ok && (other.extensions.is_empty() || other.extensions.is_subset(&self.extensions))
     }
 
     /// Check if a specific extension taint label is present.
