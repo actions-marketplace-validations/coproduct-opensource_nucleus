@@ -383,6 +383,7 @@ fn project_capabilities(
         } else {
             CapabilityLevel::Always
         },
+        #[cfg(not(kani))]
         extensions: std::collections::BTreeMap::new(),
     }
 }

@@ -479,6 +479,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -514,6 +515,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -543,6 +545,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -574,6 +577,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations,
@@ -602,6 +606,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -631,6 +636,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -668,6 +674,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::LowRisk,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations,
@@ -711,6 +718,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -745,6 +753,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::LowRisk,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations,
@@ -783,6 +792,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -839,6 +849,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::LowRisk,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations,
@@ -880,6 +891,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -918,6 +930,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -957,6 +970,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
@@ -1000,6 +1014,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Always,
+                #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
