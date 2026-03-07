@@ -170,6 +170,7 @@ fn arb_capability_lattice() -> impl Strategy<Value = CapabilityLattice> {
                 git_push: gp,
                 create_pr: cp,
                 manage_pods: mp,
+                extensions: std::collections::BTreeMap::new(),
             },
         )
 }
@@ -1066,6 +1067,7 @@ fn conformance_untrusted_profile_prevents_trifecta() {
         git_push: CapabilityLevel::Never,
         create_pr: CapabilityLevel::Never,
         manage_pods: CapabilityLevel::Never,
+        extensions: std::collections::BTreeMap::new(),
     };
 
     let all_caps = CapabilityLattice::permissive();
@@ -3117,6 +3119,7 @@ mod capability_coverage {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            extensions: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3135,6 +3138,7 @@ mod capability_coverage {
             git_push: CapabilityLevel::Always,
             create_pr: CapabilityLevel::Always,
             manage_pods: CapabilityLevel::Always,
+            extensions: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3235,6 +3239,7 @@ mod capability_coverage {
             git_push: CapabilityLevel::Always,     // 9: odd
             create_pr: CapabilityLevel::LowRisk,   // 10: even
             manage_pods: CapabilityLevel::Always,  // 11: odd
+            extensions: std::collections::BTreeMap::new(),
         };
 
         for (i, &op) in ALL_OPS.iter().enumerate() {
@@ -3357,6 +3362,7 @@ mod capability_coverage {
                 git_push: to_level(levels_a[9]),
                 create_pr: to_level(levels_a[10]),
                 manage_pods: to_level(levels_a[11]),
+                extensions: std::collections::BTreeMap::new(),
             };
 
             let b = CapabilityLattice {
@@ -3372,6 +3378,7 @@ mod capability_coverage {
                 git_push: to_level(levels_a[9].max(delta[9])),
                 create_pr: to_level(levels_a[10].max(delta[10])),
                 manage_pods: to_level(levels_a[11].max(delta[11])),
+                extensions: std::collections::BTreeMap::new(),
             };
 
             // a ≤ b by construction

@@ -2668,6 +2668,19 @@ impl NodeService for GrpcService {
         let manifest_hash =
             nucleus_identity::approval_bundle::compute_manifest_hash(spec_yaml.as_bytes());
 
+        // Compute v1 content hash: SHA-256 of canonical v1 fields
+        let v1_content_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(id.as_bytes());
+            hasher.update(report.workspace_hash.as_bytes());
+            hasher.update(report.audit_tail_hash.as_bytes());
+            hasher.update(report.audit_entry_count.to_le_bytes());
+            hasher.update(report.timestamp_unix.to_le_bytes());
+            hasher.update(manifest_hash.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
         Ok(GrpcResponse::new(proto::GetReceiptResponse {
             receipt: Some(proto::ExecutionReceipt {
                 pod_id: id.to_string(),
@@ -2678,6 +2691,9 @@ impl NodeService for GrpcService {
                 manifest_hash,
                 sandbox_tier: String::new(), // TODO: extract from pod metadata
                 spiffe_id: String::new(),    // TODO: extract from pod metadata
+                version: 1,
+                v1_content_hash,
+                extensions: std::collections::HashMap::new(),
             }),
         }))
     }

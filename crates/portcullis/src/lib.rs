@@ -92,6 +92,7 @@ mod capability;
 pub mod certificate;
 mod command;
 pub mod constraint;
+pub mod dangerous_combo;
 pub mod delegation;
 pub mod dropout;
 pub mod escalation;
@@ -118,14 +119,15 @@ pub mod region;
 mod time;
 pub mod trust;
 pub mod weakening;
+pub mod workspace;
 
 #[cfg(kani)]
 mod kani;
 
 pub use budget::BudgetLattice;
 pub use capability::{
-    CapabilityLattice, CapabilityLevel, IncompatibilityConstraint, Obligations, Operation,
-    TrifectaRisk,
+    CapabilityLattice, CapabilityLevel, ExtensionOperation, IncompatibilityConstraint, Obligations,
+    Operation, TrifectaRisk,
 };
 pub use command::{ArgPattern, CommandLattice, CommandPattern};
 pub use frame::{
@@ -140,9 +142,9 @@ pub use galois::{
 pub use graded::{Graded, GradedPermissionCheck, GradedPipeline, RiskCost, RiskGrade};
 #[allow(deprecated)]
 pub use guard::{
-    operation_taint, CheckProof, CompositeGuard, ExecuteError, GradedGuard, GradedTaintGuard,
-    GuardError, GuardFn, GuardedAction, PermissionGuard, RuntimeTrifectaGuard, TaintLabel,
-    TaintSet, ToolCallGuard,
+    operation_taint, CheckProof, CompositeGuard, ExecuteError, ExtensionTaintLabel, GradedGuard,
+    GradedTaintGuard, GuardError, GuardFn, GuardedAction, PermissionGuard, RuntimeTrifectaGuard,
+    TaintLabel, TaintSet, ToolCallGuard,
 };
 pub use heyting::{ConditionalPermission, HeytingAlgebra};
 pub use intent::{IntentKind, WorkIntent};
@@ -164,6 +166,7 @@ pub use trust::{EnforcementResult, TrustProfile};
 pub use weakening::{
     WeakeningCost, WeakeningCostConfig, WeakeningDimension, WeakeningGap, WeakeningRequest,
 };
+pub use workspace::WorkspaceGuard;
 
 // Re-export pipeline types
 pub use pipeline::{
@@ -182,6 +185,7 @@ pub use certificate::{
     canonical_permissions_hash, verify_certificate, CertificateDelegationError, CertificateError,
     LatticeCertificate, VerifiedPermissions,
 };
+pub use dangerous_combo::{ConstraintNucleus, CoreTaintRequirement, DangerousCombo};
 pub use delegation::{
     meet_with_justification, DelegationChain, DelegationLink, MeetJustification, RestrictionDetail,
     RestrictionReason,

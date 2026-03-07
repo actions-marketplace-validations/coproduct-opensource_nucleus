@@ -129,6 +129,7 @@ impl TrustProfile {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            extensions: std::collections::BTreeMap::new(),
         };
 
         Self {
@@ -157,6 +158,7 @@ impl TrustProfile {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            extensions: std::collections::BTreeMap::new(),
         };
 
         Self {

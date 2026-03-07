@@ -175,6 +175,7 @@ fn test_trifecta_risk_grading_is_monotone() {
         git_push: CapabilityLevel::Never,
         create_pr: CapabilityLevel::Never,
         manage_pods: CapabilityLevel::Never,
+        extensions: std::collections::BTreeMap::new(),
     };
     assert_eq!(constraint.trifecta_risk(&zero), TrifectaRisk::None);
 

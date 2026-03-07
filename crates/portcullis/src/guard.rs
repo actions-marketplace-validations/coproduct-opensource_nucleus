@@ -671,6 +671,9 @@ impl ToolCallGuard for RuntimeTrifectaGuard {
 /// These form a free semilattice (join = set union) that the graded monad
 /// carries as its grade. When the join reaches `{PrivateData, UntrustedContent,
 /// ExfilVector}`, the trifecta is complete.
+///
+/// These 3 core labels are FROZEN — they have Verus proofs covering
+/// monotonicity, session safety, and irreversibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaintLabel {
     /// Private data was accessed (read_files, glob_search, grep_search)
@@ -679,6 +682,32 @@ pub enum TaintLabel {
     UntrustedContent,
     /// An exfiltration-capable operation was performed (run_bash, git_push, create_pr)
     ExfilVector,
+}
+
+/// Extension taint label for emerging threat categories.
+///
+/// Extension labels participate in the same join-semilattice (union) as core
+/// labels, but do NOT affect the core trifecta predicate. They can be used
+/// by [`DangerousCombo`](crate::dangerous_combo::DangerousCombo) constraints
+/// to define new dangerous combinations.
+///
+/// Taint monotonicity (E1) holds for extension labels by the same argument
+/// as core labels: set-union only grows, never shrinks.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ExtensionTaintLabel(pub String);
+
+impl ExtensionTaintLabel {
+    /// Create a new extension taint label.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl std::fmt::Display for ExtensionTaintLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 /// A taint set tracking which trifecta legs have been touched.
@@ -691,9 +720,13 @@ pub enum TaintLabel {
 /// This gives us O(1) taint checking vs. O(n) scanning of `Vec<Operation>`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct TaintSet {
+    /// FROZEN — Verus-verified core taint labels.
     private_data: bool,
     untrusted_content: bool,
     exfil_vector: bool,
+    /// Extension taint labels for emerging threat categories.
+    /// Does NOT affect the core trifecta predicate.
+    extensions: std::collections::BTreeSet<ExtensionTaintLabel>,
 }
 
 impl TaintSet {
@@ -713,12 +746,23 @@ impl TaintSet {
         s
     }
 
+    /// Create a taint set from a single extension label.
+    pub fn extension_singleton(label: ExtensionTaintLabel) -> Self {
+        let mut s = Self::empty();
+        s.extensions.insert(label);
+        s
+    }
+
     /// Union of two taint sets (the monoid operation).
+    ///
+    /// Core labels: bitwise OR (FROZEN).
+    /// Extension labels: set union.
     pub fn union(&self, other: &Self) -> Self {
         Self {
             private_data: self.private_data || other.private_data,
             untrusted_content: self.untrusted_content || other.untrusted_content,
             exfil_vector: self.exfil_vector || other.exfil_vector,
+            extensions: &self.extensions | &other.extensions,
         }
     }
 
@@ -761,20 +805,34 @@ impl TaintSet {
         (!other.private_data || self.private_data)
             && (!other.untrusted_content || self.untrusted_content)
             && (!other.exfil_vector || self.exfil_vector)
+            && other.extensions.is_subset(&self.extensions)
+    }
+
+    /// Check if a specific extension taint label is present.
+    pub fn contains_extension(&self, label: &ExtensionTaintLabel) -> bool {
+        self.extensions.contains(label)
+    }
+
+    /// Iterator over all extension labels present in this taint set.
+    pub fn extension_labels(&self) -> impl Iterator<Item = &ExtensionTaintLabel> {
+        self.extensions.iter()
     }
 }
 
 impl std::fmt::Display for TaintSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut labels = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
         if self.private_data {
-            labels.push("PrivateData");
+            labels.push("PrivateData".to_string());
         }
         if self.untrusted_content {
-            labels.push("UntrustedContent");
+            labels.push("UntrustedContent".to_string());
         }
         if self.exfil_vector {
-            labels.push("ExfilVector");
+            labels.push("ExfilVector".to_string());
+        }
+        for ext in &self.extensions {
+            labels.push(format!("ext:{}", ext.0));
         }
         if labels.is_empty() {
             write!(f, "{{}}")
