@@ -13,8 +13,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
   build:
@@ -53,6 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: build
+    permissions:
+      pages: write
+      id-token: write
     if: ${{ vars.DOCS_DEPLOY == 'true' }}
     environment:
       name: github-pages
