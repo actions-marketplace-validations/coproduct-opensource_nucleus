@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::keychain::{SecretKind, SecretStore};
-use crate::profiles::Profile;
+use crate::profiles;
 
 /// Resolved configuration from args, config file, and Keychain
 struct ResolvedConfig {
@@ -241,16 +241,14 @@ pub async fn execute(args: RunArgs, global_config_path: &str) -> Result<()> {
         // Load custom config
         load_permission_config(config_path)?
     } else {
-        // Use profile
-        Profile::from_name(&args.profile)
-            .map(|p| p.to_lattice())
-            .unwrap_or_else(|| {
-                eprintln!(
-                    "Warning: Unknown profile '{}', using restrictive",
-                    args.profile
-                );
-                PermissionLattice::restrictive()
-            })
+        // Use profile (canonical YAML → aliases → legacy → restrictive fallback)
+        profiles::resolve(&args.profile).unwrap_or_else(|| {
+            eprintln!(
+                "Warning: Unknown profile '{}', using restrictive",
+                args.profile
+            );
+            PermissionLattice::restrictive()
+        })
     };
 
     // Override budget if specified
@@ -316,8 +314,8 @@ fn load_permission_config(path: &str) -> Result<PermissionLattice> {
 
     // Check for profile key
     if let Some(profile) = config.get("profile").and_then(|v| v.as_str()) {
-        if let Some(p) = Profile::from_name(profile) {
-            return Ok(p.to_lattice());
+        if let Some(lattice) = profiles::resolve(profile) {
+            return Ok(lattice);
         }
     }
 
