@@ -768,7 +768,7 @@ fn proof_meet_deflationary_both() {
 // Starting from empty taint, you need operations from ALL THREE categories
 // (private data, untrusted content, exfil vector) to complete the trifecta.
 // ---------------------------------------------------------------------------
-#[kani::proof]
+
 // ═══════════════════════════════════════════════════════════════════════════
 // D-series: Attenuation token invariants
 // ═══════════════════════════════════════════════════════════════════════════
