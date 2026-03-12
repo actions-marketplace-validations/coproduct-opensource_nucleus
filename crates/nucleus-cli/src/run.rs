@@ -451,11 +451,14 @@ async fn run_local(
     write_mcp_config(
         &mcp_config_path,
         &mcp_command_path,
-        &proxy_url,
-        Some(&auth_secret),
-        Some(&approval_secret),
-        &spec_path,
-        args.kernel_trace.as_deref(),
+        &McpEnvConfig {
+            proxy_url: &proxy_url,
+            auth_secret: Some(&auth_secret),
+            approval_secret: Some(&approval_secret),
+            spec_path: &spec_path,
+            kernel_trace: args.kernel_trace.as_deref(),
+            sandbox_token: Some(&sandbox_token),
+        },
     )?;
 
     let allowed_tools = build_mcp_allowed_tools(policy);
@@ -597,11 +600,14 @@ async fn run_enforced(
     write_mcp_config(
         &mcp_config_path,
         &mcp_command_path,
-        &proxy_url,
-        None,
-        None,
-        &spec_path,
-        args.kernel_trace.as_deref(),
+        &McpEnvConfig {
+            proxy_url: &proxy_url,
+            auth_secret: None,
+            approval_secret: None,
+            spec_path: &spec_path,
+            kernel_trace: args.kernel_trace.as_deref(),
+            sandbox_token: None, // provided by node in enforced mode
+        },
     )?;
 
     let allowed_tools = build_mcp_allowed_tools(policy);
@@ -723,15 +729,16 @@ fn create_pod_via_node(
     }
 }
 
-fn write_mcp_config(
-    mcp_path: &Path,
-    mcp_command: &Path,
-    proxy_url: &str,
-    auth_secret: Option<&str>,
-    approval_secret: Option<&str>,
-    spec_path: &Path,
-    kernel_trace: Option<&Path>,
-) -> Result<()> {
+struct McpEnvConfig<'a> {
+    proxy_url: &'a str,
+    auth_secret: Option<&'a str>,
+    approval_secret: Option<&'a str>,
+    spec_path: &'a Path,
+    kernel_trace: Option<&'a Path>,
+    sandbox_token: Option<&'a str>,
+}
+
+fn write_mcp_config(mcp_path: &Path, mcp_command: &Path, env_cfg: &McpEnvConfig<'_>) -> Result<()> {
     #[derive(Serialize)]
     struct McpServer {
         #[serde(rename = "type")]
@@ -750,11 +757,14 @@ fn write_mcp_config(
     }
 
     let mut env = std::collections::BTreeMap::new();
-    env.insert("NUCLEUS_MCP_PROXY_URL".to_string(), proxy_url.to_string());
-    if let Some(secret) = auth_secret {
+    env.insert(
+        "NUCLEUS_MCP_PROXY_URL".to_string(),
+        env_cfg.proxy_url.to_string(),
+    );
+    if let Some(secret) = env_cfg.auth_secret {
         env.insert("NUCLEUS_MCP_AUTH_SECRET".to_string(), secret.to_string());
     }
-    if let Some(secret) = approval_secret {
+    if let Some(secret) = env_cfg.approval_secret {
         env.insert(
             "NUCLEUS_MCP_APPROVAL_SECRET".to_string(),
             secret.to_string(),
@@ -762,13 +772,16 @@ fn write_mcp_config(
     }
     env.insert(
         "NUCLEUS_MCP_SPEC".to_string(),
-        spec_path.display().to_string(),
+        env_cfg.spec_path.display().to_string(),
     );
-    if let Some(trace_path) = kernel_trace {
+    if let Some(trace_path) = env_cfg.kernel_trace {
         env.insert(
             "NUCLEUS_MCP_KERNEL_TRACE".to_string(),
             trace_path.display().to_string(),
         );
+    }
+    if let Some(token) = env_cfg.sandbox_token {
+        env.insert("NUCLEUS_MCP_SANDBOX_TOKEN".to_string(), token.to_string());
     }
 
     let server = McpServer {

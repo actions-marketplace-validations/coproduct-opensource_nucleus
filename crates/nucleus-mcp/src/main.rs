@@ -45,6 +45,10 @@ struct Args {
     /// A summary line is written on session close.
     #[arg(long, env = "NUCLEUS_MCP_KERNEL_TRACE")]
     kernel_trace: Option<PathBuf>,
+    /// Sandbox token for authenticating with the tool proxy.
+    /// Proves this MCP bridge is running inside a managed sandbox.
+    #[arg(long, env = "NUCLEUS_MCP_SANDBOX_TOKEN")]
+    sandbox_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -606,6 +610,9 @@ impl TraceWriter {
 }
 
 fn main() -> Result<()> {
+    // Install rustls crypto provider before any TLS connections (via ureq).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args = Args::parse();
     let policy = match args.spec.as_ref() {
         Some(path) => Some(load_policy(path)?),

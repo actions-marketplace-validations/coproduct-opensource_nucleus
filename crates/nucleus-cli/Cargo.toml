@@ -51,6 +51,7 @@ rand = "0.10"
 chrono = { workspace = true, features = ["serde"] }
 hex = { workspace = true }
 sha2 = { workspace = true }
+rustls = { workspace = true }
 
 # macOS Keychain (conditional)
 [target.'cfg(target_os = "macos")'.dependencies]

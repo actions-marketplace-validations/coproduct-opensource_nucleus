@@ -938,6 +938,9 @@ impl IntoResponse for ApiError {
 
 #[tokio::main]
 async fn main() -> Result<(), ApiError> {
+    // Install rustls crypto provider before any TLS connections (web_fetch, etc.).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .json()
