@@ -1,0 +1,47 @@
+# Safe PR Fixer — the "killer workflow" for CI adoption.
+#
+# The agent can read all files, write/edit code, run tests, and commit
+# locally. It CANNOT push or create PRs — the trusted CI wrapper does that.
+#
+# Trifecta analysis:
+#   - Private data: read_files=always (present)
+#   - Untrusted content: web_fetch=low_risk (present)
+#   - Exfiltration: git_push=never, create_pr=never (absent)
+#   => Two of three components. No approval escalation needed for push/PR
+#      because those vectors are structurally removed.
+#   => run_bash is LowRisk, so trifecta normalization adds approval on it.
+
+name: safe-pr-fixer
+description: "Safe PR fixer — no push, no PR creation. CI wrapper pushes."
+
+capabilities:
+  read_files: always
+  write_files: low_risk
+  edit_files: low_risk
+  run_bash: low_risk
+  glob_search: always
+  grep_search: always
+  web_search: never
+  web_fetch: low_risk
+  git_commit: low_risk
+  git_push: never
+  create_pr: never
+  manage_pods: never
+
+paths:
+  blocked:
+    - "**/.ssh/**"
+    - "**/.aws/**"
+    - "**/.env"
+    - "**/.env.*"
+    - "**/credentials*"
+    - "/etc/shadow"
+    - "/etc/passwd"
+
+budget:
+  max_cost_usd: "5.00"
+  max_input_tokens: 100000
+  max_output_tokens: 10000
+
+time:
+  duration_hours: 2

@@ -1,0 +1,43 @@
+# Test Runner — execute tests and report results.
+#
+# Can read source code and run test commands, but cannot modify source
+# files or push results. Write is limited to test output artifacts.
+#
+# Trifecta analysis:
+#   - Private data: read_files=always (present)
+#   - Untrusted content: web_fetch=never (absent)
+#   - Exfiltration: git_push=never, create_pr=never (absent)
+#   => One of three components. Safe by construction.
+
+name: test-runner
+description: "Test runner — read source, execute tests, no source writes"
+
+capabilities:
+  read_files: always
+  write_files: never
+  edit_files: never
+  run_bash: low_risk
+  glob_search: always
+  grep_search: always
+  web_search: never
+  web_fetch: never
+  git_commit: never
+  git_push: never
+  create_pr: never
+  manage_pods: never
+
+paths:
+  blocked:
+    - "**/.ssh/**"
+    - "**/.aws/**"
+    - "**/.env"
+    - "**/.env.*"
+    - "**/credentials*"
+
+budget:
+  max_cost_usd: "1.00"
+  max_input_tokens: 50000
+  max_output_tokens: 5000
+
+time:
+  duration_minutes: 30
