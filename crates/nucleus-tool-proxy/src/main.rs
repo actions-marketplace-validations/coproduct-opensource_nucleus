@@ -38,6 +38,8 @@ mod mtls;
 mod node_client;
 mod policy;
 mod sandbox_proof;
+#[allow(dead_code)]
+mod unicode_audit;
 mod validation;
 mod web_fetch_policy;
 
