@@ -627,11 +627,8 @@ fn main() -> Result<()> {
 
     // Open kernel trace file (JSONL) if --kernel-trace is specified.
     let trace = TraceWriter::open(args.kernel_trace.as_deref())?;
-    if args.kernel_trace.is_some() {
-        eprintln!(
-            "[nucleus-mcp] kernel trace: {}",
-            args.kernel_trace.as_ref().unwrap().display()
-        );
+    if let Some(ref trace_path) = args.kernel_trace {
+        eprintln!("[nucleus-mcp] kernel trace: {}", trace_path.display());
     }
 
     // Log session ID to stderr for debugging/correlation
