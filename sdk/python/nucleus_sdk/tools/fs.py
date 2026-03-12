@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..client import ProxyClient
+    from ..taint import TaintGuard
     from ..trace import Trace
 
 
@@ -12,15 +13,24 @@ class FileHandle:
     """Typed accessor for filesystem operations.
 
     All calls delegate to a ProxyClient and record each operation
-    in the session trace.
+    in the session trace. An optional TaintGuard enforces the
+    trifecta gate before each operation.
     """
 
-    def __init__(self, proxy: ProxyClient, trace: Trace) -> None:
+    def __init__(
+        self,
+        proxy: ProxyClient,
+        trace: Trace,
+        taint_guard: Optional[TaintGuard] = None,
+    ) -> None:
         self._proxy = proxy
         self._trace = trace
+        self._guard = taint_guard
 
     def read(self, path: str) -> str:
         """Read a file and return its contents."""
+        if self._guard:
+            self._guard.check("fs.read")
         start = time.monotonic()
         result = self._proxy.read(path)
         elapsed = (time.monotonic() - start) * 1000
@@ -30,10 +40,14 @@ class FileHandle:
             result_summary=f"{len(result)} bytes",
             duration_ms=round(elapsed, 2),
         )
+        if self._guard:
+            self._guard.record("fs.read")
         return result
 
     def write(self, path: str, contents: str) -> None:
         """Write contents to a file."""
+        if self._guard:
+            self._guard.check("fs.write")
         start = time.monotonic()
         self._proxy.write(path, contents)
         elapsed = (time.monotonic() - start) * 1000
@@ -43,6 +57,8 @@ class FileHandle:
             result_summary=f"{len(contents)} bytes written",
             duration_ms=round(elapsed, 2),
         )
+        if self._guard:
+            self._guard.record("fs.write")
 
     def glob(
         self,
@@ -51,6 +67,8 @@ class FileHandle:
         max_results: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Search for files matching a glob pattern."""
+        if self._guard:
+            self._guard.check("fs.glob")
         start = time.monotonic()
         result = self._proxy.glob(
             pattern=pattern, directory=directory, max_results=max_results
@@ -63,6 +81,8 @@ class FileHandle:
             result_summary=f"{len(matches)} matches",
             duration_ms=round(elapsed, 2),
         )
+        if self._guard:
+            self._guard.record("fs.glob")
         return result
 
     def grep(
@@ -75,6 +95,8 @@ class FileHandle:
         case_insensitive: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Search file contents with a regex pattern."""
+        if self._guard:
+            self._guard.check("fs.grep")
         start = time.monotonic()
         result = self._proxy.grep(
             pattern=pattern,
@@ -92,4 +114,6 @@ class FileHandle:
             result_summary=f"{len(matches)} matches",
             duration_ms=round(elapsed, 2),
         )
+        if self._guard:
+            self._guard.record("fs.grep")
         return result

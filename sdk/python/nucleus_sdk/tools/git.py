@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..client import ProxyClient
+    from ..taint import TaintGuard
     from ..trace import Trace
 
 
@@ -12,12 +13,19 @@ class GitHandle:
     """Typed accessor for git operations.
 
     Git commands are executed via ProxyClient.run() with appropriate
-    arguments.  All calls are recorded in the session trace.
+    arguments.  All calls are recorded in the session trace. An optional
+    TaintGuard enforces the trifecta gate before each operation.
     """
 
-    def __init__(self, proxy: ProxyClient, trace: Trace) -> None:
+    def __init__(
+        self,
+        proxy: ProxyClient,
+        trace: Trace,
+        taint_guard: Optional[TaintGuard] = None,
+    ) -> None:
         self._proxy = proxy
         self._trace = trace
+        self._guard = taint_guard
 
     def _run_git(
         self,
@@ -26,17 +34,22 @@ class GitHandle:
         directory: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run a git subcommand and record it in the trace."""
+        op = f"git.{operation_name}"
+        if self._guard:
+            self._guard.check(op)
         full_args = ["git"] + args
         start = time.monotonic()
         result = self._proxy.run(args=full_args, directory=directory)
         elapsed = (time.monotonic() - start) * 1000
         exit_code = result.get("exit_code", -1)
         self._trace.record(
-            operation=f"git.{operation_name}",
+            operation=op,
             args={"git_args": args},
             result_summary=f"exit_code={exit_code}",
             duration_ms=round(elapsed, 2),
         )
+        if self._guard:
+            self._guard.record(op)
         return result
 
     def commit(
