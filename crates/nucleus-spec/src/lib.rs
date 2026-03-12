@@ -130,34 +130,49 @@ impl Default for PolicySpec {
 
 impl PolicySpec {
     /// Resolve a policy spec to a PermissionLattice.
+    ///
+    /// Profile resolution order:
+    /// 1. Canonical declarative profiles (from [`portcullis::profile::ProfileRegistry`])
+    /// 2. Legacy hardcoded profiles (built into [`PermissionLattice`])
     pub fn resolve(&self) -> Result<PermissionLattice, PolicyError> {
         match self {
-            PolicySpec::Profile { name } => match name.as_str() {
-                "default" => Ok(PermissionLattice::default()),
-                "fix_issue" => Ok(PermissionLattice::fix_issue()),
-                "demo" => Ok(PermissionLattice::demo()),
-                // Workflow profiles for orchestrated agent tasks
-                "pr_review" | "pr-review" => Ok(PermissionLattice::pr_review()),
-                "codegen" => Ok(PermissionLattice::codegen()),
-                "pr_approve" | "pr-approve" => Ok(PermissionLattice::pr_approve()),
-                // Other profiles
-                "read_only" | "read-only" => Ok(PermissionLattice::read_only()),
-                "permissive" => Ok(PermissionLattice::permissive()),
-                "restrictive" => Ok(PermissionLattice::restrictive()),
-                "local_dev" | "local-dev" => Ok(PermissionLattice::local_dev()),
-                "code_review" | "code-review" => Ok(PermissionLattice::code_review()),
-                "web_research" | "web-research" => Ok(PermissionLattice::web_research()),
-                "network_only" | "network-only" => Ok(PermissionLattice::network_only()),
-                "edit_only" | "edit-only" => Ok(PermissionLattice::edit_only()),
-                "safe_pr_fixer" | "safe-pr-fixer" => Ok(PermissionLattice::safe_pr_fixer()),
-                "release" => Ok(PermissionLattice::release()),
-                "database_client" | "database-client" => Ok(PermissionLattice::database_client()),
-                "orchestrator" => Ok(PermissionLattice::orchestrator()),
-                "filesystem_readonly" | "filesystem-readonly" => {
-                    Ok(PermissionLattice::filesystem_readonly())
+            PolicySpec::Profile { name } => {
+                // Try canonical declarative profiles first
+                let registry = portcullis::profile::ProfileRegistry::default();
+                if let Ok(lattice) = registry.resolve(name) {
+                    return Ok(lattice);
                 }
-                other => Err(PolicyError::UnknownProfile(other.to_string())),
-            },
+
+                // Fall back to legacy hardcoded profiles
+                match name.as_str() {
+                    "default" => Ok(PermissionLattice::default()),
+                    "fix_issue" => Ok(PermissionLattice::fix_issue()),
+                    "demo" => Ok(PermissionLattice::demo()),
+                    // Workflow profiles for orchestrated agent tasks
+                    "pr_review" | "pr-review" => Ok(PermissionLattice::pr_review()),
+                    "codegen" => Ok(PermissionLattice::codegen()),
+                    "pr_approve" | "pr-approve" => Ok(PermissionLattice::pr_approve()),
+                    // Other profiles
+                    "read_only" | "read-only" => Ok(PermissionLattice::read_only()),
+                    "permissive" => Ok(PermissionLattice::permissive()),
+                    "restrictive" => Ok(PermissionLattice::restrictive()),
+                    "local_dev" | "local-dev" => Ok(PermissionLattice::local_dev()),
+                    "code_review" | "code-review" => Ok(PermissionLattice::code_review()),
+                    "web_research" | "web-research" => Ok(PermissionLattice::web_research()),
+                    "network_only" | "network-only" => Ok(PermissionLattice::network_only()),
+                    "edit_only" | "edit-only" => Ok(PermissionLattice::edit_only()),
+                    "safe_pr_fixer" | "safe-pr-fixer" => Ok(PermissionLattice::safe_pr_fixer()),
+                    "release" => Ok(PermissionLattice::release()),
+                    "database_client" | "database-client" => {
+                        Ok(PermissionLattice::database_client())
+                    }
+                    "orchestrator" => Ok(PermissionLattice::orchestrator()),
+                    "filesystem_readonly" | "filesystem-readonly" => {
+                        Ok(PermissionLattice::filesystem_readonly())
+                    }
+                    other => Err(PolicyError::UnknownProfile(other.to_string())),
+                }
+            }
             PolicySpec::Inline { lattice } => Ok(lattice.as_ref().clone().normalize()),
         }
     }
@@ -558,6 +573,13 @@ mod tests {
             "database-client",
             "filesystem_readonly",
             "filesystem-readonly",
+            // Canonical declarative profiles (from ProfileRegistry)
+            "doc-editor",
+            "doc_editor",
+            "test-runner",
+            "test_runner",
+            "triage-bot",
+            "triage_bot",
         ];
 
         for name in profile_names {
@@ -965,5 +987,66 @@ spec:
         assert!(spec.allow.is_empty());
         assert!(spec.deny.is_empty());
         assert!(spec.dns_allow.is_empty(), "permissive has no DNS filter");
+    }
+
+    #[test]
+    fn test_canonical_profiles_via_podspec() {
+        // Canonical profiles should be resolvable through the PodSpec path
+        let canonical = ["doc-editor", "test-runner", "triage-bot"];
+        for name in canonical {
+            let spec = PolicySpec::Profile {
+                name: name.to_string(),
+            };
+            let result = spec.resolve();
+            assert!(
+                result.is_ok(),
+                "Canonical profile '{}' should resolve via PolicySpec, got: {:?}",
+                name,
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_profiles_trifecta_safety() {
+        // All canonical profiles must either:
+        // 1. Not complete the trifecta, OR
+        // 2. Have approval obligations on exfiltration vectors
+        let canonical = ["safe-pr-fixer", "doc-editor", "test-runner", "triage-bot"];
+        for name in canonical {
+            let spec = PolicySpec::Profile {
+                name: name.to_string(),
+            };
+            let lattice = spec.resolve().unwrap();
+
+            if lattice.is_trifecta_vulnerable() {
+                // If trifecta is present, exfiltration vectors must have
+                // approval obligations or be Never
+                let git_push_safe = lattice.capabilities.git_push
+                    == portcullis::CapabilityLevel::Never
+                    || lattice.requires_approval(portcullis::Operation::GitPush);
+                let create_pr_safe = lattice.capabilities.create_pr
+                    == portcullis::CapabilityLevel::Never
+                    || lattice.requires_approval(portcullis::Operation::CreatePr);
+                let run_bash_safe = lattice.capabilities.run_bash
+                    == portcullis::CapabilityLevel::Never
+                    || lattice.requires_approval(portcullis::Operation::RunBash);
+
+                assert!(
+                    git_push_safe && create_pr_safe && run_bash_safe,
+                    "Profile '{}' has trifecta but exfil vectors are not gated: \
+                     git_push={:?} (approval={}), create_pr={:?} (approval={}), \
+                     run_bash={:?} (approval={})",
+                    name,
+                    lattice.capabilities.git_push,
+                    lattice.requires_approval(portcullis::Operation::GitPush),
+                    lattice.capabilities.create_pr,
+                    lattice.requires_approval(portcullis::Operation::CreatePr),
+                    lattice.capabilities.run_bash,
+                    lattice.requires_approval(portcullis::Operation::RunBash),
+                );
+            }
+            // If no trifecta, profile is safe by construction — no assertion needed
+        }
     }
 }

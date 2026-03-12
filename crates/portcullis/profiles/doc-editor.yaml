@@ -1,0 +1,44 @@
+# Doc Editor — documentation-only agent profile.
+#
+# Can read the entire codebase for context, but writes are scoped to
+# documentation files. No network egress, no bash, no git push.
+#
+# Trifecta analysis:
+#   - Private data: read_files=always (present)
+#   - Untrusted content: web_fetch=never, web_search=never (absent)
+#   - Exfiltration: git_push=never, run_bash=never (absent)
+#   => One of three components. Safe by construction.
+
+name: doc-editor
+description: "Documentation editor — read all, write docs only, no network"
+
+capabilities:
+  read_files: always
+  write_files: low_risk
+  edit_files: low_risk
+  run_bash: never
+  glob_search: always
+  grep_search: always
+  web_search: never
+  web_fetch: never
+  git_commit: low_risk
+  git_push: never
+  create_pr: never
+  manage_pods: never
+
+paths:
+  blocked:
+    - "**/.ssh/**"
+    - "**/.aws/**"
+    - "**/.env"
+    - "**/.env.*"
+    - "**/credentials*"
+    - "/etc/shadow"
+
+budget:
+  max_cost_usd: "2.00"
+  max_input_tokens: 50000
+  max_output_tokens: 10000
+
+time:
+  duration_hours: 1
