@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Optional
 
 
@@ -16,6 +16,7 @@ class PodSpec:
     labels: Optional[Dict[str, str]] = None
     task: Optional[str] = None
     budget_max_usd: Optional[float] = None
+    credentials_env: Optional[Dict[str, str]] = None
 
     def to_dict(self) -> Dict[str, object]:
         metadata: Dict[str, object] = {}
@@ -46,6 +47,9 @@ class PodSpec:
                 "memory_mib": self.memory_mib,
             }
 
+        if self.credentials_env:
+            inner_spec["credentials"] = {"env": dict(self.credentials_env)}
+
         spec: Dict[str, object] = {
             "apiVersion": "nucleus/v1",
             "kind": "Pod",
@@ -54,6 +58,18 @@ class PodSpec:
         }
 
         return spec
+
+    def __repr__(self) -> str:
+        # Redact credential values for safe debug/log output
+        parts = []
+        for f in fields(self):
+            val = getattr(self, f.name)
+            if f.name == "credentials_env" and val:
+                redacted = {k: "[REDACTED]" for k in val}
+                parts.append(f"credentials_env={redacted!r}")
+            elif val != f.default:
+                parts.append(f"{f.name}={val!r}")
+        return f"PodSpec({', '.join(parts)})"
 
 
 @dataclass
