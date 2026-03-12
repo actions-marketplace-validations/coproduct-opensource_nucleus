@@ -105,6 +105,11 @@ pub mod heyting;
 /// Kernel decision engine — complete mediation with monotone session state.
 #[cfg(feature = "serde")]
 pub mod kernel;
+/// Progressive discovery: observe agent behavior and generate minimal policies.
+///
+/// Requires the `spec` feature (includes `serde`, `serde_yaml`, `toml`).
+#[cfg(feature = "spec")]
+pub mod observe;
 /// Declarative profile specification and canonical profile registry.
 ///
 /// Requires the `spec` feature (includes `serde`, `cel`, `serde_yaml`, `toml`).

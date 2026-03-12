@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Core enforcement
-portcullis = { path = "../portcullis" }
+portcullis = { path = "../portcullis", features = ["spec"] }
 nucleus-spec = { path = "../nucleus-spec" }
 nucleus-client = { path = "../nucleus-client" }
 

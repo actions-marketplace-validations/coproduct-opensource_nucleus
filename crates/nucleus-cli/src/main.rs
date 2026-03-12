@@ -26,6 +26,7 @@ mod constants;
 mod doctor;
 mod keychain;
 mod node;
+mod observe;
 mod profiles;
 mod run;
 mod setup;
@@ -73,6 +74,9 @@ enum Commands {
     /// Show current configuration
     Config,
 
+    /// Observe agent behavior and generate a minimal policy profile
+    Observe(observe::ObserveArgs),
+
     /// Interact with a running nucleus-node (test utilities)
     Node(node::NodeArgs),
 }
@@ -106,6 +110,7 @@ async fn main() -> Result<()> {
         Commands::Doctor => doctor::diagnose().await,
         Commands::Profiles => profiles::list(),
         Commands::Config => config::show(&config_path),
+        Commands::Observe(args) => observe::execute(args),
         Commands::Node(args) => node::execute(args).await,
     }
 }
