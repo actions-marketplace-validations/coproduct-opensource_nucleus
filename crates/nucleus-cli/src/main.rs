@@ -96,6 +96,9 @@ fn init_logging(verbose: bool) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install rustls crypto provider before any TLS connections (via ureq).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     init_logging(cli.verbose);
 

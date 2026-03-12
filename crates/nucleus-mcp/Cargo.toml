@@ -22,6 +22,7 @@ rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+rustls = { workspace = true }
 ureq = { workspace = true }
 uuid = { workspace = true }
 
