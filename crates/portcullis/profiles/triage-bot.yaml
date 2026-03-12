@@ -1,0 +1,44 @@
+# Triage Bot — read and search, no code changes.
+#
+# Can read source code, search with glob/grep, and fetch web content
+# for context (e.g., linked issues, docs). Cannot write, edit, run
+# commands, or push anything. Ideal for issue triage and labeling.
+#
+# Trifecta analysis:
+#   - Private data: read_files=always (present)
+#   - Untrusted content: web_fetch=low_risk (present)
+#   - Exfiltration: git_push=never, run_bash=never, create_pr=never (absent)
+#   => Two of three components. No approval escalation needed.
+
+name: triage-bot
+description: "Triage bot — read, search, fetch context. No code changes."
+
+capabilities:
+  read_files: always
+  write_files: never
+  edit_files: never
+  run_bash: never
+  glob_search: always
+  grep_search: always
+  web_search: low_risk
+  web_fetch: low_risk
+  git_commit: never
+  git_push: never
+  create_pr: never
+  manage_pods: never
+
+paths:
+  blocked:
+    - "**/.ssh/**"
+    - "**/.aws/**"
+    - "**/.env"
+    - "**/.env.*"
+    - "**/credentials*"
+
+budget:
+  max_cost_usd: "1.00"
+  max_input_tokens: 50000
+  max_output_tokens: 5000
+
+time:
+  duration_minutes: 30

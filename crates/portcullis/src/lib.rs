@@ -93,6 +93,7 @@ pub mod certificate;
 mod command;
 pub mod constraint;
 pub mod dangerous_combo;
+
 pub mod delegation;
 pub mod dropout;
 pub mod escalation;
@@ -104,6 +105,11 @@ pub mod heyting;
 /// Kernel decision engine — complete mediation with monotone session state.
 #[cfg(feature = "serde")]
 pub mod kernel;
+/// Declarative profile specification and canonical profile registry.
+///
+/// Requires the `spec` feature (includes `serde`, `cel`, `serde_yaml`, `toml`).
+#[cfg(feature = "spec")]
+pub mod profile;
 #[cfg(feature = "remote-audit")]
 pub mod s3_audit_backend;
 pub mod taint_core;
