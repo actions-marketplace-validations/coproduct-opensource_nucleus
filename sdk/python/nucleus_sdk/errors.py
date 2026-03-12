@@ -37,6 +37,17 @@ class PolicyDenied(AccessDenied):
     pass
 
 
+class TrifectaBlocked(AccessDenied):
+    """Raised when an operation would complete the taint trifecta.
+
+    The taint trifecta fires when a session has accumulated all three
+    taint labels (private_data + untrusted_content + exfil_vector) and
+    an exfiltration-capable operation is attempted without approval.
+    """
+
+    pass
+
+
 class BudgetExceeded(NucleusError):
     """Raised when a session or pod exceeds its budget limit."""
 
@@ -61,11 +72,13 @@ def from_error_payload(payload: dict, status: int) -> NucleusError:
     if kind == "budget_exceeded":
         return BudgetExceeded(message, kind=kind, status=status, operation=operation)
 
+    if kind == "trifecta_blocked":
+        return TrifectaBlocked(message, kind=kind, status=status, operation=operation)
+
     if kind in {
         "path_denied",
         "command_denied",
         "sandbox_escape",
-        "trifecta_blocked",
         "insufficient_capability",
         "dns_not_allowed",
     }:

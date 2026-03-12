@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, Optional, TypeVar
 
 from .client import ProxyClient
 from .errors import AccessDenied, ApprovalRequired
+from .taint import TaintGuard
 from .trace import Trace
 from .tools.fs import FileHandle
 from .tools.net import NetHandle
@@ -15,14 +16,19 @@ T = TypeVar("T")
 
 
 class Session:
-    """High-level session that wraps a ProxyClient with typed tool handles
-    and automatic trace recording.
+    """High-level session that wraps a ProxyClient with typed tool handles,
+    automatic trace recording, and taint tracking.
+
+    The session tracks taint across tool calls using a monotone 3-bool
+    semilattice. When all three taint labels co-occur (the "trifecta"),
+    exfiltration-capable operations raise ``TrifectaBlocked`` unless
+    explicitly approved.
 
     Usage::
 
         with Session(profile="codegen") as s:
-            readme = s.fs.read("README.md")
-            s.fs.write("out.txt", readme.upper())
+            readme = s.fs.read("README.md")          # adds private_data taint
+            s.fs.write("out.txt", readme.upper())     # neutral
             result = s.approve("fetch", lambda: s.net.fetch("https://example.com"))
 
     On exit the session exports its trace.  The trace is available
@@ -35,12 +41,14 @@ class Session:
         proxy_url: Optional[str] = None,
         proxy: Optional[ProxyClient] = None,
         timeout: float = 30.0,
+        trifecta_enabled: bool = True,
     ) -> None:
         self.profile = profile
         self._proxy_url = proxy_url or os.environ.get("NUCLEUS_PROXY_URL", "")
         self._timeout = timeout
         self._trace = Trace()
         self._external_proxy = proxy
+        self._taint_guard = TaintGuard(trifecta_enabled=trifecta_enabled)
 
         # These are initialised lazily in __enter__
         self._proxy: Optional[ProxyClient] = None
@@ -60,9 +68,9 @@ class Session:
                 )
             self._proxy = ProxyClient(self._proxy_url, timeout=self._timeout)
 
-        self._fs = FileHandle(self._proxy, self._trace)
-        self._net = NetHandle(self._proxy, self._trace)
-        self._git = GitHandle(self._proxy, self._trace)
+        self._fs = FileHandle(self._proxy, self._trace, self._taint_guard)
+        self._net = NetHandle(self._proxy, self._trace, self._taint_guard)
+        self._git = GitHandle(self._proxy, self._trace, self._taint_guard)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore[no-untyped-def]
@@ -101,6 +109,11 @@ class Session:
     @property
     def trace(self) -> Trace:
         return self._trace
+
+    @property
+    def taint_summary(self) -> str:
+        """Human-readable summary of the current session taint state."""
+        return self._taint_guard.summary()
 
     # -- approval helper ---------------------------------------------------
 
