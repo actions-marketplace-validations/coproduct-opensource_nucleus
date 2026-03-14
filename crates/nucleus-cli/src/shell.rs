@@ -69,6 +69,11 @@ pub struct ShellArgs {
     #[arg(long, env = "NUCLEUS_KERNEL_TRACE")]
     pub kernel_trace: Option<PathBuf>,
 
+    /// Run a single prompt non-interactively instead of launching an interactive session.
+    /// Output is printed to stdout as JSON. No TTY required — works from within Claude Code.
+    #[arg(short = 'P', long)]
+    pub prompt: Option<String>,
+
     /// Print the MCP config and exit (useful for manual claude invocation)
     #[arg(long)]
     pub print_config: bool,
@@ -241,7 +246,7 @@ pub async fn execute(args: ShellArgs) -> Result<()> {
     }
     eprintln!();
 
-    // Launch claude in interactive mode.
+    // Launch claude with nucleus MCP tools.
     //
     // --allowedTools: only nucleus MCP tools are auto-approved
     // --disallowedTools: explicitly block built-in tools so Claude doesn't
@@ -259,6 +264,11 @@ pub async fn execute(args: ShellArgs) -> Result<()> {
         .arg("Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Agent")
         .env_remove("CLAUDECODE")
         .current_dir(&work_dir);
+
+    // Non-interactive prompt mode: run a single prompt and exit
+    if let Some(ref prompt) = args.prompt {
+        cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
+    }
 
     // Pass through any additional claude args
     for arg in &args.claude_args {
