@@ -54,7 +54,7 @@ base64 = "0.22"
 x509-parser = { workspace = true }
 oid-registry = "0.8"
 
-bollard = "0.20"
+bollard = "0.21"
 
 nucleus = { path = "../nucleus" }
 nucleus-identity = { path = "../nucleus-identity" }
