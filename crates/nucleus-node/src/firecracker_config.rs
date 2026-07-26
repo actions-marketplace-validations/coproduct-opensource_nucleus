@@ -30,7 +30,7 @@ use crate::ApiError;
 // Config structs
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Serialize)]
 pub(crate) struct FirecrackerConfig {
     #[serde(rename = "boot-source")]
@@ -46,7 +46,7 @@ pub(crate) struct FirecrackerConfig {
     logger: Option<LoggerConfig>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Serialize)]
 struct BootSource {
     kernel_image_path: String,
@@ -63,7 +63,7 @@ struct DriveConfig {
     is_read_only: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Serialize)]
 struct MachineConfig {
     vcpu_count: i64,
@@ -79,7 +79,7 @@ struct NetworkInterface {
     guest_mac: String,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Serialize)]
 struct LoggerConfig {
     log_path: String,
@@ -409,11 +409,25 @@ pub(crate) fn verify_seccomp_active(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+// FAIL-CLOSED, corrected 2026-07-26. This returned `Ok(())` — "seccomp is
+// Linux-only; skip verification on other platforms" — which made a VERIFIER
+// report success on a platform where it cannot verify anything.
+//
+// That silently defeated its own caller. main.rs kills the process and aborts
+// the launch when seccomp cannot be confirmed, and its comment says so
+// explicitly: "The previous behavior only logged a warning and continued
+// (fail-open)." The cfg stub reintroduced precisely that, for any non-Linux
+// build, one layer down.
+//
+// THE RULE, worth stating because it generalises: an ENFORCER may refuse when it
+// cannot act, but a VERIFIER may never SUCCEED when it cannot check. "I was
+// unable to look" and "I looked and it was fine" are different answers, and only
+// one of them is safe to return from a function whose caller kills a process on
+// Err.
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 pub(crate) fn verify_seccomp_active(_pid: u32) -> Result<(), String> {
-    // Seccomp is Linux-only; skip verification on other platforms.
-    Ok(())
+    Err("seccomp verification requires Linux; cannot confirm a filter is active".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -609,5 +623,100 @@ mod tests {
             // FAIL here.
             prop_assert_eq!(has_disable, disable);
         }
+    }
+
+    // ── the fail-closed verifier rule ───────────────────────────────────────
+    //
+    // Runs only off Linux, which is exactly where the bug lived: on Linux the
+    // real implementation reads /proc and this stub does not exist. A dev
+    // machine is where a vacuously-successful verifier would have been trusted.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn seccomp_verifier_fails_closed_when_it_cannot_verify() {
+        let r = super::verify_seccomp_active(1);
+        assert!(
+            r.is_err(),
+            "a verifier that cannot check must not report success — its caller \
+             kills the process on Err and continues on Ok"
+        );
+    }
+
+    // ── THE GUEST-VISIBLE DEVICE SURFACE ────────────────────────────────────
+    //
+    // Firecracker deliberately emulates only five devices — virtio-net,
+    // virtio-block, virtio-vsock, a serial console and a minimal keyboard
+    // controller — on the principle that every feature not implemented is
+    // attack surface that does not exist. This test pins which of them WE
+    // attach, because that is the guest-to-host boundary of a nucleus pod.
+    //
+    // Nothing asserted it before. Firecracker's 2026 releases added developer-
+    // preview hotplug for PCI virtio block/pmem/net devices; a future config
+    // field enabling any of those would widen the guest's reach into the host
+    // and, without this test, would land as an ordinary struct change.
+    //
+    // Pinned on the SERIALIZED form — that is what Firecracker actually
+    // consumes — so a field renamed or newly serialized is caught, and a field
+    // that exists in Rust but is never serialized correctly is not counted.
+    #[test]
+    fn firecracker_device_surface_is_exactly_pinned() {
+        // A maximal pod: every optional device present, so nothing is missed by
+        // being skip_serializing_if'd away.
+        let cfg = FirecrackerConfig {
+            boot_source: BootSource {
+                kernel_image_path: "/k".to_string(),
+                boot_args: Some("console=ttyS0".to_string()),
+            },
+            drives: vec![DriveConfig {
+                drive_id: "rootfs".to_string(),
+                path_on_host: "/rootfs.ext4".to_string(),
+                is_root_device: true,
+                is_read_only: true,
+            }],
+            machine_config: MachineConfig {
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                smt: false,
+            },
+            network_interfaces: vec![NetworkInterface {
+                iface_id: "eth0".to_string(),
+                host_dev_name: "tap0".to_string(),
+                guest_mac: "AA:BB:CC:DD:EE:01".to_string(),
+            }],
+            vsock: Some(VsockConfig {
+                guest_cid: 3,
+                uds_path: "/v.sock".to_string(),
+            }),
+            logger: Some(LoggerConfig {
+                log_path: "/log".to_string(),
+                level: "Info".to_string(),
+                show_level: false,
+                show_log_origin: false,
+            }),
+        };
+
+        let value = serde_json::to_value(&cfg).expect("serialize");
+        let got: std::collections::BTreeSet<String> = value
+            .as_object()
+            .expect("config is a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        let want: std::collections::BTreeSet<String> = [
+            "boot-source",
+            "drives",
+            "logger",
+            "machine-config",
+            "network-interfaces",
+            "vsock",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        assert_eq!(
+            got, want,
+            "the guest-visible device surface changed — a device class was \
+             added to or removed from what Firecracker is told to attach"
+        );
     }
 }
