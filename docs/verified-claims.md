@@ -135,14 +135,33 @@ constructor is private.
 that cannot be named outside its module. `Discharged<O>` tokens are zero-sized
 proof witnesses; `Discharged::mint()` is `fn` (not `pub fn`).
 
-**Proved in:** Compile-fail doc-test on `DischargedBundle` (portcullis-core/src/discharge.rs)
+**Scope binding (now machine-checked — see claim 8a):** the type system
+establishes that *a* preflight ran, not that a
+preflight ran for **this** action. The bundle carries the `(Operation, SinkClass)`
+pair it was earned for, and each mediated method checks it; without that check a
+bundle earned for a cheaper action would authorize any other — the confused
+deputy. The check itself is a runtime comparison, but it can no longer be
+*skipped*: effect methods take an owned `Authority`, so reaching the effect
+requires surrendering one.
+
+**Proved in:** Compile-fail doc-test on `DischargedBundle`
+(portcullis-core/src/discharge.rs); scope binding by
+`a_read_bundle_will_not_authorize_a_write` and siblings in
+`portcullis-effects/src/runtime.rs`.
 
 **What it does NOT prove:** That the obligation checks themselves are correct.
 Only that they cannot be skipped. The checks' correctness is tested by 33 unit
 tests and the Kani harnesses above.
 
-**CI gate:** `Tests` job runs the compile-fail doc-test. A PR that makes the
-`Seal` field public or adds a public constructor would fail the doc-test.
+Nor does it prove **complete mediation** on its own. For the effect traits that
+property now holds structurally: all 13 methods take an `Authority` **by value**,
+so the scope check cannot be skipped and replay is a compile error. See claim 8a
+for the machine-checked scope predicate, and
+[Production Delta](production-delta.md) for the surfaces still outside it.
+
+**CI gate:** `Tests` job runs the compile-fail doc-test and the scope-binding
+tests. A PR that makes the `Seal` field public, adds a public constructor, or
+drops a `require_scope` call would fail it.
 
 ---
 
@@ -192,6 +211,56 @@ system is an approximation — dynamic data flow through the `FlowTracker` remai
 necessary for paths where the type is erased.
 
 **CI gate:** `Tests` job.
+
+---
+
+### 8a. A discharge authorizes its own action and nothing else
+
+**Plain English:** An authorization earned for one action cannot be spent on a
+different one. A bundle earned for reading a file does not authorize a write, a
+shell spawn, or a push — even when the coarse capability for that action is
+enabled. This is the confused deputy, and it is the first half of complete
+mediation.
+
+**Formal statement:** for the extracted scope predicate,
+`scope_admits(eo, es, ao, as) ↔ (eo = ao ∧ es = as)`. Corollaries: admission is
+reflexive (no false denial), discriminates on each component independently, and
+is functional — a bundle admits **at most one** pair.
+
+**Proved in:**
+- Lean 4: [`lean/MediationScopeExtracted.lean`](../crates/portcullis-core/lean/MediationScopeExtracted.lean)
+  — `scope_admits_refl`, `scope_admits_iff_eq`, `scope_admits_unique`,
+  `scope_admits_no_escalation`
+- Proven **over the Aeneas-extracted definitions**, not a hand-written model:
+  `crates/nucleus-ifc-kernel/src/extracted/mediation.rs` → charon (scoped
+  `--start-from`) → aeneas → `generated-mediation/PortcullisCoreMediation/`.
+- Rust↔model parity: exhaustive sweep in `src/extracted/mediation.rs` over every
+  earnable pair (27 of 247 pass `PathAllowed`) against all 247 attempted pairs —
+  6,669 comparisons, the complete domain, so this is an equivalence proof rather
+  than a sample.
+
+**Axiom set:** `[propext, Classical.choice, Quot.sound]` — no `sorryAx`, and no
+Aeneas `*External` opaque axiom. The Rust slice compares explicit `u8` ranks
+rather than deriving `PartialEq` precisely so no opaque comparison axiom lands on
+the critical path.
+
+**What it does NOT prove:** that every effect path *calls* the predicate. For the
+effect traits that is now true: **all 13 methods take an `Authority` by value**,
+up from 3 taking any token at all, so the scope check is unavoidable and replay
+is a compile error — carried by a `compile_fail` doctest on `FileEffect` whose
+dependence on the replay was established by perturbation.
+
+It remains untrue elsewhere. `nucleus::Sandbox::{write,write_approved}` take a
+`&DischargedBundle` and ignore it (`_proof`), so that surface is unmediated in
+the same way the effect traits were. See
+[Production Delta](production-delta.md).
+
+It also says nothing about the other seven obligations: it governs which action a
+bundle speaks for, not whether that action is safe.
+
+**CI gate:** `Scoped Aeneas (Rust → Lean 4) + parity tests` — re-extracts from
+Rust, rebuilds the theorem against the fresh extraction, and fails on a dirty
+axiom set or any `sorry`/`admit`/`native_decide`.
 
 ---
 
