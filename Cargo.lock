@@ -6665,9 +6665,18 @@ dependencies = [
 name = "nucleus-cred-broker"
 version = "1.0.0"
 dependencies = [
+ "nucleus-cred-protocol",
  "serde",
  "thiserror 2.0.19",
  "zeroize",
+]
+
+[[package]]
+name = "nucleus-cred-protocol"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -7284,6 +7293,7 @@ dependencies = [
  "hmac 0.13.0",
  "nucleus",
  "nucleus-client",
+ "nucleus-cred-protocol",
  "nucleus-identity",
  "nucleus-ifc-kernel",
  "nucleus-permission-market",
