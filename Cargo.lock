@@ -6662,6 +6662,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleus-cred-broker"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+ "zeroize",
+]
+
+[[package]]
 name = "nucleus-creditworthiness"
 version = "1.0.0"
 dependencies = [
@@ -6965,6 +6974,7 @@ dependencies = [
  "jsonwebtoken",
  "nucleus",
  "nucleus-client",
+ "nucleus-cred-broker",
  "nucleus-identity",
  "nucleus-ifc-kernel",
  "nucleus-proto",
