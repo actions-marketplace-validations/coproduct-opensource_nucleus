@@ -562,6 +562,18 @@ impl NucleusRuntime {
         }
     }
 
+    /// The receipt log for this runtime's effects.
+    ///
+    /// Delegates to the effect layer rather than holding its own. That is not an
+    /// implementation detail: `PolicyEnforced::gate` calls `witnessed`, which
+    /// REPLACES whatever log an authority already carried, so a second log
+    /// attached upstream would be silently discarded. Attempting exactly that
+    /// is how this accessor came to exist — the runtime-held log recorded
+    /// nothing, and the reason was the override downstream.
+    pub fn receipts(&self) -> &crate::receipt::ReceiptLog {
+        self.effects.receipts()
+    }
+
     /// The active policy profile.
     pub fn profile(&self) -> PolicyProfile {
         self.profile
@@ -2062,6 +2074,40 @@ mod tests {
                 "a correctly-scoped bundle was rejected: {err:?}"
             );
         }
+    }
+
+    /// **The behavioural complement to the source scan.** The scan proves the
+    /// witness is WIRED at every site; it cannot prove the wiring works. A
+    /// `witnessed_by` that attached a log nobody appended to would satisfy the
+    /// scan and record nothing — which is materially the state this whole
+    /// change fixes, so it is the failure mode most worth a real test.
+    #[test]
+    fn a_real_effect_leaves_a_real_receipt() {
+        let mut rt = rt_tok(PolicyProfile::Codegen);
+        assert_eq!(
+            rt.receipts().len(),
+            0,
+            "a fresh runtime should have recorded nothing yet"
+        );
+
+        let result = {
+            let p = rt.preflight_read().unwrap();
+            rt.read_file(std::path::Path::new("Cargo.toml"), p)
+        };
+        assert!(result.is_ok(), "the read should succeed: {result:?}");
+
+        let entries = rt.receipts().entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "one authorised effect must leave exactly one receipt, got {entries:?}"
+        );
+        assert_eq!(entries[0].operation, Operation::ReadFiles);
+        assert_eq!(
+            entries[0].outcome,
+            crate::receipt::EffectOutcome::Allowed,
+            "an effect that succeeded must be recorded as allowed"
+        );
     }
 
     #[test]
