@@ -45,6 +45,21 @@ pub struct SetupArgs {
     /// Skip artifact download (for offline setup)
     #[arg(long)]
     pub skip_artifacts: bool,
+
+    /// Install missing host dependencies (currently Lima, via Homebrew).
+    ///
+    /// Off by default: installing software on someone's machine is not
+    /// something a setup command should do unasked. Without it, a missing
+    /// dependency prints the exact command to run.
+    #[arg(long)]
+    pub install_deps: bool,
+
+    /// Skip the post-setup smoke test that boots a throwaway microVM.
+    ///
+    /// The smoke test is the only step that proves Tier 2 actually works
+    /// rather than appears configured, so skipping it is opt-out, not opt-in.
+    #[arg(long)]
+    pub skip_smoke_test: bool,
 }
 
 /// Platform detection result
@@ -64,13 +79,39 @@ pub enum AppleChip {
     M2,
     M3,
     M4,
+    /// M5 **or newer**. The detection below folds every generation from 5 up
+    /// into this variant deliberately: enumerating chips means the check goes
+    /// stale on every Apple release, and the failure mode is the bad one —
+    /// an unrecognised chip fell through to `Unknown`, whose
+    /// `supports_nested_virt()` is `false`, so `doctor` told an M5 owner their
+    /// hardware could not do nested virtualisation. That is exactly backwards,
+    /// and it discourages the Lima+`vz` path that Firecracker needs for KVM.
+    M5OrNewer,
     Intel,
     Unknown,
 }
 
+/// The generation number in an Apple Silicon brand string, e.g.
+/// `"apple m5 pro"` -> `Some(5)`.
+///
+/// Parses rather than enumerating, because enumerating goes stale on every
+/// Apple release and the stale failure mode is the harmful one: an
+/// unrecognised chip fell through to [`AppleChip::Unknown`], whose
+/// `supports_nested_virt()` is `false`, so `doctor` told an M5 owner their
+/// hardware could not do nested virtualisation. It can — and that is the
+/// capability the Lima `vz` path needs to expose `/dev/kvm` for Firecracker.
+///
+/// Requires the `apple m` prefix so a stray `m1` elsewhere in the string
+/// cannot be mistaken for a generation.
+pub fn apple_silicon_generation(brand_lowercase: &str) -> Option<u32> {
+    let rest = brand_lowercase.split("apple m").nth(1)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 impl AppleChip {
     pub fn supports_nested_virt(&self) -> bool {
-        matches!(self, AppleChip::M3 | AppleChip::M4)
+        matches!(self, AppleChip::M3 | AppleChip::M4 | AppleChip::M5OrNewer)
     }
 
     /// Returns the Linux architecture for this chip
@@ -154,7 +195,35 @@ pub async fn execute(args: SetupArgs) -> Result<()> {
     println!("\nWriting configuration...");
     write_config(&args)?;
 
-    // Step 6: Print summary
+    // Step 6: Prove it works, rather than reporting that it appears configured.
+    //
+    // Deliberately the LAST thing, and deliberately opt-out: every other step
+    // above checks a precondition, and a machine can pass all of them and still
+    // boot no microVM. If this fails the user learns it here, not the first
+    // time they try to run a workload.
+    // On macOS Firecracker lives in the Lima VM; on Linux it is right here.
+    // Previously this only ran on macOS, so a Linux host — the case where Tier 2
+    // is most likely to actually be used — got no verification at all.
+    let smoke_target = match &platform {
+        Platform::MacOS { .. } if !args.skip_vm => Some(SmokeTarget::LimaVm(&args.vm_name)),
+        Platform::MacOS { .. } => None,
+        Platform::Linux => Some(SmokeTarget::LocalHost),
+        Platform::Other(_) => None,
+    };
+    if let (Some(target), false) = (smoke_target, args.skip_smoke_test) {
+        if !run_smoke_test(target) {
+            print_setup_summary(&args, &platform);
+            bail!(
+                "setup finished, but no microVM could boot — Tier 2 is not usable yet.\n\
+                 Re-run `nucleus doctor` and check the /dev/kvm line.\n\
+                 To skip this check: nucleus setup --skip-smoke-test"
+            );
+        }
+    } else if smoke_target.is_some() {
+        println!("\nSkipping smoke test (--skip-smoke-test) — Tier 2 is unverified.");
+    }
+
+    // Step 7: Print summary
     print_setup_summary(&args, &platform);
 
     Ok(())
@@ -182,19 +251,20 @@ fn detect_apple_chip() -> Result<AppleChip> {
 
     let brand = String::from_utf8_lossy(&output.stdout).to_lowercase();
 
-    if brand.contains("m4") {
-        Ok(AppleChip::M4)
-    } else if brand.contains("m3") {
-        Ok(AppleChip::M3)
-    } else if brand.contains("m2") {
-        Ok(AppleChip::M2)
-    } else if brand.contains("m1") {
-        Ok(AppleChip::M1)
-    } else if brand.contains("intel") {
-        Ok(AppleChip::Intel)
-    } else {
-        Ok(AppleChip::Unknown)
+    if brand.contains("intel") {
+        return Ok(AppleChip::Intel);
     }
+    // Parse the generation rather than enumerating chips, so a new Apple
+    // Silicon release is not misreported as `Unknown` (and therefore as
+    // lacking nested virtualisation).
+    Ok(match apple_silicon_generation(&brand) {
+        Some(1) => AppleChip::M1,
+        Some(2) => AppleChip::M2,
+        Some(3) => AppleChip::M3,
+        Some(4) => AppleChip::M4,
+        Some(_) => AppleChip::M5OrNewer,
+        None => AppleChip::Unknown,
+    })
 }
 
 fn detect_macos_version() -> Result<MacOSVersion> {
@@ -299,11 +369,15 @@ async fn setup_lima_vm(args: &SetupArgs, chip: &AppleChip) -> Result<()> {
 
     // Check if Lima is installed
     if !is_lima_installed() {
-        bail!(
-            "Lima is not installed.\n\
-             Install with: brew install lima\n\
-             Then re-run: nucleus setup"
-        );
+        if args.install_deps {
+            install_lima()?;
+        } else {
+            bail!(
+                "Lima is not installed (2.0+ required for nested virtualization).\n\
+                 Install it for me:  nucleus setup --install-deps\n\
+                 Or do it yourself:  brew install lima && nucleus setup"
+            );
+        }
     }
 
     // Check if VM already exists
@@ -387,11 +461,113 @@ fn verify_kvm_in_vm(vm_name: &str) {
     } else {
         warn!("KVM not available in VM - Firecracker will use emulation");
         println!("\nKVM Status: /dev/kvm NOT available");
-        println!("  Firecracker microVMs will run in emulation mode (slower).");
-        println!("  For native performance, you need:");
+        // Firecracker is a KVM-based VMM. There is no emulation fallback: it
+        // refuses to start, and `nucleus-node` returns "firecracker requires
+        // /dev/kvm". Saying "slower" here promised a mode that does not exist.
+        println!("  Firecracker CANNOT START without KVM - this is not a slow mode.");
+        println!("  Tier 2 (microVM isolation) will be unavailable. You need:");
         println!("    - Apple Silicon M3/M4 Mac");
         println!("    - macOS 15+ (Sequoia)");
         println!("    - Or: Use a Linux host with KVM support");
+    }
+}
+
+/// Install Lima via Homebrew, on explicit request (`--install-deps`).
+fn install_lima() -> Result<()> {
+    if which("brew").is_none() {
+        bail!(
+            "--install-deps needs Homebrew, which is not on PATH.\n\
+             Install Lima another way, then re-run: nucleus setup"
+        );
+    }
+    println!("Installing Lima (brew install lima)...");
+    let status = Command::new("brew")
+        .args(["install", "lima"])
+        .status()
+        .context("failed to run brew")?;
+    if !status.success() {
+        bail!("brew install lima failed; install it manually and re-run: nucleus setup");
+    }
+    if !is_lima_installed() {
+        bail!("Lima still not on PATH after install; open a new shell and re-run: nucleus setup");
+    }
+    println!("Lima installed.");
+    Ok(())
+}
+
+fn which(bin: &str) -> Option<String> {
+    Command::new("which")
+        .arg(bin)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|p| !p.is_empty())
+}
+
+/// Where the smoke test should run.
+#[derive(Debug, Clone, Copy)]
+pub enum SmokeTarget<'a> {
+    /// Through a Lima VM (macOS hosts).
+    LimaVm(&'a str),
+    /// Directly on this machine (Linux hosts with KVM).
+    LocalHost,
+}
+
+/// Boot a throwaway microVM and report whether it reached userspace.
+///
+/// This is the only check in setup that RUNS the thing rather than inferring
+/// from it. `test -c /dev/kvm` passing means the device node exists, not that
+/// Firecracker can use it — so without this, setup can report success on a
+/// machine where no microVM will ever boot.
+fn run_smoke_test(target: SmokeTarget<'_>) -> bool {
+    println!("\nSmoke test: booting a throwaway microVM...");
+    let script = include_str!("../../../scripts/firecracker/smoke-test.sh");
+    let mut cmd = match target {
+        // macOS reaches Firecracker through the Lima VM.
+        SmokeTarget::LimaVm(vm_name) => {
+            let mut c = Command::new("limactl");
+            c.args(["shell", vm_name, "--", "sudo", "sh", "-s"]);
+            c
+        }
+        // A Linux host with KVM already has everything; there is no VM to
+        // shell into, and pretending otherwise is why this check used to be
+        // skipped entirely on Linux.
+        SmokeTarget::LocalHost => {
+            let mut c = Command::new("sudo");
+            c.args(["sh", "-s"]);
+            c
+        }
+    };
+    let out = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(script.as_bytes());
+            }
+            child.wait_with_output()
+        });
+    match out {
+        Ok(o) if o.status.success() => {
+            println!("  PASS - a microVM booted to userspace. Tier 2 works on this host.");
+            true
+        }
+        Ok(o) => {
+            println!("  FAIL - Tier 2 is not usable on this host yet.");
+            let err = String::from_utf8_lossy(&o.stderr);
+            for line in err.lines().take(12) {
+                println!("    {line}");
+            }
+            false
+        }
+        Err(e) => {
+            println!("  FAIL - could not run the smoke test: {e}");
+            false
+        }
     }
 }
 
@@ -871,6 +1047,8 @@ mod tests {
             vm_disk_gib: 20,
             rotate_secrets: false,
             skip_artifacts: false,
+            install_deps: false,
+            skip_smoke_test: true,
         };
 
         let config = generate_lima_config(&args, &AppleChip::M3).unwrap();
@@ -893,6 +1071,8 @@ mod tests {
             vm_disk_gib: 20,
             rotate_secrets: false,
             skip_artifacts: false,
+            install_deps: false,
+            skip_smoke_test: true,
         };
 
         let config = generate_lima_config(&args, &AppleChip::Intel).unwrap();
@@ -916,5 +1096,55 @@ mod tests {
     fn test_apple_chip_musl_target() {
         assert_eq!(AppleChip::M3.musl_target(), "aarch64-unknown-linux-musl");
         assert_eq!(AppleChip::Intel.musl_target(), "x86_64-unknown-linux-musl");
+    }
+}
+
+#[cfg(test)]
+mod apple_chip_tests {
+    use super::*;
+
+    /// The bug: "Apple M5 Pro" matched none of the enumerated m1..m4 strings,
+    /// fell through to `Unknown`, and `Unknown.supports_nested_virt()` is
+    /// false — so `doctor` reported that an M5 cannot do nested virtualisation.
+    /// It can, and that is precisely the capability needed to expose /dev/kvm
+    /// to Firecracker under Lima's `vz` backend.
+    #[test]
+    fn m5_and_newer_are_recognised_and_support_nested_virt() {
+        for (brand, gen) in [
+            ("apple m5 pro", 5),
+            ("apple m5 max", 5),
+            ("apple m6", 6),
+            ("apple m12 ultra", 12),
+        ] {
+            assert_eq!(apple_silicon_generation(brand), Some(gen), "{brand}");
+        }
+        assert!(AppleChip::M5OrNewer.supports_nested_virt());
+    }
+
+    #[test]
+    fn the_known_generations_still_parse() {
+        for (brand, gen) in [
+            ("apple m1", 1),
+            ("apple m2 pro", 2),
+            ("apple m3 max", 3),
+            ("apple m4", 4),
+        ] {
+            assert_eq!(apple_silicon_generation(brand), Some(gen), "{brand}");
+        }
+    }
+
+    /// M1/M2 genuinely lack nested virt; the fix must not paper over that.
+    #[test]
+    fn older_silicon_still_reports_no_nested_virt() {
+        assert!(!AppleChip::M1.supports_nested_virt());
+        assert!(!AppleChip::M2.supports_nested_virt());
+        assert!(AppleChip::M3.supports_nested_virt());
+    }
+
+    #[test]
+    fn non_apple_silicon_yields_no_generation() {
+        for brand in ["intel(r) core(tm) i9", "", "some other cpu"] {
+            assert_eq!(apple_silicon_generation(brand), None, "{brand}");
+        }
     }
 }

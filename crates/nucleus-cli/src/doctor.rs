@@ -120,9 +120,13 @@ fn check_platform() -> bool {
                 "{:?}{}",
                 chip,
                 if chip.supports_nested_virt() {
-                    " (nested virt supported)"
+                    " (nested virt expected)"
                 } else {
-                    " (nested virt NOT supported)"
+                    // An expectation derived from the chip name, not a
+                    // capability test. The /dev/kvm probe in the Lima section
+                    // is authoritative — inference from chip strings is what
+                    // reported an M5 as incapable when it is not.
+                    " (nested virt not expected - the /dev/kvm probe below decides)"
                 }
             ),
         );
@@ -169,18 +173,16 @@ fn check_chip() -> AppleChip {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
         .unwrap_or_default();
 
-    if brand.contains("m4") {
-        AppleChip::M4
-    } else if brand.contains("m3") {
-        AppleChip::M3
-    } else if brand.contains("m2") {
-        AppleChip::M2
-    } else if brand.contains("m1") {
-        AppleChip::M1
-    } else if brand.contains("intel") {
-        AppleChip::Intel
-    } else {
-        AppleChip::Unknown
+    if brand.contains("intel") {
+        return AppleChip::Intel;
+    }
+    match crate::setup::apple_silicon_generation(&brand) {
+        Some(1) => AppleChip::M1,
+        Some(2) => AppleChip::M2,
+        Some(3) => AppleChip::M3,
+        Some(4) => AppleChip::M4,
+        Some(_) => AppleChip::M5OrNewer,
+        None => AppleChip::Unknown,
     }
 }
 
@@ -204,6 +206,15 @@ fn check_macos_version() -> MacOSVersion {
         major: parts.first().and_then(|s| s.parse().ok()).unwrap_or(0),
         minor: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
     }
+}
+
+/// The Lima VM to inspect.
+///
+/// `setup` takes `--vm-name`, so hardcoding "nucleus" here meant `doctor`
+/// reported "VM not found" for any user who named theirs anything else — the
+/// two commands disagreed about which machine they were talking about.
+fn vm_name() -> String {
+    std::env::var("NUCLEUS_VM_NAME").unwrap_or_else(|_| "nucleus".to_string())
 }
 
 fn check_lima() -> bool {
@@ -274,7 +285,7 @@ fn check_lima() -> bool {
 
     let nucleus_vm = vms
         .lines()
-        .find(|line| line.starts_with("nucleus:"))
+        .find(|line| line.starts_with(&format!("{}:", vm_name())))
         .map(|line| line.split(':').nth(1).unwrap_or("unknown"));
 
     let vm_ok = match nucleus_vm {
@@ -294,7 +305,7 @@ fn check_lima() -> bool {
     // Check KVM inside VM (if running)
     if nucleus_vm == Some("Running") {
         let kvm_check = Command::new("limactl")
-            .args(["shell", "nucleus", "--", "test", "-e", "/dev/kvm"])
+            .args(["shell", &vm_name(), "--", "test", "-e", "/dev/kvm"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -304,18 +315,24 @@ fn check_lima() -> bool {
             if kvm_check {
                 Status::Ok
             } else {
-                Status::Warning
+                // NOT a warning. Firecracker is a KVM-based VMM: without
+                // /dev/kvm it does not fall back to emulation, it refuses to
+                // start (`nucleus-node` returns "firecracker requires
+                // /dev/kvm"). Reporting this as a slow-but-working mode sent
+                // users down a path that cannot work.
+                Status::Error
             },
             if kvm_check {
-                "/dev/kvm available (native Firecracker performance)"
+                "/dev/kvm available (Tier 2 microVMs will run)"
             } else {
-                "/dev/kvm not available (emulation mode - slower)"
+                "/dev/kvm MISSING - Firecracker cannot start at all (not emulation). \
+                 Recreate the VM with nested virtualization: nucleus setup --force"
             },
         );
 
         // Check Firecracker version in VM
         let fc_output = Command::new("limactl")
-            .args(["shell", "nucleus", "--", "firecracker", "--version"])
+            .args(["shell", &vm_name(), "--", "firecracker", "--version"])
             .output()
             .ok();
 
@@ -355,7 +372,7 @@ fn check_lima() -> bool {
 
         // Check Docker in VM (needed for rootfs building inside VM)
         let docker_check = Command::new("limactl")
-            .args(["shell", "nucleus", "--", "docker", "--version"])
+            .args(["shell", &vm_name(), "--", "docker", "--version"])
             .output()
             .ok();
 
