@@ -172,6 +172,24 @@ fn run() -> Result<(), String> {
 
     // Sandbox token is optional — Tier 3 fallback when SVID doesn't carry
     // an attestation OID. If absent, tool-proxy uses Tier 1 or Tier 2 proof.
+    // DLC-D verified-admission provisioning → the in-VM tool-proxy, over the
+    // workload API like the task token (the cmdline lacks the capacity for a
+    // credential set, and per-pod material must not bake into snapshot bases).
+    // Unprovisioned is the ordinary case and stays quiet; the proxy is inert
+    // without these.
+    if let Some(port) = workload_api_port {
+        match identity::fetch_dlc_admission(port) {
+            Ok(Some(m)) => {
+                std::env::set_var("NUCLEUS_DLC_TRUSTED_KEYS", &m.trusted_keys);
+                std::env::set_var("NUCLEUS_DLC_ISSUER", &m.issuer);
+                std::env::set_var("NUCLEUS_DLC_CREDENTIALS", &m.credentials);
+                eprintln!("fetched DLC admission provisioning over the workload API");
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("failed to fetch DLC admission provisioning: {err}"),
+        }
+    }
+
     if let Some(sandbox_token) = parse_cmdline_secret(&cmdline, "nucleus.sandbox_token")
         .or_else(|| read_secret("/etc/nucleus/sandbox.token"))
     {

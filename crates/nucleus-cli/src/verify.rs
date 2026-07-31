@@ -88,6 +88,46 @@ const ALLOWED_GLOB: &str = "*";
 /// which is a *different* control and would prove something else.
 const FORBIDDEN_READ: &str = ".ssh/id_rsa";
 
+/// Ephemeral DLC-D admission material for the pod under test: issuer + one
+/// credential per operation the OTHER checks exercise, and deliberately NONE
+/// for `web_fetch` — the operation [`check_admission_gate`] proves is refused
+/// by the verified-admission gate specifically.
+struct AdmissionMaterial {
+    issuer_hex: String,
+    credentials: String,
+}
+
+/// Mint the pod's admission material with a throwaway issuer key.
+///
+/// Key from `/dev/urandom` (this path is Linux-only, like the whole Tier 2
+/// harness); the key never outlives the run and its only power is over this
+/// one ephemeral pod. Credentials cover exactly the operations the existing
+/// checks exercise — `glob_search` (allowed-op check) and `read_files` (the
+/// forbidden-read check, WHICH MUST KEEP FAILING FOR THE LATTICE'S REASON:
+/// credentialing `read_files` means admission passes and the refusal that
+/// check asserts remains the path lattice's, not a missing credential's).
+fn mint_admission() -> Result<AdmissionMaterial> {
+    let mut seed = [0u8; 32];
+    {
+        use std::io::Read as _;
+        std::fs::File::open("/dev/urandom")
+            .context("no /dev/urandom on this host")?
+            .read_exact(&mut seed)
+            .context("could not read 32 bytes of randomness")?;
+    }
+    let mut issuer_hex = String::new();
+    let mut creds = Vec::new();
+    for op in ["glob_search", "read_files"] {
+        let (pk, sig) = portcullis::says_admission::mint_credential(&seed, op);
+        issuer_hex = hex::encode(pk);
+        creds.push(format!("{op}={}", hex::encode(&sig.bytes)));
+    }
+    Ok(AdmissionMaterial {
+        issuer_hex,
+        credentials: creds.join(","),
+    })
+}
+
 pub async fn execute(args: VerifyArgs) -> Result<()> {
     if args.pins {
         return print_pins();
@@ -202,10 +242,16 @@ fn verify_here() -> Result<()> {
     preflight(&host)?;
     start_node(&host)?;
 
+    // The pod runs UNDER verified admission: every check below therefore also
+    // exercises the DLC-D gate — the allowed-op check proves the credentialed
+    // path serves, the forbidden-read check proves lattice denials still win
+    // (its operation IS credentialed), and check_admission_gate proves an
+    // uncredentialed operation is refused by the admission gate specifically.
+    let admission = mint_admission()?;
     let started = Instant::now();
-    let pod = create_pod(&host)?;
+    let pod = create_pod(&host, &admission)?;
     println!(
-        "  [OK] pod created in {} ms, tool-proxy at {}",
+        "  [OK] pod created in {} ms, tool-proxy at {} (verified admission provisioned)",
         started.elapsed().as_millis(),
         pod.proxy
     );
@@ -213,12 +259,15 @@ fn verify_here() -> Result<()> {
     check_sandbox_proof(&pod)?;
     check_allowed_operation(&pod)?;
     check_forbidden_operation(&pod)?;
+    check_admission_gate(&pod)?;
     check_guest_facts(&host, &pod)?;
 
     println!();
     println!("Tier 2 works on this host. A real nucleus pod booted, proved its");
     println!("identity to its own tool-proxy, served an allowed operation from");
-    println!("inside the sandbox, and refused a forbidden one.");
+    println!("inside the sandbox under an issuer-signed admission credential,");
+    println!("refused a forbidden one, and refused an uncredentialed operation");
+    println!("at the verified-admission gate.");
     Ok(())
 }
 
@@ -325,11 +374,20 @@ struct CreatePodResponse {
 }
 
 /// Create a pod on the real nucleus rootfs, signed the way the node requires.
-fn create_pod(host: &Tier2Host) -> Result<Pod> {
+///
+/// The DLC-D labels provision verified admission for THIS pod only (the node
+/// forwards them to the pod's tool-proxy as `NUCLEUS_DLC_*`); the issuer key
+/// doubles as its own trust anchor, matching dlc-d's principal convention.
+fn create_pod(host: &Tier2Host, admission: &AdmissionMaterial) -> Result<Pod> {
     let secret = node_auth_secret(host)?;
+    let issuer = &admission.issuer_hex;
+    let creds = &admission.credentials;
     let body = format!(
         r#"{{"apiVersion":"nucleus/v1","kind":"Pod",
-            "metadata":{{"name":"nucleus-verify"}},
+            "metadata":{{"name":"nucleus-verify",
+              "labels":{{"dlc_trusted_keys":"{issuer}",
+                         "dlc_issuer":"{issuer}",
+                         "dlc_credentials":"{creds}"}}}},
             "spec":{{"work_dir":"/work","timeout_seconds":120,
               "policy":{{"type":"profile","name":"codegen"}},
               "image":{{"kernel_path":"{HOST_ARTIFACTS_DIR}/vmlinux",
@@ -501,6 +559,77 @@ fn check_allowed_operation(pod: &Pod) -> Result<()> {
 /// claim, since fixed — the denial now arrives as `kernel_denied` naming the
 /// delegation ceiling it exceeded. The check accepts both, because the point is
 /// that a *policy* refused, not which spelling it used.
+/// An operation with NO issuer credential is refused BY THE VERIFIED-ADMISSION
+/// GATE — the active leg of the DLC-D scenario.
+///
+/// The operation is `run_bash`: granted by the codegen profile, inside the
+/// pod's verified task scope, exercised by no other check, a DISTINCT
+/// primitive at the ActionTerm layer, and deliberately absent from
+/// [`mint_admission`]'s credential list. Each qualifier was earned by a live
+/// failure of this check refusing to accept a counterfeit denial:
+/// - `web_fetch` (out of task scope) was refused by `InScopeWithTask` before
+///   the request ever reached the kernel;
+/// - `grep_search` was ADMITTED by the glob credential — `from_operation`
+///   collapses Grep and Glob into one `GlobSearch` primitive, so at the
+///   kernel boundary they are the same operation identity and a glob
+///   credential legitimately covers grep — then refused downstream by an
+///   obligations check, i.e. the wrong reason again.
+///
+/// An in-scope, primitively-distinct, uncredentialed operation reaches the
+/// kernel, where the admission gate runs before the capability lattice — so
+/// the refusal must arrive as the gate's own reason (`DlcAdmissionDenied`);
+/// anything else means a different control refused and this check proves
+/// nothing about admission.
+fn check_admission_gate(pod: &Pod) -> Result<()> {
+    // First: was the gate ARMED at all? The proxy's health endpoint reports
+    // whether NUCLEUS_DLC_* provisioning reached it — without this, a refusal
+    // check cannot distinguish "gate refused" from "gate never armed" (and an
+    // unarmed gate would let the uncredentialed operation THROUGH, failing
+    // below with a misleading message about enforcement).
+    let mut health = plain_agent()
+        .get(format!("{}/v1/health", pod.proxy))
+        .call()
+        .map_err(|e| anyhow!("the tool-proxy did not answer /v1/health: {e}"))?;
+    let health_body: serde_json::Value = health
+        .body_mut()
+        .read_json()
+        .context("health response was not JSON")?;
+    let armed = health_body.get("dlc_admission").and_then(|v| v.as_str());
+    if armed != Some("provisioned") {
+        bail!(
+            "the pod's tool-proxy reports dlc_admission={armed:?}, expected \
+             \"provisioned\" — the PodSpec labels did not arrive as NUCLEUS_DLC_* \
+             env. The break is in the labels→node→spawn-env chain, not the gate."
+        );
+    }
+
+    let (status, body) = proxy_post(
+        pod,
+        "run",
+        // Never executes: the gate refuses before any discharge or spawn.
+        serde_json::json!({ "args": ["true"] }),
+    )?;
+    if status < 400 {
+        bail!(
+            "run WITHOUT a credential was ALLOWED ({status}): {}\n\
+             The pod is provisioned for verified admission, so an uncredentialed\n\
+             operation passing means the admission gate is not on the live path.",
+            body.trim()
+        );
+    }
+    if !body.contains("DlcAdmissionDenied") {
+        bail!(
+            "run was refused ({status}) but NOT by the admission gate: {}\n\
+             A refusal for another reason (lattice, scope, IFC) does not prove\n\
+             the verified-admission gate fired.",
+            body.trim()
+        );
+    }
+    println!("  [OK] uncredentialed operation refused by the verified-admission gate");
+    println!("       run without an issuer credential -> {status} (DlcAdmissionDenied)");
+    Ok(())
+}
+
 fn check_forbidden_operation(pod: &Pod) -> Result<()> {
     let (status, body) = proxy_post(pod, "read", serde_json::json!({ "path": FORBIDDEN_READ }))?;
     if status < 400 {
