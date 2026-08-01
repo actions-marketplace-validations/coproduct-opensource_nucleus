@@ -27,6 +27,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 mod art12;
+mod art12_sink;
 mod attestation;
 mod auth;
 mod broker_client;
@@ -106,6 +107,18 @@ struct Args {
     /// Optional audit log signing secret (defaults to auth secret if omitted).
     #[arg(long, env = "NUCLEUS_TOOL_PROXY_AUDIT_SECRET")]
     audit_secret: Option<String>,
+    /// Path for the EU AI Act Article 12 record-keeping log (JSONL, hash-chained).
+    ///
+    /// Absent means no Article 12 log is kept — the runtime does not pretend to
+    /// record-keeping it was not configured for. Present means EVERY kernel
+    /// decision is appended before the operation proceeds, and a write failure
+    /// latches the log degraded so the next operation is refused.
+    ///
+    /// MUST NOT be inside the agent's workspace: the log is the runtime's record
+    /// about the session, and #2145 is the same mistake made with the exit
+    /// report. Startup refuses rather than warns.
+    #[arg(long, env = "NUCLEUS_TOOL_PROXY_ART12_LOG")]
+    art12_log: Option<PathBuf>,
     /// Approval authority secret (separate from tool auth).
     #[arg(long, env = "NUCLEUS_TOOL_PROXY_APPROVAL_SECRET")]
     approval_secret: String,
@@ -345,6 +358,10 @@ pub(crate) struct AppState {
     /// This IS the monitor below — `build_monitored_sink` returns one object
     /// under two handles — so the field cannot hold an unmonitored sink.
     pub(crate) verdict_sink: Arc<dyn portcullis::verdict_sink::VerdictSink>,
+    /// The Article 12 record-keeping log, when configured. Held so the host can
+    /// see the chain head and whether recording is still happening — a log the
+    /// operator cannot observe is one that can stop without anyone noticing.
+    pub(crate) art12_log: Option<Arc<crate::art12::Art12Log>>,
     /// Read handle on the runtime monitor wrapping `verdict_sink`, so the
     /// process can report what the decision stream actually did — live at
     /// `/v1/health`, and at shutdown in the exit report.
@@ -1495,6 +1512,25 @@ async fn main() -> Result<(), ApiError> {
     // DLC-D verified admission: provisioned from NUCLEUS_DLC_* env (inert when
     // unset). The SAME provisioning is applied to both transports' kernels, and
     // the sink stamps every allowed verdict's span with the admission state.
+    // Article 12 record-keeping (opt-in). Opened BEFORE the sink chain, because
+    // the chain takes it by value and there must be no window in which decisions
+    // are made against a chain that is missing it.
+    let art12_log = match args.art12_log.as_ref() {
+        Some(path) => Some(
+            art12_sink::open_log(
+                path,
+                args.audit_secret.as_deref(),
+                &spec.spec.work_dir,
+                &session_id,
+            )
+            .map_err(ApiError::Spec)?,
+        ),
+        None => None,
+    };
+    if let Some(path) = args.art12_log.as_ref() {
+        info!(path = %path.display(), "Article 12 record-keeping log opened");
+    }
+
     let dlc_admission = dlc_admission::provision_from_env();
     let dlc_provisioned = dlc_admission.is_some();
 
@@ -1509,6 +1545,7 @@ async fn main() -> Result<(), ApiError> {
         policy_checksum.clone(),
         session_id.clone(),
         dlc_provisioned,
+        art12_log.clone(),
     );
 
     if dlc_provisioned {
@@ -1602,6 +1639,7 @@ async fn main() -> Result<(), ApiError> {
         policy_checksum,
         session_id,
         verdict_sink,
+        art12_log,
         trace_monitor,
         kernel,
         flow_tracker,
@@ -2355,7 +2393,8 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "trace_monitor": {
             "violations": state.trace_monitor.violations().len(),
             "violations_dropped": state.trace_monitor.violations_dropped(),
-        }
+        },
+        "art12": art12_sink::health_json(state.art12_log.as_ref())
     }))
 }
 
