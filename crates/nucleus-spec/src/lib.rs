@@ -77,6 +77,9 @@ pub struct PodSpecInner {
     /// Optional VM image hints (Firecracker).
     #[serde(default)]
     pub image: Option<ImageSpec>,
+    /// Upstreams the pod may reach with a credential it never sees.
+    #[serde(default)]
+    pub credentialed_egress: Vec<CredentialedEgressSpec>,
     /// Optional workload to run inside the pod under mediation.
     ///
     /// Absent means the pod serves its API and runs nothing of its own, which is
@@ -700,6 +703,42 @@ pub struct ExitReport {
     pub art12_dropped: u64,
 }
 
+/// An upstream the workload may call without holding the credential.
+///
+/// # The problem this solves
+///
+/// A workload given an API token in its environment can exfiltrate it, and its
+/// calls to that API bypass every gate the runtime applies to tool calls — the
+/// data it has read leaves in a request body nothing inspected. Both follow from
+/// the same choice: putting the credential in the guest.
+///
+/// The runtime holds it instead and forwards on the workload's behalf. The
+/// workload is told a LOCAL address; the upstream and the header are fixed here,
+/// so it can neither redirect the request nor read what authenticates it.
+///
+/// # Per-pod, and it must stay that way
+///
+/// This concentrates a credential in the proxy, and credential-concentrating AI
+/// gateways are a demonstrated supply-chain target (the LiteLLM compromise of
+/// March 2026 shipped releases that harvested exactly the keys such services
+/// hold). The mitigation is structural: this proxy is per-pod and holds one
+/// pod's credentials, not a fleet's. Do not turn it into a shared gateway.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialedEgressSpec {
+    /// Name the workload refers to this upstream by.
+    pub name: String,
+    /// Absolute upstream base URL. Fixed here; a request cannot change it.
+    pub upstream: String,
+    /// Environment variable, in the RUNTIME's environment, holding the
+    /// credential. Never placed in the workload's environment.
+    pub credential_env: String,
+    /// Header the credential is injected as (e.g. `authorization`).
+    pub header: String,
+    /// Optional prefix for the header value (e.g. `Bearer `).
+    #[serde(default)]
+    pub value_prefix: String,
+}
+
 /// A process the pod runs under its own mediation.
 ///
 /// # Why the runtime starts it, rather than the image
@@ -732,6 +771,23 @@ pub struct WorkloadSpec {
     /// key — see `workload_env`.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// UID to run the workload as.
+    ///
+    /// # Why this matters more than it looks
+    ///
+    /// The runtime and the workload share a guest. On Linux a process can read
+    /// `/proc/<pid>/environ` of any process with the SAME uid, so a workload
+    /// running as the runtime's user can simply read the runtime's environment —
+    /// including a credential that `credentialed_egress` exists to keep out of
+    /// its hands. "Not in the workload's environment" is not the same as "the
+    /// workload cannot get it", and only a uid boundary makes the second true.
+    ///
+    /// `None` means the workload runs as the runtime's user, which is fine when
+    /// no credential is being withheld from it. When `credentialed_egress` is
+    /// configured, a distinct uid is REQUIRED and the pod refuses to start
+    /// without one.
+    #[serde(default)]
+    pub uid: Option<u32>,
 }
 
 /// Errors resolving policies.
