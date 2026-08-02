@@ -55,6 +55,7 @@ mod unicode_audit;
 mod validation;
 mod verdict_sink;
 mod web_fetch_policy;
+mod workload;
 
 use attestation::{AttestationConfig, AttestationVerifier};
 use auth::{AuthConfig, AuthError};
@@ -1809,6 +1810,9 @@ async fn main() -> Result<(), ApiError> {
     if let Some(path) = args.announce_path.as_ref() {
         tokio::fs::write(path, addr.to_string()).await?;
     }
+
+    // Started here and not earlier; `workload::start_if_configured` explains why.
+    let _workload = workload::start_if_configured(&spec, addr, &args.auth_secret)?;
 
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
