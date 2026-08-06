@@ -180,6 +180,14 @@ impl Verdict {
     }
 }
 
+/// The declassification authority surface — extracted from this file under the
+/// line ratchet; a CHILD module so it can reach the kernel's private fields.
+///
+/// Gated on `crypto` because everything in it is: without the feature the
+/// module's imports would be unused, which is an error under this crate's
+/// warning policy (caught by `cargo hack --each-feature`).
+#[cfg(feature = "crypto")]
+mod declassify_authority;
 /// Reason an operation was denied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -292,6 +300,17 @@ pub enum DenyReason {
     InvalidDeclassification {
         /// Human-readable detail about why the declassification was rejected.
         detail: String,
+    },
+    /// A declassification token was REPLAYED.
+    ///
+    /// The token's Ed25519 signature was already applied once in this kernel
+    /// session. Tokens are one-shot: exercising the authority consumes it, and
+    /// a caller who legitimately needs to declassify twice mints a second
+    /// token. Replay is not "invalid" — the signature verifies — it is REUSE,
+    /// which deserves its own auditable verdict.
+    DeclassificationReplayed {
+        /// The node the replayed token targets.
+        target_node: String,
     },
     /// Operation denied by certificate sink scope restrictions.
     ///
@@ -515,6 +534,16 @@ pub struct Kernel {
     /// trusted keys are configured.
     #[cfg(feature = "crypto")]
     trusted_public_keys: Vec<[u8; 32]>,
+    /// Signatures of declassification tokens already APPLIED in this session.
+    ///
+    /// Ed25519 is deterministic (RFC 8032), so a token's signature identifies
+    /// exactly one authorization — recording it makes tokens one-shot with
+    /// zero wire-format change. Only successful applications are recorded: a
+    /// token that failed (expired, precondition unmet, node not found) did not
+    /// exercise its authority and is not burnt. `BTreeSet`, not `HashSet`, for
+    /// the deterministic ordering the audit style of this crate relies on.
+    #[cfg(feature = "crypto")]
+    applied_declassifications: std::collections::BTreeSet<[u8; 64]>,
     /// Optional delegation constraints for this session.
     ///
     /// When present, `SpawnAgent` operations are checked against scope,
@@ -608,6 +637,8 @@ impl Kernel {
             #[cfg(feature = "crypto")]
             trusted_public_keys: Vec::new(),
             #[cfg(feature = "crypto")]
+            applied_declassifications: std::collections::BTreeSet::new(),
+            #[cfg(feature = "crypto")]
             signing_key: None,
             receipt_chain: None,
         }
@@ -660,6 +691,8 @@ impl Kernel {
             sink_scope: None,
             #[cfg(feature = "crypto")]
             trusted_public_keys: Vec::new(),
+            #[cfg(feature = "crypto")]
+            applied_declassifications: std::collections::BTreeSet::new(),
             #[cfg(feature = "crypto")]
             signing_key: None,
             receipt_chain: None,
@@ -736,76 +769,6 @@ impl Kernel {
             return;
         }
         self.declassification_rules.push(rule);
-    }
-
-    /// Set trusted Ed25519 public keys for declassification token verification.
-    ///
-    /// When set, [`apply_declassification_token`](Self::apply_declassification_token)
-    /// verifies token signatures against these keys before applying label
-    /// changes. Supports key rotation by accepting multiple keys.
-    ///
-    /// When no trusted keys are set (the default), unsigned declassification
-    /// rules are applied without verification for backward compatibility.
-    #[cfg(feature = "crypto")]
-    pub fn set_trusted_keys(&mut self, keys: Vec<[u8; 32]>) {
-        self.trusted_public_keys = keys;
-    }
-
-    /// Apply a cryptographically signed declassification token to a flow graph node.
-    ///
-    /// This is the secure path for declassification. The token must carry a
-    /// valid Ed25519 signature from one of the kernel's trusted public keys
-    /// (set via [`set_trusted_keys`](Self::set_trusted_keys)).
-    ///
-    /// If trusted keys are configured, the token's signature is verified
-    /// before applying. If no trusted keys are configured, the token is
-    /// applied without verification (backward compatibility) with a warning.
-    ///
-    /// Returns `Err(DenyReason::InvalidDeclassification)` if trusted keys
-    /// are set and signature verification fails.
-    ///
-    /// Returns `Ok(TokenApplyResult)` on success (or if the token was
-    /// expired / precondition unmet — those are non-error rejections).
-    #[cfg(feature = "crypto")]
-    pub fn apply_declassification_token(
-        &mut self,
-        token: &portcullis_core::declassify::DeclassificationToken,
-    ) -> Result<portcullis_core::declassify::TokenApplyResult, DenyReason> {
-        let graph = &mut self.flow_graph;
-
-        let now = chrono::Utc::now().timestamp() as u64;
-
-        // Fail-closed (most-paranoid #3): declassification weakens information-flow
-        // labels, so it MUST be cryptographically authorized. With no trusted keys
-        // configured there is no authority to verify against, so refuse outright
-        // rather than applying the token unsigned.
-        if self.trusted_public_keys.is_empty() {
-            tracing::warn!(
-                target_node = token.target_node_id,
-                "declassification refused: no trusted public keys configured (fail-closed)"
-            );
-            return Err(DenyReason::InvalidDeclassification {
-                detail: "no trusted public keys configured — declassification refused \
-                         (fail-closed); configure trusted keys and sign the token"
-                    .to_string(),
-            });
-        }
-        let key_refs: Vec<&[u8]> = self
-            .trusted_public_keys
-            .iter()
-            .map(|k| k.as_slice())
-            .collect();
-        let result = graph.apply_token_verified(token, &key_refs, now);
-        if matches!(
-            result,
-            portcullis_core::declassify::TokenApplyResult::InvalidSignature
-        ) {
-            return Err(DenyReason::InvalidDeclassification {
-                detail: "token signature verification failed — not signed by any trusted key"
-                    .to_string(),
-            });
-        }
-        Ok(result)
     }
 
     /// Set the Ed25519 signing key for receipt signing.
@@ -1052,6 +1015,8 @@ impl Kernel {
             #[cfg(feature = "crypto")]
             trusted_public_keys: Vec::new(),
             #[cfg(feature = "crypto")]
+            applied_declassifications: std::collections::BTreeSet::new(),
+            #[cfg(feature = "crypto")]
             signing_key: None,
             receipt_chain: None,
         }
@@ -1110,6 +1075,8 @@ impl Kernel {
             sink_scope,
             #[cfg(feature = "crypto")]
             trusted_public_keys: Vec::new(),
+            #[cfg(feature = "crypto")]
+            applied_declassifications: std::collections::BTreeSet::new(),
             #[cfg(feature = "crypto")]
             signing_key: None,
             receipt_chain: None,
