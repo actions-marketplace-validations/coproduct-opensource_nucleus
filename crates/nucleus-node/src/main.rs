@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body, Bytes};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::{get, post};
@@ -34,6 +34,9 @@ mod firecracker_config;
 mod grpc_tls;
 mod identity;
 mod oidc;
+mod pod_api;
+mod pod_caller_identity;
+
 mod workload_api_protocol;
 mod workload_api_vsock;
 use auth::{AuthConfig, AuthError};
@@ -345,6 +348,12 @@ struct NodeState {
     #[cfg(feature = "local-driver")]
     listen_addr: String,
     proxy_auth_secret: String,
+    /// Node-only secret for deriving per-pod caller-identity tokens.
+    ///
+    /// Fresh per process, never persisted, never shared with a pod — which is
+    /// the whole point: a pod able to derive tokens could claim to be any other
+    /// pod. See `pod_caller_identity`.
+    caller_secret: std::sync::Arc<[u8; 32]>,
     proxy_approval_secret: String,
     proxy_actor: Option<String>,
     /// Operator-configured registry of proof-carrying postures a trusted builder
@@ -697,6 +706,19 @@ async fn main() -> Result<(), ApiError> {
         #[cfg(feature = "local-driver")]
         listen_addr: args.listen.clone(),
         proxy_auth_secret: args.proxy_auth_secret.clone(),
+        // A NODE-ONLY secret, fresh per process and never persisted or shared.
+        //
+        // Not `auth_secret`: every proxy holds that one, so deriving caller
+        // tokens from it would let any pod compute any other pod's token — the
+        // mechanism would authenticate nothing. Not configured, either: there is
+        // no operator burden and nothing to leak at rest, and a node restart
+        // simply invalidates tokens for pods that cannot outlive the node.
+        caller_secret: {
+            use rand_core::RngCore;
+            let mut k = [0u8; 32];
+            rand_core::OsRng.fill_bytes(&mut k);
+            std::sync::Arc::new(k)
+        },
         proxy_approval_secret: args.proxy_approval_secret.clone(),
         proxy_actor: Some(args.proxy_actor.clone()).filter(|actor| !actor.trim().is_empty()),
         trusted_postures: posture::PostureRegistry::from_operator_str(&args.trusted_postures),
@@ -722,9 +744,9 @@ async fn main() -> Result<(), ApiError> {
 
     // Routes that require HMAC auth
     let authenticated_routes = Router::new()
-        .route("/v1/pods", post(create_pod).get(list_pods))
-        .route("/v1/pods/{id}/logs", get(pod_logs))
-        .route("/v1/pods/{id}/cancel", post(cancel_pod))
+        .route("/v1/pods", post(create_pod).get(pod_api::list_pods))
+        .route("/v1/pods/{id}/logs", get(pod_api::pod_logs))
+        .route("/v1/pods/{id}/cancel", post(pod_api::cancel_pod))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1023,8 +1045,16 @@ async fn auth_middleware(
         .await
         .map_err(|e| ApiError::Body(e.to_string()))?;
     let context = auth::verify_http(&parts.headers, &bytes, &state.auth)?;
+
+    // WHICH POD is calling, when the caller can prove it. See
+    // `pod_caller_identity::identify_from_headers` for why this cannot change a
+    // verdict.
+    let caller =
+        pod_caller_identity::identify_from_headers(state.caller_secret.as_ref(), &parts.headers);
+
     let mut req = axum::http::Request::from_parts(parts, Body::from(bytes));
     req.extensions_mut().insert(context);
+    req.extensions_mut().insert(caller.ok());
     Ok(next.run(req).await)
 }
 
@@ -1092,50 +1122,6 @@ async fn create_pod_internal(
     state.pods.lock().await.insert(id, handle);
 
     Ok((id, proxy_addr))
-}
-
-async fn list_pods(State(state): State<NodeState>) -> Result<Json<Vec<PodInfo>>, ApiError> {
-    let infos = collect_pod_infos(&state).await;
-    Ok(Json(infos))
-}
-
-async fn collect_pod_infos(state: &NodeState) -> Vec<PodInfo> {
-    let pods: Vec<Arc<PodHandle>> = {
-        let guard = state.pods.lock().await;
-        guard.values().cloned().collect()
-    };
-
-    let mut infos = Vec::with_capacity(pods.len());
-    for pod in pods {
-        infos.push(pod.info().await);
-    }
-
-    infos
-}
-
-async fn pod_logs(
-    State(state): State<NodeState>,
-    AxumPath(id): AxumPath<Uuid>,
-) -> Result<String, ApiError> {
-    let pod = get_pod(&state, id).await?;
-    let logs = tokio::fs::read_to_string(&pod.log_path)
-        .await
-        .unwrap_or_default();
-    Ok(logs)
-}
-
-async fn cancel_pod(
-    State(state): State<NodeState>,
-    AxumPath(id): AxumPath<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let pod = get_pod(&state, id).await?;
-    pod.cancel().await?;
-    Ok(Json(serde_json::json!({"status": "cancelled"})))
-}
-
-async fn get_pod(state: &NodeState, id: Uuid) -> Result<Arc<PodHandle>, ApiError> {
-    let guard = state.pods.lock().await;
-    guard.get(&id).cloned().ok_or(ApiError::NotFound)
 }
 
 impl PodHandle {
@@ -2720,6 +2706,15 @@ async fn spawn_firecracker_pod(
                     // Serving it here is what lets the cmdline copy go: a value
                     // fetched after boot is not baked into a snapshot base.
                     task_token: task_token.clone(),
+                    // This pod's caller identity for the management API, derived
+                    // from a NODE-ONLY secret. Deliberately not `auth_secret`:
+                    // every proxy already holds that one, so deriving from it
+                    // would let any pod compute any other pod's token and the
+                    // mechanism would prove nothing.
+                    caller_token: Some(pod_caller_identity::derive_token(
+                        state.caller_secret.as_ref(),
+                        id,
+                    )),
                     // Pod-scoped DLC-D admission provisioning (PodSpec labels).
                     // Partial labels still provision — the proxy's parser fails
                     // CLOSED, so misconfiguration narrows rather than widens.
@@ -3396,7 +3391,7 @@ impl NodeService for GrpcService {
             auth::Operation::ListPods,
         )?;
 
-        let infos = collect_pod_infos(&self.state).await;
+        let infos = pod_api::collect_pod_infos(&self.state).await;
         let pods = infos.into_iter().map(pod_info_to_grpc).collect();
         Ok(GrpcResponse::new(proto::ListPodsResponse { pods }))
     }
@@ -3414,7 +3409,7 @@ impl NodeService for GrpcService {
 
         let id = Uuid::parse_str(&request.into_inner().id)
             .map_err(|_| Status::invalid_argument("invalid pod id"))?;
-        let pod = get_pod(&self.state, id)
+        let pod = pod_api::get_pod(&self.state, id)
             .await
             .map_err(|_| Status::not_found("pod not found"))?;
         let logs = tokio::fs::read_to_string(&pod.log_path)
@@ -3436,7 +3431,7 @@ impl NodeService for GrpcService {
 
         let id = Uuid::parse_str(&request.into_inner().id)
             .map_err(|_| Status::invalid_argument("invalid pod id"))?;
-        let pod = get_pod(&self.state, id)
+        let pod = pod_api::get_pod(&self.state, id)
             .await
             .map_err(|_| Status::not_found("pod not found"))?;
         pod.cancel()
@@ -3460,7 +3455,7 @@ impl NodeService for GrpcService {
 
         let id = Uuid::parse_str(&request.into_inner().pod_id)
             .map_err(|_| Status::invalid_argument("invalid pod id"))?;
-        let handle = get_pod(&self.state, id)
+        let handle = pod_api::get_pod(&self.state, id)
             .await
             .map_err(|_| Status::not_found("pod not found"))?;
         let info = handle.info().await;
@@ -3485,7 +3480,7 @@ impl NodeService for GrpcService {
         let req = request.into_inner();
         let id =
             Uuid::parse_str(&req.pod_id).map_err(|_| Status::invalid_argument("invalid pod id"))?;
-        let pod = get_pod(&self.state, id)
+        let pod = pod_api::get_pod(&self.state, id)
             .await
             .map_err(|_| Status::not_found("pod not found"))?;
 
@@ -3521,7 +3516,7 @@ impl NodeService for GrpcService {
         let req = request.into_inner();
         let id =
             Uuid::parse_str(&req.pod_id).map_err(|_| Status::invalid_argument("invalid pod id"))?;
-        let pod = get_pod(&self.state, id)
+        let pod = pod_api::get_pod(&self.state, id)
             .await
             .map_err(|_| Status::not_found("pod not found"))?;
 
@@ -3553,7 +3548,7 @@ impl NodeService for GrpcService {
         let pod_id_str = request.into_inner().pod_id;
         let id =
             Uuid::parse_str(&pod_id_str).map_err(|_| Status::invalid_argument("invalid pod id"))?;
-        let handle = get_pod(&self.state, id)
+        let handle = pod_api::get_pod(&self.state, id)
             .await
             .map_err(|_| Status::not_found("pod not found"))?;
 
