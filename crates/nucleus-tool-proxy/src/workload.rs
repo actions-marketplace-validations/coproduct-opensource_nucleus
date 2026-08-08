@@ -119,6 +119,13 @@ fn env_source(key: &str, spec: &WorkloadSpec) -> EnvSource {
 /// none of the three can carry authority.
 pub(crate) const INHERITED_BY_NAME: [&str; 4] = ["PATH", "HOME", "LANG", "TZ"];
 
+/// The uid a workload runs as when its spec sets none. Deliberately a high,
+/// unprivileged, non-root value: the guest runtime is root and holds every
+/// per-pod secret in its environment, so the workload MUST run as a distinct
+/// uid or it could read that environment via `/proc/<pid>/environ`. A pod may
+/// override with `workload.uid`, but never to the runtime's own uid.
+pub(crate) const DEFAULT_WORKLOAD_UID: u32 = 65534;
+
 #[must_use]
 pub(crate) fn workload_env(
     spec: &WorkloadSpec,
@@ -198,10 +205,6 @@ pub(crate) struct WorkloadLaunch {
     uid: Option<u32>,
     env: BTreeMap<String, String>,
     classified: Vec<ClassifiedEntry>,
-    /// Whether credentialed egress is configured — folded in here so the uid
-    /// coupling that used to live 300 lines away is a field of the thing being
-    /// admitted, not an adjacent call a caller can forget.
-    has_credentialed_egress: bool,
 }
 
 impl WorkloadLaunch {
@@ -246,7 +249,6 @@ impl WorkloadLaunch {
             uid: spec.uid,
             env,
             classified,
-            has_credentialed_egress: !egress.is_empty(),
         }
     }
 
@@ -259,25 +261,55 @@ impl WorkloadLaunch {
     /// reaching this point is refused here rather than trusted to have been kept
     /// out upstream.
     pub(crate) fn admit(self) -> Result<AdmittedWorkloadPlan, Refused> {
-        // The uid coupling, folded in from `reject_credential_readable_workload`.
-        if self.has_credentialed_egress {
-            match self.uid {
-                Some(uid) if uid != nix_getuid() => {}
-                Some(uid) => {
-                    return Err(Refused(format!(
-                        "the workload's uid ({uid}) is the runtime's own, so it can read the \
-                         runtime's environment via /proc and obtain the credentialed-egress \
-                         secret. Give the workload a distinct unprivileged uid."
-                    )));
-                }
-                None => {
-                    return Err(Refused(
-                        "credentialed egress is configured but the workload has no `uid`, so it \
-                         runs as the runtime's user and can read the credential from \
-                         /proc/<pid>/environ. Set `workload.uid` to a distinct unprivileged uid."
-                            .to_string(),
-                    ));
-                }
+        // The workload must never run as the runtime's uid. The runtime holds
+        // every per-pod secret in its own environment, and Linux lets a process
+        // read `/proc/<pid>/environ` of any process sharing its uid — so a
+        // same-uid workload reads the broker/task/approval/DLC secrets straight
+        // out of the runtime. A distinct unprivileged uid is the boundary, and
+        // it must hold for EVERY pod, not only when credentialed egress is
+        // configured: the runtime holds those secrets regardless of egress (this
+        // supersedes the egress-only coupling in
+        // `reject_credential_readable_workload`, kept as a node-side pre-check).
+        //
+        // A pod that sets no `workload.uid` gets a distinct default unprivileged
+        // uid rather than silently running as the runtime's user; an explicit
+        // uid equal to the runtime's own is refused — it re-opens the hole.
+        let effective_uid = self.uid.unwrap_or(DEFAULT_WORKLOAD_UID);
+        if effective_uid == nix_getuid() {
+            return Err(Refused(format!(
+                "the workload's uid ({effective_uid}) is the runtime's own, so it could read the \
+                 runtime's environment — every per-pod secret — via /proc/<pid>/environ. Set \
+                 `workload.uid` to a distinct unprivileged uid."
+            )));
+        }
+
+        // Reserved-namespace fail-safe — closes the `_ => OrdinaryData`
+        // fallthrough in `env_classifier`. A `NUCLEUS_*` key the classifier does
+        // not recognise falls through to `OrdinaryData` (Public), which the
+        // relation below happily delivers. So a future secret added to the
+        // workload overlay WITHOUT a classifier arm would reach the workload
+        // silently — and the dual-classifier corpus test cannot catch it,
+        // because both classifiers share that same `OrdinaryData` default (a
+        // differential check is blind to a shortcut both sides take). Refuse any
+        // unrecognised reserved-namespace key here instead. The only public
+        // value the runtime injects under this prefix is allowlisted; every
+        // other `NUCLEUS_*` name must be classified deliberately (as a secret
+        // material kind if it carries identity, or added to this allowlist if it
+        // is genuinely public runtime config) before it may cross.
+        const PUBLIC_RESERVED: &[&str] = &["NUCLEUS_TOOL_PROXY_URL"];
+        for entry in &self.classified {
+            if entry.key.starts_with("NUCLEUS_")
+                && entry.material == MaterialKind::OrdinaryData
+                && !PUBLIC_RESERVED.contains(&entry.key.as_str())
+            {
+                return Err(Refused(format!(
+                    "environment variable `{}` is in the reserved `NUCLEUS_` namespace but the \
+                     classifier does not recognise it, so it falls through to OrdinaryData \
+                     (public) and would be delivered to the workload. Classify it in \
+                     `env_classifier.rs` (a secret material kind if it carries identity, or add \
+                     it to PUBLIC_RESERVED if it is genuinely public runtime config).",
+                    entry.key
+                )));
             }
         }
 
@@ -300,7 +332,7 @@ impl WorkloadLaunch {
             command: self.command,
             args: self.args,
             work_dir: self.work_dir,
-            uid: self.uid,
+            uid: Some(effective_uid),
             env: self.env,
             classified: self.classified,
         })
@@ -353,8 +385,32 @@ pub(crate) fn spawn_admitted(
     // guest) after its uid dropped. The run-5 boot proved the ordering the hard
     // way: a hook that tried setgroups itself ran as the ALREADY-dropped uid
     // and got EPERM.
-    let hardened = plan.uid.is_some();
-    if let Some(uid) = plan.uid {
+    // The privilege drop and the scratch-dir chown are only possible as root,
+    // which the guest runtime is. Under a non-root test harness neither syscall
+    // would succeed, so both are skipped there; the admit-time uid logic (which
+    // guarantees `plan.uid` is a distinct unprivileged uid, never the runtime's)
+    // is unit-tested directly. In the guest the workload therefore always runs
+    // as that distinct uid and cannot read the runtime's secret-bearing environ
+    // via `/proc/<pid>/environ`.
+    let drop_uid = if nix_getuid() == 0 { plan.uid } else { None };
+    let hardened = drop_uid.is_some();
+    if let Some(uid) = drop_uid {
+        // Best-effort: hand the workload ownership of its work dir so the
+        // unprivileged child can write its scratch. This is an ERGONOMIC aid,
+        // not the security control — the uid drop below is. It legitimately
+        // fails when the work dir is read-only (a pod with no writable scratch
+        // drive, where `/work` is on the read-only rootfs), and in that case the
+        // workload cannot write it regardless, so the failure is not fatal: log
+        // it and proceed. The privilege drop still happens unconditionally.
+        if let Err(e) = std::os::unix::fs::chown(&plan.work_dir, Some(uid), Some(uid)) {
+            tracing::warn!(
+                work_dir = %plan.work_dir.display(),
+                uid,
+                error = %e,
+                "could not chown the workload work dir to its uid; the workload will run \
+                 without ownership of it (expected when the scratch is read-only)"
+            );
+        }
         cmd.uid(uid);
         cmd.gid(uid);
     }
@@ -365,7 +421,7 @@ pub(crate) fn spawn_admitted(
     // the runc CVE-2024-21626 lesson. When a uid is set it additionally applies
     // no_new_privs and rlimits — the self-restrictions an unprivileged process
     // may still make. Runs AFTER std's stdio dup2 and privilege drop.
-    harden::apply(&mut cmd, plan.uid);
+    harden::apply(&mut cmd, drop_uid);
 
     tracing::info!(
         command = %plan.command,
@@ -826,6 +882,103 @@ mod tests {
                 .map(String::as_str),
             Some("s3cret")
         );
+    }
+
+    /// **The reserved-namespace fail-safe.** An unrecognised `NUCLEUS_*`
+    /// variable falls through the classifier to `OrdinaryData` (public) and
+    /// would be delivered to the workload — the exact hole a future secret would
+    /// slip through, and one the dual-classifier corpus test cannot catch
+    /// because both classifiers share that `OrdinaryData` default. `admit` must
+    /// refuse it at the boundary, where the fence actually bites.
+    #[test]
+    fn an_unclassified_reserved_namespace_key_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = "http://127.0.0.1:8080";
+
+        // A novel NUCLEUS_* name the classifier does not recognise.
+        let refused = WorkloadLaunch::build(
+            &spec_with(&[("NUCLEUS_FUTURE_SECRET", "sensitive")]),
+            url,
+            "s3cret",
+            dir.path(),
+            &[],
+        )
+        .admit();
+        assert!(
+            refused.is_err(),
+            "an unclassified NUCLEUS_* key must be refused, not delivered as OrdinaryData"
+        );
+
+        // Control 1: the one public reserved name the runtime injects
+        // (NUCLEUS_TOOL_PROXY_URL) is allowlisted and must still admit.
+        assert!(
+            WorkloadLaunch::build(&spec_with(&[]), url, "s3cret", dir.path(), &[])
+                .admit()
+                .is_ok(),
+            "NUCLEUS_TOOL_PROXY_URL is public runtime config and must still admit"
+        );
+
+        // Control 2: an ordinary (non-reserved) operator var is unaffected.
+        assert!(
+            WorkloadLaunch::build(
+                &spec_with(&[("MY_APP_SETTING", "value")]),
+                url,
+                "s3cret",
+                dir.path(),
+                &[],
+            )
+            .admit()
+            .is_ok(),
+            "a non-NUCLEUS_ operator var must be unaffected by the reserved-namespace fence"
+        );
+    }
+
+    /// **The workload never runs as the runtime's uid — for EVERY pod, not only
+    /// under credentialed egress.** The runtime holds every per-pod secret in
+    /// its environment, and Linux lets a same-uid process read it via
+    /// `/proc/<pid>/environ`. A pod that sets no `workload.uid` is assigned a
+    /// distinct default uid rather than silently inheriting the runtime's — the
+    /// case that used to be exposed whenever no credentialed egress was set.
+    #[test]
+    fn admit_assigns_a_distinct_default_uid_when_none_is_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = WorkloadLaunch::build(&spec_with(&[]), "u", "s3cret", dir.path(), &[])
+            .admit()
+            .expect("a clean spec admits");
+        assert_eq!(plan.uid, Some(DEFAULT_WORKLOAD_UID));
+        assert_ne!(
+            plan.uid,
+            Some(nix_getuid()),
+            "the default workload uid must never equal the runtime's own"
+        );
+    }
+
+    /// An explicit uid equal to the runtime's own re-opens the /proc/environ
+    /// hole and must be refused — the default cannot be overridden back to root.
+    #[test]
+    fn admit_refuses_a_workload_sharing_the_runtime_uid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut spec = spec_with(&[]);
+        spec.uid = Some(nix_getuid());
+        assert!(
+            WorkloadLaunch::build(&spec, "u", "s3cret", dir.path(), &[])
+                .admit()
+                .is_err(),
+            "a workload sharing the runtime uid must be refused"
+        );
+    }
+
+    /// A distinct explicit uid is preserved, not overwritten by the default.
+    #[test]
+    fn admit_preserves_an_explicit_distinct_uid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut spec = spec_with(&[]);
+        let distinct = nix_getuid().wrapping_add(4242);
+        spec.uid = Some(distinct);
+        let plan = WorkloadLaunch::build(&spec, "u", "s3cret", dir.path(), &[])
+            .admit()
+            .expect("a distinct uid admits");
+        assert_eq!(plan.uid, Some(distinct));
     }
 
     /// **The capability does not reach a real child.** This is the property; the
