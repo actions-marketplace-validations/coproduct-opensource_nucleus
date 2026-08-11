@@ -86,7 +86,7 @@ status is a visible event, not an edit.
 | C5 | "cannot steer which value that is" | PROVED | `crates/portcullis-core/lean/DeclassifySinkScopeExtracted.lean#four_run_value_robustness`, `crates/portcullis/src/flow_graph.rs#value_binding_ok`, `crates/portcullis/tests/declassify_scope.rs#four_run_released_value_is_not_attacker_steerable` | `scripts/check-declassify-value-bound.sh` |
 | C6 | "every mediated channel" | TESTED | `crates/nucleus-ifc-kernel/src/egress_channel.rs#no_channel_is_an_open_hole`, `crates/portcullis-core/lean/MediationScopeExtracted.lean#no_sink_reachable_without_discharge`, `crates/nucleus-ifc-kernel/src/egress_channel.rs#documented_inventory_equals_the_enum`, `scripts/check-egress-probe.sh`, `docs/architecture/mediated-set.md` | `scripts/check-egress-probe.sh` |
 | C7 | "a theorem about the code that ships" | TESTED | `.github/workflows/aeneas-ifc-scoped.yml`, `crates/nucleus-ifc-kernel/src/extracted/identity.rs` | `.github/workflows/aeneas-ifc-scoped.yml` |
-| C8 | "re-checked on every change" | NOT-YET | `.github/workflows/aeneas-ifc-scoped.yml` | — |
+| C8 | "re-checked on every change" | TESTED | `.github/workflows/aeneas-ifc-scoped.yml`, `scripts/check-extracted-callsites.sh`, `scripts/extracted-callsites-manifest.txt` | `scripts/check-extracted-callsites.sh` |
 | C9 | "verify from the outside" | NOT-YET | `crates/nucleus-identity/src/attestation.rs`, `crates/nucleus-node/src/posture.rs#admit_posture` | — |
 *The clause fragments quote the sentence above, whose exclusions travel with
 them: the claim covers explicit flows only, excluding timing, cache, and other
@@ -287,9 +287,33 @@ What each status means, and what it deliberately does not:
   kernel, classifier, and spawn path are still covered by tests and lints, not by
   the theorem; and even the declassify slice's byte-level runtime comparison
   transfers to the proof by *tested* parity, not by proof. C7 stays TESTED.
-- **C8 (NOT-YET)** — the proof workflow is path-filtered; a change to the
-  trusted classifier or the spawn path does not re-run it, and nothing checks
-  that the call sites of the extracted predicates still exist.
+- **C8 (TESTED — promoted from NOT-YET 2026-08-11).** Two gaps closed. (a) The
+  proof workflow's trigger was an *allowlist* of the extracted Lean files that
+  missed the production types the parity tests bind against (`IFCLabel`,
+  `SinkClass`, `ConfLevel` in `ifc_ops.rs`/`lib.rs`); it now triggers on the
+  whole `crates/nucleus-ifc-kernel/**` domain (derived, not enumerated), so a
+  change to the enforcement the theorems mirror re-extracts + re-parity-tests +
+  re-proves. (b) Nothing checked that the extracted predicates are still *wired*
+  into the live path — a theorem about a function nobody calls is a proof about
+  dead code. `scripts/check-extracted-callsites.sh` (required, runs every PR via
+  `ci.yml`) now asserts each manifest-covered predicate has a live production
+  call site (production region, test blocks excluded); it reds if the call site
+  is deleted. Every extracted family is accounted for (a call-site audit confirmed
+  none is proven-but-silently-unwired): the **wired** ones carry a live anchor —
+  identity delivery (`ident_may_deliver`, a direct call to the extracted
+  predicate), mediation (`classify_sink` for `sinkcode`, and `authorizes` — the
+  effect-gate `require_scope` — for `scope_admits`), declassify
+  (`authorize_release`), egress (`egress_chain`), and the capability lattice
+  (`CapabilityLevel`'s ordering, used live in the trifecta classifier for
+  `capleq`); the genuinely **structural** ones carry their construction anchor —
+  `channel_admits` (C1's no-secret-channel / distinct-uid fence) and
+  `cred_may_deliver` (the broker builds its store from the node env, never the
+  guest spec, so a Secret credential never reaches the Guest sink by
+  construction). **Ceiling:** these two are proof-only *by design* — there is no
+  runtime predicate call to check, so the gate anchors the construction instead;
+  and the base flows-to relations (`iflows_to`/`cflows_to`) are exercised
+  transitively by the decision predicates. TESTED, not PROVED: the correspondence
+  is a build-system + grep-gate check, not a proof.
 - **C9 (NOT-YET — demoted 2026-08-08, was TESTED).** The external-verification
   leg is not wired end to end, so a relying party CANNOT yet verify from the
   outside. Concretely: `FETCH_SVID` serves a plain certificate
