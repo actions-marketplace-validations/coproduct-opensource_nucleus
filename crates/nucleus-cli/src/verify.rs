@@ -261,6 +261,7 @@ fn verify_here() -> Result<()> {
     check_forbidden_operation(&pod)?;
     check_admission_gate(&pod)?;
     check_guest_facts(&host, &pod)?;
+    check_credential_absent_from_guest(&host, &pod)?;
 
     println!();
     println!("Tier 2 works on this host. A real nucleus pod booted, proved its");
@@ -756,6 +757,106 @@ fn check_art12_witnessed(host: &Tier2Host, pod: &Pod) -> Result<()> {
 /// Each line here corresponds to a defect found by booting in the last week; a
 /// check that only asserted "the pod started" would have passed through all of
 /// them.
+/// **A secret held in the NODE's environment does not surface in the guest.**
+///
+/// The node's environment carries every HMAC secret the runtime holds
+/// (`/etc/nucleus/node.env`, mode 0600, read by the systemd unit). The guest is
+/// the thing the sandbox exists to contain. Nothing in the first should reach
+/// the second, and until now nothing checked it.
+///
+/// # Non-vacuity is the whole difficulty
+///
+/// "The canary was not found" is satisfied by a sweep that looked nowhere, and a
+/// pod whose workload failed to start produces exactly that. So this asserts, in
+/// order: the dump RAN (its fences are present), it CAPTURED content (the decoy
+/// planted in the workload's environment is there), and only then that the
+/// canary is absent.
+///
+/// # A hit reports the PATH, never the value
+///
+/// A test that printed the secret into a CI log to prove the secret does not
+/// leak would be self-defeating.
+fn check_credential_absent_from_guest(host: &Tier2Host, pod: &Pod) -> Result<()> {
+    let canary = std::env::var("NUCLEUS_E2E_CANARY").unwrap_or_default();
+    if canary.is_empty() {
+        // Refuse rather than skip. A silent skip is how this check would rot
+        // into a no-op that still prints reassuringly.
+        bail!(
+            "NUCLEUS_E2E_CANARY is not set in this process, so there is no secret to \
+             look for and the absence assertion below would be trivially true. The CI \
+             job must export the same value it wrote into /etc/nucleus/node.env."
+        );
+    }
+
+    let log = format!("{HOST_STATE_DIR}/pods/{}/firecracker.log", pod.id);
+    let contents = host.sh(&format!("cat {log}"))?;
+    assess_leak_sweep(&contents, &canary)?;
+    println!(
+        "  [OK] no node-held secret surfaced in the guest (sweep read its sites; canary absent)"
+    );
+    Ok(())
+}
+
+/// The decision, separated from the pod so it can be RUN rather than reasoned
+/// about.
+///
+/// A booted pod needs `/dev/kvm`, so on a dev machine the check above cannot
+/// execute and every claim about it would rest on reading. This half takes the
+/// log as a string and is exercised against each state a real run produces —
+/// including the ones that used to be indistinguishable from success.
+///
+/// The in-guest sweep (`nucleus-workload-probe::check_credential_absence`) emits one
+/// `NUCLEUS_E2E_LEAK <site>: looked=<y/n> canary=<absent|PRESENT>` line per leak site
+/// — booleans only, never values. This asserts the sweep RAN and READ its sites
+/// (`looked=yes` on the always-readable ones — otherwise "no canary" means "no
+/// look"), then that no site saw the canary, and finally that the canary value does
+/// not appear anywhere on the console (a path the four sites might not enumerate).
+fn assess_leak_sweep(contents: &str, canary: &str) -> Result<()> {
+    let sweep: Vec<&str> = contents
+        .lines()
+        .filter(|l| l.contains("NUCLEUS_E2E_LEAK"))
+        .collect();
+    if sweep.is_empty() {
+        bail!(
+            "the guest log has no NUCLEUS_E2E_LEAK lines: the in-guest leak sweep never \
+             ran, so 'the canary was not found' would mean 'nobody looked'."
+        );
+    }
+
+    // Non-vacuity: the always-readable sites must report looked=yes.
+    for site in ["cmdline", "workload-env", "pod-spec"] {
+        let looked = sweep
+            .iter()
+            .any(|l| l.contains(&format!("{site}:")) && l.contains("looked=yes"));
+        if !looked {
+            bail!(
+                "the leak sweep did not read the {site} site (no looked=yes line): it is \
+                 not reading the places it claims to, so its silence about the canary is \
+                 not evidence."
+            );
+        }
+    }
+
+    // The leak, reported by the in-guest sweep as a PATH, never a value.
+    if let Some(hit) = sweep.iter().find(|l| l.contains("canary=PRESENT")) {
+        bail!(
+            "a node-held secret surfaced in the guest — {}. The value is deliberately \
+             not printed here.",
+            hit.trim()
+        );
+    }
+
+    // Belt-and-suspenders: the canary VALUE must not appear anywhere on the console,
+    // catching a leak on any path the four enumerated sites do not cover.
+    if contents.contains(canary) {
+        bail!(
+            "the node's canary value appears in the guest console log — a leak on a path \
+             the site sweep does not enumerate. The value is deliberately not printed here."
+        );
+    }
+    Ok(())
+}
+
 fn check_guest_facts(host: &Tier2Host, pod: &Pod) -> Result<()> {
     // Addressed by pod id, not found by timestamp. See `Pod::id`.
     let log = format!("{HOST_STATE_DIR}/pods/{}/firecracker.log", pod.id);
@@ -885,5 +986,77 @@ mod tests {
     #[test]
     fn artifact_paths_are_absolute_on_the_tier2_host() {
         assert!(HOST_ARTIFACTS_DIR.starts_with('/'));
+    }
+}
+
+#[cfg(test)]
+mod leak_sweep {
+    use super::*;
+
+    const CANARY: &str = "nucleus-e2e-canary-deadbeef";
+
+    /// A sweep from a healthy boot: the always-readable sites report `looked=yes`,
+    /// `proxy-environ` is `looked=no` (the uid fence legitimately keeps a workload
+    /// out of PID 1's environ), and nothing saw the canary.
+    fn clean_sweep() -> String {
+        "NUCLEUS_E2E_LEAK cmdline: looked=yes canary=absent\n\
+         NUCLEUS_E2E_LEAK workload-env: looked=yes canary=absent\n\
+         NUCLEUS_E2E_LEAK proxy-environ: looked=no canary=absent\n\
+         NUCLEUS_E2E_LEAK pod-spec: looked=yes canary=absent\n"
+            .to_string()
+    }
+
+    /// **The control, first.** Everything else asserts a refusal, and a function
+    /// that refused every sweep would satisfy all of them while being useless.
+    #[test]
+    fn a_clean_sweep_passes() {
+        assert!(assess_leak_sweep(&clean_sweep(), CANARY).is_ok());
+    }
+
+    /// The probe never ran the sweep, so nothing was inspected. This is the state
+    /// that used to be indistinguishable from success.
+    #[test]
+    fn a_sweep_that_never_ran_is_refused() {
+        let err = assess_leak_sweep("some unrelated boot log\n", CANARY)
+            .expect_err("no NUCLEUS_E2E_LEAK lines means nobody looked");
+        assert!(format!("{err}").contains("nobody looked"));
+    }
+
+    /// A required site reports `looked=no` — its read or search is broken, so its
+    /// silence about the canary is not evidence.
+    #[test]
+    fn a_site_that_did_not_read_is_refused() {
+        let blind = clean_sweep().replace("cmdline: looked=yes", "cmdline: looked=no");
+        let err = assess_leak_sweep(&blind, CANARY).expect_err("a blind site is not evidence");
+        assert!(format!("{err}").contains("cmdline"));
+    }
+
+    /// **The leak, caught — and the error must not become the leak.** A site that
+    /// saw the canary reports `canary=PRESENT` (never the value).
+    #[test]
+    fn a_leaked_canary_is_reported_without_printing_it() {
+        let leaked = clean_sweep().replace(
+            "workload-env: looked=yes canary=absent",
+            "workload-env: looked=yes canary=PRESENT",
+        );
+        let err = assess_leak_sweep(&leaked, CANARY).expect_err("the canary is present");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains(CANARY),
+            "the failure printed the secret it exists to protect: {msg}"
+        );
+        assert!(
+            msg.contains("workload-env"),
+            "it must name the site so the leak is actionable: {msg}"
+        );
+    }
+
+    /// Belt-and-suspenders: the canary VALUE on the console (a path the four sites
+    /// do not enumerate) is caught even when every sweep line says `absent`.
+    #[test]
+    fn the_canary_value_anywhere_on_the_console_is_caught() {
+        let sneaky = format!("{}some_other_line SECRET={CANARY}\n", clean_sweep());
+        let err = assess_leak_sweep(&sneaky, CANARY).expect_err("the value is on the console");
+        assert!(!format!("{err}").contains(CANARY));
     }
 }
