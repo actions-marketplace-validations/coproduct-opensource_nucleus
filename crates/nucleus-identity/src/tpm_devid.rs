@@ -29,6 +29,7 @@ use crate::assurance::{
 };
 use crate::attestation::AttestationRequirements;
 use crate::{oid, Error, Result};
+use rustls::pki_types::{CertificateDer, UnixTime};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -306,6 +307,722 @@ pub fn verify_residency(
         not_proven,
         launch: None,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EK-manufacturer-root chain verification (North Star C9, Phase 1 Inc 3, brick 1)
+//
+// `verify_residency` above proves a key is non-exportable on SOME TPM; it
+// deliberately does not prove the TPM is genuine manufacturer silicon (see its
+// `not_proven` set). That proof is an Endorsement Key (EK) certificate that
+// chains to a PINNED manufacturer root CA. This brick verifies exactly that
+// chain and yields an INERT `EkIdentity` witness — nothing here adds a `Claim`,
+// a `VerifiedAttestation`, or an `AssuranceLevel`.
+//
+// Hardware rooting (`Claim::HardwareRootedKey`, `AssuranceLevel::L2Device`) stays
+// UNREACHABLE until a later brick binds this EK to the residency AK (credential
+// activation) and a single composition constructor consumes residency + EK +
+// binding at once. A genuine EK with an UNBOUND AK proves "a TPM exists",
+// never "THIS key lives in it" — so the witness must not be sayable as a claim
+// on its own. Keeping it inert makes the half-done state unsayable by
+// construction, not merely omitted.
+
+/// tcg-kp-EKCertificate EKU (OID 2.23.133.8.1), DER OID value bytes. A real EK
+/// certificate carries this; requiring it stops a non-EK cert (e.g. a TLS leaf
+/// with serverAuth) from masquerading as an EK.
+const EK_EKU_OID: &[u8] = &[0x67, 0x81, 0x05, 0x08, 0x01];
+
+/// EK-chain signature algorithms: EK certs are RSA-2048/3072/4096 or ECC P-256/384
+/// across manufacturers — all verified through `ring`, no new crypto in the TCB.
+static EK_CHAIN_ALGS: &[&dyn rustls::pki_types::SignatureVerificationAlgorithm] = &[
+    webpki::ring::ECDSA_P256_SHA256,
+    webpki::ring::ECDSA_P384_SHA384,
+    webpki::ring::RSA_PKCS1_2048_8192_SHA256,
+    webpki::ring::RSA_PKCS1_2048_8192_SHA384,
+    webpki::ring::RSA_PKCS1_2048_8192_SHA512,
+];
+
+/// PINNED TPM-manufacturer root CAs an EK certificate may chain to.
+///
+/// Brick 1 ships only an in-repo TEST root (exercised by fixtures). Which REAL
+/// manufacturer roots to trust (Infineon/Nuvoton/Intel/STMicro/AMD…) and their
+/// update/revocation policy is a federation-trust decision reserved for the
+/// operator — an empty store proves nothing, by design.
+#[derive(Default)]
+pub struct EkTrustStore {
+    anchors: Vec<(String, Vec<u8>)>,
+}
+
+impl EkTrustStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Pin a manufacturer root (DER). The label names the manufacturer this root
+    /// vouches for; it is carried into `EkIdentity` on a successful chain.
+    pub fn pin_root(&mut self, manufacturer: impl Into<String>, root_der: impl Into<Vec<u8>>) {
+        self.anchors.push((manufacturer.into(), root_der.into()));
+    }
+    pub fn is_empty(&self) -> bool {
+        self.anchors.is_empty()
+    }
+}
+
+/// The genuine-silicon witness: an EK whose certificate chained to a pinned
+/// manufacturer root. INERT by construction — no method turns it into a `Claim`
+/// or an `AssuranceLevel`; only a later composition constructor (given an AK↔EK
+/// binding and residency) may.
+#[derive(Clone, Debug)]
+pub struct EkIdentity {
+    /// The EK certificate's subjectPublicKeyInfo (DER) — the handle a future
+    /// credential-activation brick challenges to bind the residency AK.
+    pub ek_spki_der: Vec<u8>,
+    /// The manufacturer whose pinned root this EK chained to.
+    pub manufacturer: String,
+}
+
+/// Verify that `ek_cert_der` chains, through `intermediates`, to a PINNED root in
+/// `store`, and carries the EK EKU. Returns the inert [`EkIdentity`] witness.
+///
+/// EK-leaf `notAfter` is ADVISORY (TCG EK Credential Profile: it is manufacturer
+/// discretion and may be `99991231235959Z` or already past), so the chain is
+/// validated at the leaf's own `notBefore` instant rather than wall clock —
+/// trust rests on the chain signatures and the pinned root, not on leaf expiry.
+/// A bad signature or a chain to an UNPINNED root still fails.
+pub fn verify_ek_chain(
+    ek_cert_der: &[u8],
+    intermediates: &[Vec<u8>],
+    store: &EkTrustStore,
+) -> Result<EkIdentity> {
+    if store.is_empty() {
+        return Err(vfail(
+            "EK trust store is empty — no pinned root to chain to, so genuine silicon cannot be established",
+        ));
+    }
+
+    let ee_der = CertificateDer::from(ek_cert_der);
+    let ee = webpki::EndEntityCert::try_from(&ee_der)
+        .map_err(|e| vfail(format!("EK leaf certificate did not parse: {e}")))?;
+
+    let inter_ders: Vec<CertificateDer> = intermediates
+        .iter()
+        .map(|d| CertificateDer::from(d.as_slice()))
+        .collect();
+
+    // Validate at the leaf's own notBefore so leaf expiry is advisory (see above).
+    let time = ek_not_before(ek_cert_der)?;
+
+    // Try each pinned root individually so a success also tells us WHICH
+    // manufacturer vouched — the label goes into the witness.
+    let mut last_err = String::from("no pinned root matched");
+    for (manufacturer, root_der) in &store.anchors {
+        let anchor_der = CertificateDer::from(root_der.as_slice());
+        let anchor = match webpki::anchor_from_trusted_cert(&anchor_der) {
+            Ok(a) => a,
+            Err(e) => {
+                last_err = format!("pinned root {manufacturer:?} is not a valid trust anchor: {e}");
+                continue;
+            }
+        };
+        match ee.verify_for_usage(
+            EK_CHAIN_ALGS,
+            &[anchor],
+            &inter_ders,
+            time,
+            webpki::KeyUsage::required(EK_EKU_OID),
+            None,
+            None,
+        ) {
+            Ok(_) => {
+                return Ok(EkIdentity {
+                    ek_spki_der: ek_spki(ek_cert_der)?,
+                    manufacturer: manufacturer.clone(),
+                });
+            }
+            Err(e) => last_err = format!("chain to {manufacturer:?}: {e}"),
+        }
+    }
+    Err(vfail(format!(
+        "EK certificate does not chain to any pinned manufacturer root ({last_err})"
+    )))
+}
+
+/// The EK certificate's notBefore, as a webpki `UnixTime`.
+fn ek_not_before(cert_der: &[u8]) -> Result<UnixTime> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
+        .map_err(|e| vfail(format!("EK certificate did not parse (validity): {e}")))?;
+    let secs = cert.validity().not_before.timestamp();
+    let secs = u64::try_from(secs).map_err(|_| vfail("EK notBefore is before the Unix epoch"))?;
+    Ok(UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+        secs,
+    )))
+}
+
+/// The EK certificate's subjectPublicKeyInfo (DER).
+fn ek_spki(cert_der: &[u8]) -> Result<Vec<u8>> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
+        .map_err(|e| vfail(format!("EK certificate did not parse (spki): {e}")))?;
+    Ok(cert.public_key().raw.to_vec())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AK↔EK binding via TPM credential activation (North Star C9, Phase 1 Inc 3, brick 2)
+//
+// Brick 1 proved an EK certificate chains to a manufacturer root; the residency
+// verifier proved an AK is non-exportable. Neither proves the AK and that EK are
+// on the SAME TPM — a genuine EK with an unrelated AK proves nothing about the
+// AK's key. Credential activation closes that: nucleus (the verifier) builds a
+// challenge that ONLY a TPM holding BOTH the EK and the object named `ak_name`
+// can decrypt (TPM2_ActivateCredential), and getting our secret back proves
+// co-residency.
+//
+// This is the VERIFIER's `TPM2_MakeCredential` half, pure and in-tree (ring ECDH
+// + sha2 + AES-128-CFB), constructed to be byte-identical to what a real TPM's
+// ActivateCredential consumes — validated by a swtpm round-trip (producer=nucleus,
+// verifier=real TPM), the same producer≠verifier discipline as the residency work.
+//
+// INERT, like brick 1: the witness `AkEkBound` carries no `Claim` and no
+// `AssuranceLevel`; only brick 3's composition (residency ∧ EK ∧ this) may reach
+// L2Device. This brick covers ECC endorsement keys; RSA EKs are a disclosed
+// follow-brick (RSA-OAEP-encrypt would add a primitive to the TCB).
+
+/// INERT AK↔EK co-residency witness: a credential activation proved the residency
+/// AK and the manufacturer-rooted EK are on the SAME TPM. No method yields a
+/// `Claim` or `AssuranceLevel` — only brick 3's composition may. Fields tie back
+/// to residency (`ak_name_sha256`) and brick 1 (`ek_spki_sha256`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AkEkBound {
+    pub ak_name_sha256: [u8; 32],
+    pub ek_spki_sha256: [u8; 32],
+}
+
+/// A credential-activation challenge — exactly the two TPM2Bs `tpm2_activatecredential`
+/// consumes (`TPM2B_ID_OBJECT` and, for an ECC EK, a `TPM2B_ENCRYPTED_SECRET`
+/// carrying the ephemeral `TPMS_ECC_POINT`).
+pub struct CredentialChallenge {
+    pub credential_blob: Vec<u8>,
+    pub encrypted_secret: Vec<u8>,
+}
+
+#[cfg(feature = "tpm-devid")]
+/// HMAC-SHA256 — hand-rolled over `sha2` (already in the TCB), so no `hmac` dep.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const B: usize = 64;
+    let mut k0 = [0u8; B];
+    if key.len() > B {
+        k0[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k0[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; B];
+    let mut opad = [0x5cu8; B];
+    for i in 0..B {
+        ipad[i] ^= k0[i];
+        opad[i] ^= k0[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let ih = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(ih);
+    outer.finalize().into()
+}
+
+#[cfg(feature = "tpm-devid")]
+/// KDFa (TPM 2.0 Part 1 §11.4.10.2, SP800-108 counter mode). Single HMAC block —
+/// valid for `bits <= 256`, which covers every use here (128-bit AES key, 256-bit
+/// HMAC key). `K = HMAC(key, counter(1) || label || 0x00 || contextU || contextV || bits)`.
+fn kdfa(key: &[u8], label: &str, context_u: &[u8], context_v: &[u8], bits: u32) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&1u32.to_be_bytes());
+    msg.extend_from_slice(label.as_bytes());
+    msg.push(0x00);
+    msg.extend_from_slice(context_u);
+    msg.extend_from_slice(context_v);
+    msg.extend_from_slice(&bits.to_be_bytes());
+    hmac_sha256(key, &msg)[..(bits as usize) / 8].to_vec()
+}
+
+#[cfg(feature = "tpm-devid")]
+/// KDFe (TPM 2.0 Part 1 §11.4.10.3, SP800-56A one-step). Single hash block —
+/// valid for `bits <= 256`. `K = H(counter(1) || Z || label || 0x00 || contextU || contextV)`.
+fn kdfe(z: &[u8], label: &str, context_u: &[u8], context_v: &[u8], bits: u32) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(1u32.to_be_bytes());
+    h.update(z);
+    h.update(label.as_bytes());
+    h.update([0x00]);
+    h.update(context_u);
+    h.update(context_v);
+    h.finalize()[..(bits as usize) / 8].to_vec()
+}
+
+#[cfg(feature = "tpm-devid")]
+/// `len(2 BE) || data` — a TPM2B.
+fn tpm2b(data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(2 + data.len());
+    v.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    v.extend_from_slice(data);
+    v
+}
+
+/// The pure, seed-driven half (TPM 2.0 "SensitiveToCredential"): given the KDF
+/// `seed`, protect `secret` for the object named `ak_name`. Returns the
+/// `TPM2B_ID_OBJECT` (`credential_blob`). The AK name is bound TWICE — it keys the
+/// STORAGE KDFa and is covered by the integrity HMAC — which is what makes a
+/// credential built for one AK fail to activate on another.
+#[cfg(feature = "tpm-devid")]
+fn sensitive_to_credential(seed: &[u8], ak_name: &[u8], secret: &[u8]) -> Vec<u8> {
+    use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+
+    let sym_key = kdfa(seed, "STORAGE", ak_name, &[], 128);
+    let mut enc_identity = tpm2b(secret); // plaintext = TPM2B(secret)
+    let iv = [0u8; 16];
+    cfb_mode::Encryptor::<aes::Aes128>::new(sym_key.as_slice().into(), (&iv).into())
+        .encrypt(&mut enc_identity);
+
+    let hmac_key = kdfa(seed, "INTEGRITY", &[], &[], 256);
+    let mut integrity_input = enc_identity.clone();
+    integrity_input.extend_from_slice(ak_name);
+    let outer_hmac = hmac_sha256(&hmac_key, &integrity_input);
+
+    // TPMS_ID_OBJECT = TPM2B_DIGEST(integrityHMAC) || encIdentity(raw)
+    let mut id_object = tpm2b(&outer_hmac);
+    id_object.extend_from_slice(&enc_identity);
+    tpm2b(&id_object) // TPM2B_ID_OBJECT
+}
+
+/// Build a credential-activation challenge for an ECC endorsement key: only a TPM
+/// holding that EK and the object named `ak_name` can recover `secret`.
+///
+/// `ek_pub` is the TPM's `TPM2B_PUBLIC` for the EK (ECC P-256). `secret` is a
+/// fresh random challenge (≤ 32 bytes). A one-pass ECDH ephemeral × EK derives the
+/// seed (KDFe), so the returned `encrypted_secret` carries the ephemeral point the
+/// TPM needs to recompute it.
+#[cfg(feature = "tpm-devid")]
+pub fn make_credential_ecc(
+    ek_pub: &[u8],
+    ak_name: &[u8],
+    secret: &[u8],
+) -> Result<CredentialChallenge> {
+    use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
+
+    if secret.len() > 32 {
+        return Err(vfail("credential secret exceeds the SHA-256 digest size"));
+    }
+    let ek = parse_ecc_public(ek_pub)?; // 0x04 || EK_x || EK_y in ek.sec1_uncompressed
+    let ek_x = ek.sec1_uncompressed[1..33].to_vec();
+
+    let rng = ring::rand::SystemRandom::new();
+    let eph = EphemeralPrivateKey::generate(&ECDH_P256, &rng)
+        .map_err(|_| vfail("ephemeral key generation failed"))?;
+    let eph_pub = eph
+        .compute_public_key()
+        .map_err(|_| vfail("ephemeral public key failed"))?;
+    let eph_bytes = eph_pub.as_ref(); // 0x04 || eph_x || eph_y
+    if eph_bytes.len() != 65 {
+        return Err(vfail("unexpected ephemeral point encoding"));
+    }
+    let eph_x = eph_bytes[1..33].to_vec();
+    let eph_y = eph_bytes[33..65].to_vec();
+
+    let peer = UnparsedPublicKey::new(&ECDH_P256, &ek.sec1_uncompressed);
+    let z = agree_ephemeral(eph, &peer, |shared| shared.to_vec())
+        .map_err(|_| vfail("ECDH with the EK public key failed"))?;
+
+    // seed = KDFe(SHA256, Z, "IDENTITY", ephemeral.x, EK.x, 256)
+    let seed = kdfe(&z, "IDENTITY", &eph_x, &ek_x, 256);
+    let credential_blob = sensitive_to_credential(&seed, ak_name, secret);
+
+    // TPM2B_ENCRYPTED_SECRET = TPM2B( TPMS_ECC_POINT{ TPM2B(x), TPM2B(y) } )
+    let mut point = tpm2b(&eph_x);
+    point.extend_from_slice(&tpm2b(&eph_y));
+    let encrypted_secret = tpm2b(&point);
+
+    Ok(CredentialChallenge {
+        credential_blob,
+        encrypted_secret,
+    })
+}
+
+/// Mint the inert [`AkEkBound`] iff the TPM returned EXACTLY the challenge secret —
+/// i.e. a TPM holding both the manufacturer-rooted EK and the residency AK
+/// recovered it, so the two keys are co-resident. Constant-time comparison; `Err`
+/// on any mismatch. Produces no `Claim` (L2 stays unreachable until brick 3).
+pub fn verify_activation(
+    expected_secret: &[u8],
+    recovered_secret: &[u8],
+    ak_name: &[u8],
+    ek_spki_der: &[u8],
+) -> Result<AkEkBound> {
+    if !ct_eq(expected_secret, recovered_secret) {
+        return Err(vfail(
+            "credential activation did not recover the challenge secret — the AK and EK are not co-resident (or a different TPM answered)",
+        ));
+    }
+    Ok(AkEkBound {
+        ak_name_sha256: sha256_32(ak_name),
+        ek_spki_sha256: sha256_32(ek_spki_der),
+    })
+}
+
+/// Constant-time byte-slice equality. Length is compared first and non-secret
+/// (the challenge length is fixed), then every byte is folded so the comparison
+/// time does not depend on WHERE a mismatch is.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// L2 composition (North Star C9, Phase 1 Inc 3, brick 3)
+//
+// The ONLY place `HardwareRootedKey` / `StableDeviceIdentity` / `GenuineSilicon`
+// are emitted and assurance rises to L2Device. Bricks 1 and 2 produce inert
+// witnesses precisely so this composition is the single choke point: a caller
+// literally cannot construct an L2 result without holding all three witness
+// values, so a partial Inc-3 (EK chain alone, or a binding alone) is structurally
+// unable to claim hardware rooting — unsayable, not merely undocumented.
+//
+// It refuses unless the three witnesses are about the SAME TPM — the coherence
+// tooth that stops a genuine EK *here* and a non-exportable key *there* from
+// composing into a false hardware-rooted claim.
+
+/// Compose residency (non-exportability), an EK-manufacturer-root chain, and an
+/// AK↔EK binding into an `L2Device` attestation. Refuses unless all three name
+/// the same TPM: the binding's AK is the residency AK, the binding's EK is the
+/// manufacturer-rooted EK, and residency actually established non-exportability.
+pub fn compose_l2(
+    residency: &VerifiedAttestation,
+    ek: &EkIdentity,
+    binding: &AkEkBound,
+) -> Result<VerifiedAttestation> {
+    let ak_name_sha256 = match &residency.subject {
+        AttestedSubject::TpmResidentKey { ak_name_sha256, .. } => *ak_name_sha256,
+        _ => return Err(vfail("residency attestation is not a TPM resident key")),
+    };
+    if !residency.proves(Claim::KeyNonExportable) {
+        return Err(vfail(
+            "residency proof does not establish KeyNonExportable — there is nothing to root",
+        ));
+    }
+    if binding.ak_name_sha256 != ak_name_sha256 {
+        return Err(vfail(
+            "the AK↔EK binding names a different AK than the residency proof — not the same key",
+        ));
+    }
+    if binding.ek_spki_sha256 != sha256_32(&ek.ek_spki_der) {
+        return Err(vfail(
+            "the AK↔EK binding names a different EK than the manufacturer-rooted one — not the same TPM",
+        ));
+    }
+
+    // Coherent: a non-exportable AK, bound to the EK of a genuine manufacturer TPM.
+    let proves = BTreeSet::from([
+        Claim::KeyNonExportable,     // carried from residency
+        Claim::GenuineSilicon,       // from the EK-manufacturer-root chain (brick 1)
+        Claim::HardwareRootedKey,    // GenuineSilicon ∧ AkEkBound ∧ KeyNonExportable
+        Claim::StableDeviceIdentity, // the EK is the permanent per-device identity
+    ]);
+    let not_proven = BTreeSet::from([
+        Claim::MeasuredBoot, // a PCR/TEE quote is L3, not established here
+        Claim::ContinuousLiveness,
+        Claim::UnmodifiedArtifact,
+    ]);
+    Ok(VerifiedAttestation {
+        backend: "tpm-devid-l2",
+        assurance: AssuranceLevel::L2Device,
+        subject: residency.subject.clone(),
+        proves,
+        not_proven,
+        launch: None,
+    })
+}
+
+#[cfg(test)]
+mod l2_composition_tests {
+    use super::{compose_l2, sha256_32, AkEkBound, EkIdentity};
+    use crate::assurance::{AssuranceLevel, AttestedSubject, Claim, VerifiedAttestation};
+    use std::collections::BTreeSet;
+
+    fn residency(ak: [u8; 32]) -> VerifiedAttestation {
+        VerifiedAttestation {
+            backend: "tpm-devid-residency",
+            assurance: AssuranceLevel::L1Software,
+            subject: AttestedSubject::TpmResidentKey {
+                ak_name_sha256: ak,
+                subject_name_sha256: [0u8; 32],
+            },
+            proves: BTreeSet::from([Claim::KeyNonExportable]),
+            not_proven: BTreeSet::from([Claim::HardwareRootedKey, Claim::StableDeviceIdentity]),
+            launch: None,
+        }
+    }
+    fn ek() -> EkIdentity {
+        EkIdentity {
+            ek_spki_der: vec![1, 2, 3, 4, 5],
+            manufacturer: "test-root".into(),
+        }
+    }
+
+    /// Coherent witnesses → L2Device, emitting exactly the four claims, with
+    /// MeasuredBoot still `not_proven` (L3 unreachable) and the sets disjoint.
+    #[test]
+    fn coherent_witnesses_compose_to_l2() {
+        let ak = [7u8; 32];
+        let e = ek();
+        let b = AkEkBound {
+            ak_name_sha256: ak,
+            ek_spki_sha256: sha256_32(&e.ek_spki_der),
+        };
+        let va = compose_l2(&residency(ak), &e, &b).expect("coherent → L2");
+        assert_eq!(va.assurance(), AssuranceLevel::L2Device);
+        for c in [
+            Claim::KeyNonExportable,
+            Claim::GenuineSilicon,
+            Claim::HardwareRootedKey,
+            Claim::StableDeviceIdentity,
+        ] {
+            assert!(va.proves(c), "must prove {c:?}");
+        }
+        assert!(va.cannot_prove(Claim::MeasuredBoot), "MeasuredBoot is L3");
+        assert!(va.proves.is_disjoint(&va.not_proven));
+    }
+
+    /// **Coherence bite — wrong AK.** A binding for a different AK than the
+    /// residency proof must not compose (three proofs, not the same key).
+    #[test]
+    fn a_binding_for_a_different_ak_is_refused() {
+        let e = ek();
+        let b = AkEkBound {
+            ak_name_sha256: [9u8; 32], // != residency's AK
+            ek_spki_sha256: sha256_32(&e.ek_spki_der),
+        };
+        assert!(compose_l2(&residency([7u8; 32]), &e, &b).is_err());
+    }
+
+    /// **Coherence bite — wrong EK.** A binding whose EK is not the
+    /// manufacturer-rooted one must not compose (not the same TPM).
+    #[test]
+    fn a_binding_for_a_different_ek_is_refused() {
+        let ak = [7u8; 32];
+        let b = AkEkBound {
+            ak_name_sha256: ak,
+            ek_spki_sha256: sha256_32(b"some other EK"),
+        };
+        assert!(compose_l2(&residency(ak), &ek(), &b).is_err());
+    }
+
+    /// Residency that never established non-exportability cannot be rooted.
+    #[test]
+    fn residency_without_nonexportable_is_refused() {
+        let ak = [7u8; 32];
+        let mut r = residency(ak);
+        r.proves = BTreeSet::new(); // strip KeyNonExportable
+        let e = ek();
+        let b = AkEkBound {
+            ak_name_sha256: ak,
+            ek_spki_sha256: sha256_32(&e.ek_spki_der),
+        };
+        assert!(compose_l2(&r, &e, &b).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "tpm-devid"))]
+mod credential_activation_tests {
+    use super::{hmac_sha256, kdfa, sensitive_to_credential, verify_activation};
+
+    fn name(tag: u8) -> Vec<u8> {
+        let mut n = vec![0x00, 0x0b]; // nameAlg = SHA-256
+        n.extend_from_slice(&[tag; 32]);
+        n
+    }
+
+    /// The credential blob depends on the AK name — a credential built for one AK
+    /// differs from one built for another (same seed + secret). Necessary (not
+    /// sufficient) for the wrong-AK activation to fail; the sufficiency is the
+    /// swtpm bite in `scripts/tpm-credential-activation-check.sh`.
+    #[test]
+    fn credential_blob_is_ak_name_bound() {
+        let seed = [7u8; 32];
+        let secret = [0xa5u8; 16];
+        let b1 = sensitive_to_credential(&seed, &name(1), &secret);
+        let b2 = sensitive_to_credential(&seed, &name(2), &secret);
+        assert_ne!(b1, b2, "the credential blob must depend on the AK name");
+    }
+
+    /// **The integrity HMAC genuinely covers the AK name** — the exact check a TPM
+    /// runs in ActivateCredential. Reconstruct the blob's HMAC and confirm it
+    /// matches an HMAC over `encIdentity || name`, and that swapping the name
+    /// breaks it. Reds if the name is dropped from the integrity input.
+    #[test]
+    fn integrity_hmac_binds_the_name() {
+        let seed = [3u8; 32];
+        let secret = [0x11u8; 16];
+        let n1 = name(1);
+        let blob = sensitive_to_credential(&seed, &n1, &secret);
+        // blob = TPM2B( TPM2B(hmac=32) || encIdentity ); parse it out.
+        let id_object = &blob[2..];
+        let hmac_in_blob = &id_object[2..2 + 32];
+        let enc_identity = &id_object[2 + 32..];
+
+        let hmac_key = kdfa(&seed, "INTEGRITY", &[], &[], 256);
+        let mut over_correct = enc_identity.to_vec();
+        over_correct.extend_from_slice(&n1);
+        assert_eq!(
+            hmac_sha256(&hmac_key, &over_correct),
+            hmac_in_blob,
+            "the blob's integrity HMAC must be HMAC(encIdentity || name)"
+        );
+
+        let mut over_wrong = enc_identity.to_vec();
+        over_wrong.extend_from_slice(&name(2)); // swap the name
+        assert_ne!(
+            hmac_sha256(&hmac_key, &over_wrong).as_slice(),
+            hmac_in_blob,
+            "a name-swapped HMAC must NOT match — the name is what binds the AK"
+        );
+    }
+
+    /// `verify_activation` mints the witness only on an exact secret match.
+    #[test]
+    fn verify_activation_requires_exact_recovery() {
+        let ak = vec![9u8; 34];
+        let ek = vec![4u8; 91];
+        let bound = verify_activation(b"the-secret", b"the-secret", &ak, &ek).unwrap();
+        assert_eq!(bound.ak_name_sha256, super::sha256_32(&ak));
+        assert!(verify_activation(b"the-secret", b"the-secre_", &ak, &ek).is_err());
+        assert!(verify_activation(b"the-secret", b"short", &ak, &ek).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ek_chain_tests {
+    use super::{verify_ek_chain, EkTrustStore};
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    };
+
+    /// A self-signed CA: returns its DER (for pinning) and an `Issuer` for signing
+    /// leaves under it.
+    fn ca(name: &str) -> (Vec<u8>, Issuer<'static, KeyPair>) {
+        let key = KeyPair::generate().unwrap();
+        let mut p = CertificateParams::new(vec![name.to_string()]).unwrap();
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let der = p.self_signed(&key).unwrap().der().to_vec();
+        (der, Issuer::new(p, key))
+    }
+
+    /// The tcg-kp-EKCertificate EKU as an `extKeyUsage` extension (2.5.29.37 =
+    /// SEQUENCE { OID 2.23.133.8.1 }) — rcgen has no built-in EK EKU variant.
+    fn ek_eku_ext() -> rcgen::CustomExtension {
+        rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 37],
+            vec![0x30, 0x07, 0x06, 0x05, 0x67, 0x81, 0x05, 0x08, 0x01],
+        )
+    }
+
+    /// An EK leaf signed by `issuer`. By default it carries the EK EKU; passing
+    /// `eku` gives it a NON-EK EKU instead, to prove the requirement bites.
+    fn ek_leaf(
+        issuer: &Issuer<'_, KeyPair>,
+        eku: Option<ExtendedKeyUsagePurpose>,
+        validity: Option<(i32, i32)>,
+    ) -> Vec<u8> {
+        let key = KeyPair::generate().unwrap();
+        let mut p = CertificateParams::new(vec!["ek".to_string()]).unwrap();
+        match eku {
+            Some(e) => p.extended_key_usages = vec![e],
+            None => p.custom_extensions.push(ek_eku_ext()),
+        }
+        if let Some((from, to)) = validity {
+            p.not_before = rcgen::date_time_ymd(from, 1, 1);
+            p.not_after = rcgen::date_time_ymd(to, 1, 1);
+        }
+        p.signed_by(&key, issuer).unwrap().der().to_vec()
+    }
+
+    /// Positive: an EK leaf chaining to a PINNED root verifies, and the witness
+    /// carries the manufacturer label and a non-empty EK SPKI.
+    #[test]
+    fn ek_chains_to_a_pinned_root() {
+        let (root_der, issuer) = ca("test-root");
+        let ek = ek_leaf(&issuer, None, None);
+        let mut store = EkTrustStore::new();
+        store.pin_root("nucleus-test-root", root_der);
+
+        let id = verify_ek_chain(&ek, &[], &store).expect("EK should chain to the pinned root");
+        assert_eq!(id.manufacturer, "nucleus-test-root");
+        assert!(!id.ek_spki_der.is_empty());
+    }
+
+    /// **The bite (anti-overclaim).** An EK signed by a root that is NOT pinned —
+    /// the shape of swtpm's own self-signed EK — must NOT verify, so genuine
+    /// silicon stays unprovable without a real manufacturer root. Reds if the
+    /// pinning is ever weakened to accept unrooted EKs.
+    #[test]
+    fn an_unpinned_root_is_rejected() {
+        let (pinned_der, _pinned) = ca("pinned");
+        let (_other_der, other) = ca("swtpm-like-unpinned");
+        let ek = ek_leaf(&other, None, None);
+        let mut store = EkTrustStore::new();
+        // Pin ONLY the first root; the EK chains to the other.
+        store.pin_root("pinned", pinned_der);
+        assert!(verify_ek_chain(&ek, &[], &store).is_err());
+    }
+
+    /// A tampered EK certificate (a flipped signature byte) must not verify.
+    #[test]
+    fn a_tampered_ek_is_rejected() {
+        let (root_der, issuer) = ca("test-root");
+        let mut ek = ek_leaf(&issuer, None, None);
+        let n = ek.len();
+        ek[n - 1] ^= 0xff; // corrupt the trailing signature bytes
+        let mut store = EkTrustStore::new();
+        store.pin_root("test-root", root_der);
+        assert!(verify_ek_chain(&ek, &[], &store).is_err());
+    }
+
+    /// The EK EKU requirement bites: a leaf carrying a NON-EK EKU (serverAuth),
+    /// even when it chains to a pinned root, is refused — a TLS cert cannot pose
+    /// as an EK.
+    #[test]
+    fn a_non_ek_eku_is_rejected() {
+        let (root_der, issuer) = ca("test-root");
+        let ek = ek_leaf(&issuer, Some(ExtendedKeyUsagePurpose::ServerAuth), None);
+        let mut store = EkTrustStore::new();
+        store.pin_root("test-root", root_der);
+        assert!(verify_ek_chain(&ek, &[], &store).is_err());
+    }
+
+    /// An empty store proves nothing — refuse rather than accept any EK.
+    #[test]
+    fn an_empty_store_refuses() {
+        let (_d, issuer) = ca("test-root");
+        let ek = ek_leaf(&issuer, None, None);
+        assert!(verify_ek_chain(&ek, &[], &EkTrustStore::new()).is_err());
+    }
+
+    /// EK-leaf expiry is ADVISORY (TCG): an EK whose `notAfter` is in the past but
+    /// which chains validly to a pinned root still verifies, because the chain is
+    /// checked at the leaf's `notBefore`. (A bad signature still fails — proven by
+    /// `a_tampered_ek_is_rejected` — so this did not disable validation.)
+    #[test]
+    fn an_expired_ek_leaf_still_verifies() {
+        let (root_der, issuer) = ca("test-root");
+        // Long-lived root; short, already-expired leaf.
+        let ek = ek_leaf(&issuer, None, Some((2020, 2021)));
+        let mut store = EkTrustStore::new();
+        store.pin_root("test-root", root_der);
+        assert!(verify_ek_chain(&ek, &[], &store).is_ok());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
