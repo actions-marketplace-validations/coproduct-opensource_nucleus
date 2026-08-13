@@ -22,6 +22,390 @@ Corollaries:
 
 This is the apodictic core — logically compelled, machine-checkable, marketable.
 
+"Can only stay the same or tighten" is stated from the **workload's** side, which
+is what the second corollary makes precise: the agent cannot widen its own
+authority mid-run. The single widening path, `POST /v1/escalate`, is not the
+agent's to take — it requires a separate approver's authority and the result is
+bounded by the delegation ceiling, so it never exceeds what was delegated (see
+Pillar A #4). An adversary controlling the workload sees a pure ratchet.
+
+### The Confidentiality Dual
+
+The claim above is about **authority**: what a workload may *do*. Its dual is
+about **confidentiality**: what a workload may *learn*. Both are needed, because
+a tenant's first question is not "can this agent act" but "can another tenant's
+agent read my secrets."
+
+**Whatever an agent workload does — including when an adversary controls the
+inputs feeding it — it can neither learn the secrets Nucleus holds on its behalf
+nor those of any other pod, nor influence which of them get released; the sole
+exception is a value a governor deliberately released with a single-use token,
+and even then the adversary cannot steer which value that is. This covers
+explicit flows through every mediated channel and excludes timing, cache, and
+other microarchitectural channels, and excludes availability and
+resource-contention channels such as a bounded pod pool; it is a theorem about
+the code that ships, re-checked on every change, and a relying party can verify
+from the outside that the pod they are talking to is the artifact the theorem is
+about.**
+
+The exclusions are **inside the sentence, not a footnote**, so the claim cannot
+be quoted without its limits. Cross-pod confidentiality stated without them would
+read as "immune to co-tenancy attacks" — the worst overclaim available to this
+project, and one we have no basis for: Firecracker, the host kernel, and the
+hardware are all in the TCB and none of them is modelled.
+
+The **resource-contention** exclusion was added after the fact, and it is worth
+saying why rather than letting it look like it was always there. The first
+version excluded only timing, cache, and microarchitectural channels. Working
+through the host state field by field (`cross-pod-view.md`) turned up
+`firecracker_pool`: a bounded semaphore that pod spawn acquires with
+`acquire_owned().await`. It **blocks**, so one tenant's pod delays another's, and
+that channel is macroscopic and reliable — not microarchitectural at all. Under
+the original wording a careful reader would have concluded the claim covered it,
+and that the claim was false. It was. Possibilistic noninterference over values
+conventionally says nothing about availability; the fix is to say so out loud,
+which is what this sentence now does.
+
+#### Status — what is proved, what is tested, what is not yet
+
+Keeping these apart is a house rule, because a north star written in the present
+tense is how a claim outruns its wiring. This table is a **machine-checked
+ledger** (`scripts/check-north-star-ledger.sh`, run on every change): each row
+names a clause of the sentence verbatim, carries exactly one status from
+{PROVED, TESTED, NOT-YET}, an evidence handle CI can dereference, and the gate
+that reds if the status regresses. The row count, the NOT-YET count, and the
+count of in-tree dormancy gates the ledger is cross-checked against are all
+pinned (`scripts/north-star-ledger-ratchet.txt`) — deleting a row, demoting a
+status, or a dormancy gate silently appearing or disappearing is a visible
+event, not an edit.
+
+| # | Clause (verbatim from the sentence) | Status | Evidence | Falsified by |
+| --- | --- | --- | --- | --- |
+| C1 | "learn the secrets Nucleus holds on its behalf" | PROVED | `crates/portcullis-core/lean/IdentityMaterialNoninterferenceExtracted.lean#identity_material_never_reaches_the_workload`, `crates/portcullis-core/lean/ChannelAdmissionExtracted.lean#no_channel_delivers_secret_to_the_workload`, `crates/nucleus-tool-proxy/src/workload.rs#DEFAULT_WORKLOAD_UID`, `crates/nucleus-tool-proxy/src/workload.rs#PUBLIC_RESERVED` | `scripts/check-c1-inbound-fences.sh` |
+| C2 | "nor those of any other pod" | NOT-YET | `crates/portcullis-core/lean/PodCrossView.lean#cross_pod_noninterference`, `crates/nucleus-node/src/pod_api.rs#caller_may_manage_matches_the_podview_lineage_filter`, `crates/nucleus-node/src/pod_api.rs#pod_b_cannot_observe_pod_a_across_the_auth_and_filter_path`, `scripts/cross-pod-lineage-check.sh`, `scripts/cross-pod-scoped-check.sh`, `docs/cross-pod-view.md` | `.github/workflows/portcullis-core-proven-lean.yml` |
+| C3 | "nor influence which of them get released" | PROVED | `crates/portcullis-core/lean/PodMachineSpike.lean#noninterference` | `.github/workflows/portcullis-core-proven-lean.yml` |
+| C4 | "a governor deliberately released with a single-use token" | TESTED | `crates/portcullis-core/lean/DeclassifySinkScopeExtracted.lean#no_second_apply`, `crates/portcullis/src/kernel/declassify_authority.rs#apply_declassification_token_on`, `crates/portcullis/tests/declassify_rehome_egress.rs#c4_flip_back_on_one_graph`, `crates/portcullis/tests/kernel_token.rs` | `scripts/check-declassify-value-bound.sh` |
+| C5 | "cannot steer which value that is" | PROVED | `crates/portcullis-core/lean/DeclassifySinkScopeExtracted.lean#four_run_value_robustness`, `crates/portcullis/src/flow_graph.rs#value_binding_ok`, `crates/portcullis/tests/declassify_scope.rs#four_run_released_value_is_not_attacker_steerable` | `scripts/check-declassify-value-bound.sh` |
+| C6 | "every mediated channel" | TESTED | `crates/nucleus-ifc-kernel/src/egress_channel.rs#no_channel_is_an_open_hole`, `crates/portcullis-core/lean/MediationScopeExtracted.lean#no_sink_reachable_without_discharge`, `crates/nucleus-ifc-kernel/src/egress_channel.rs#documented_inventory_equals_the_enum`, `scripts/check-egress-probe.sh`, `docs/architecture/mediated-set.md` | `scripts/check-egress-probe.sh` |
+| C7 | "a theorem about the code that ships" | TESTED | `.github/workflows/aeneas-ifc-scoped.yml`, `crates/nucleus-ifc-kernel/src/extracted/identity.rs` | `.github/workflows/aeneas-ifc-scoped.yml` |
+| C8 | "re-checked on every change" | TESTED | `.github/workflows/aeneas-ifc-scoped.yml`, `scripts/check-extracted-callsites.sh`, `scripts/extracted-callsites-manifest.txt` | `scripts/check-extracted-callsites.sh` |
+| C9 | "verify from the outside" | NOT-YET | `crates/nucleus-identity/src/attestation.rs#verify_attested_svid`, `crates/nucleus-node/src/identity.rs#attested_svid_is_served_and_verifier_reds_on_drift_and_absent`, `crates/nucleus-cli/src/verify_attestation.rs`, `crates/nucleus-node/src/posture.rs#admit_posture` | — |
+*The clause fragments quote the sentence above, whose exclusions travel with
+them: the claim covers explicit flows only, excluding timing, cache, and other
+microarchitectural channels, and excluding availability and resource-contention
+channels.*
+
+What each status means, and what it deliberately does not:
+
+- **C1 (PROVED — re-promoted 2026-08-08; had been demoted earlier the same day).** FM-5 genuinely proves,
+  over the seven modelled child-inheritance channels (Env, Argv, Cwd, Stdio,
+  ExtraFd, Uid, Cmdline), the 11-kind × 3-principal delivery table,
+  Aeneas-extracted, `sorry`-free, axiom-audited — but the *clause* is broader
+  than that theorem,
+  and the *clause* was **falsified by a channel FM-5 does not model**: the
+  guest kernel command line (`/proc/cmdline`) is world-readable inside the VM,
+  and it carried real secrets — `nucleus.approval_secret` (the symmetric HMAC
+  key, so any workload could *forge approvals*, an authority bypass) on every
+  pod, plus the AWS audit-sink credentials whenever an audit sink was
+  configured. Both are closed as of 2026-08-08: the AWS credentials ride the
+  workload API (`FETCH_AUDIT_CREDENTIALS`, served once before any workload
+  exists), and approvals are Ed25519 signatures the guest verifies against
+  the node's *public* key (`nucleus.approval_pubkeys`) — no shared secret
+  exists in the guest. The **task-token cmdline copy** and the dead Tier-3
+  **`nucleus.sandbox_token`** were then RETIRED (2026-08-08): the task token is
+  fetched over the workload API (`FETCH_TASK_TOKEN`), and the sandbox token was
+  verified with an `auth_secret` no shipped rootfs delivers
+  (`/etc/nucleus/auth.secret` is written only under `build-rootfs.sh
+  --legacy-secrets`), so it could never verify — a dead Secret on a
+  world-readable channel. `MaterialKind::TaskToken` stays `Secret` in the FM-5
+  model; rather than argue the cmdline copy harmless (an argument resting on
+  `session_mint` keeping the nonce host-pinned forever), it is deleted. **No pod
+  writes any per-pod material to `/proc/cmdline` now** — a categorical gate
+  (`no_pod_cmdline_carries_any_per_pod_secret`) proves it over the real boot
+  args for every identity outcome, and it is the Rust half of the Lean channel
+  theorem. This also realized the FM-4 snapshot payoff: a realistic
+  identity-bearing pod cmdline is `SafeToClone`. **The cmdline is now a MODELLED
+  channel** (`ChannelKind::Cmdline`, Aeneas-extracted): the flagship
+  `no_channel_delivers_secret_to_the_workload` covers it, and
+  `the_cmdline_delivers_no_secret_to_the_workload` states it by name — a `Secret`
+  re-appearing on the command line is now a RED theorem, not an unmodelled gap.
+  So the specific falsifier that demoted C1 is closed AND proved. **C1 is
+  re-promoted to PROVED** after a red-team walk of the four residual inbound
+  surfaces resolved each — two as declared exclusions, two closed fail-closed:
+  - **Bind-mounts (excluded).** Firecracker gives the guest virtio block
+    devices, not a shared host filesystem; the only bind-mounts are host-side
+    jailer-chroot plumbing the guest never sees as files. This is FM-5's existing
+    mount fence (`extracted/channel.rs`), not a new one.
+  - **`/etc/nucleus/*` (excluded).** The legacy secret files (`auth.secret`,
+    `approval.secret`) are written only under a `--legacy-secrets` build flag no
+    shipping path passes; `pod.yaml` is cred-split (no credential *values*); the
+    one runtime-written private key is mode-0600 and folds into the uid fence
+    below.
+  - **`/proc/<pid>/environ` (gap B — now closed).** The runtime holds every
+    per-pod secret in its own environment, and a same-uid workload reads it via
+    `/proc`. The uid fence was wired only under credentialed egress, so a
+    no-egress, no-uid pod ran the workload as the runtime's uid and was exposed.
+    Every workload now runs as a distinct unprivileged uid, never the runtime's
+    (`workload.rs`, `DEFAULT_WORKLOAD_UID`).
+  - **The `_ => OrdinaryData` classifier fallthrough (gap D — now closed).** An
+    unrecognised `NUCLEUS_*` name fell through to Public and was delivered, and
+    the dual-classifier corpus test could not catch it (both classifiers share
+    that default). Any unclassified reserved-namespace key is now refused at
+    admission (`workload.rs`, `PUBLIC_RESERVED`).
+
+  C1's **relation leg** is the Lean noninterference; its **conformance leg** —
+  that the shipping runtime actually withholds — is TESTED and gated by
+  `scripts/check-c1-inbound-fences.sh` (reverting fence B or D reds it). That
+  conformance leg is bounded by C7 ("a theorem about the code that ships"),
+  itself TESTED, so the row records the proven relation with the runtime
+  conformance gated beside it — the same shape as C4.
+- **C2 (NOT-YET — first mechanization landed 2026-08-11).** The design
+  (`docs/cross-pod-view.md`, after Nickel/OSDI-2018: the view relation is
+  *untrusted*, so a too-coarse relation fails the proof) is now a kernel-checked
+  two-run theorem for the first shared surface. `PodCrossView.lean` defines
+  `podView : PodId → HostState → Observation` verbatim from the design and proves
+  both unwinding conditions over `pods` — the only shared-mutable field mediated
+  by design (server-side lineage filter, #2199): *output-consistency*
+  (`output_consistency`, a pod's view is determined by its own lineage slice) and
+  *local-respect* (`local_respect`, another pod's write is excluded from the
+  view), with `cross_pod_noninterference` as the two-run payoff. It is non-vacuous
+  by four `decide`-checked witnesses — including the **coarse-relation-fails**
+  guardrail (dropping the lineage filter makes `local_respect` false, so a weaker
+  relation breaks the proof rather than silently passing). Clean axiom profile
+  (⊆ `[propext, Classical.choice, Quot.sound]`), gated by the proven-lean
+  workflow. **What keeps C2 NOT-YET:** (a) only `pods` of the 8 shared-mutable
+  fields is mechanized — the rest are not yet in-Lean (five are
+  availability/cardinality channels the sentence already excludes); (b) the two
+  fields that were excluded *because their code was defective* are now fixed —
+  the `lockdown_tx` broadcast leak (#2203, server-side filter) and the node-wide
+  identity socket handing out an arbitrary cert+key (#2204, retired) both landed —
+  so `lockdown_tx` and the identity registry can now **re-enter** the model in a
+  later increment (they are unblocked, not yet mechanized); (c) the model↔runtime
+  parity for the `pods` filter is **tied** — `caller_may_manage_matches_the_podview_lineage_filter`
+  pins the shipped listing/management predicate (`pod_api.rs`, live at #2199) to
+  the abstract `ownedBy` relation exhaustively; (d) the cross-pod isolation is now
+  tested **over the live request path** — `pod_b_cannot_observe_pod_a_across_the_auth_and_filter_path`
+  drives both functions a request traverses (auth `identify_caller` + filter
+  `caller_may_manage`) through the B-cannot-observe-A scenario, including the
+  forgery the auth exists to stop; (e) the lineage that filter reads is verified
+  on a **running node** — `scripts/cross-pod-lineage-check.sh` boots the real
+  `nucleus-node` (KVM-free local driver), creates two sibling pods and a child of
+  one through the real signed `POST /v1/pods`, and asserts the listing serves the
+  recorded `parent_pod_id` (child→parent; siblings top-level); (f) the **scoped
+  exclusion itself** is verified on a running node — `scripts/cross-pod-scoped-check.sh`
+  boots the real node, creates an orchestrator pod A and a non-lineage sibling B,
+  and drives A's tool-proxy `POST /v1/pod/list` presenting A's OWN node-minted
+  caller token: the node scopes the listing server-side (`caller_may_manage`) so
+  A sees A but **not** B — a strict subset of the operator view that sees both.
+  This runs KVM-free because a pod's caller token is
+  `derive_token(caller_secret, id)` whether delivered as a local-driver env var or
+  over the Firecracker vsock — its unforgeability rests on the node-only
+  `caller_secret`, not on the transport (correcting an earlier over-strong note
+  that this "needs a real Firecracker pod"). What remains: a **two-pod Firecracker
+  boot** exercising the same path with the token delivered over the real vsock
+  (transport + real-guest-origin fidelity, `quickstart-boot`); re-entering the
+  now-unblocked `lockdown_tx`/identity fields; and VM-level guest isolation (partly
+  covered by `net-guest-isolation-check.sh`). "Any other pod" is not yet earned end
+  to end — the substrate, first surface, filter parity, request-path isolation,
+  live-node lineage, and running-node scoped exclusion are in; the Firecracker
+  two-pod boot is not.
+- **C3 (PROVED)** — the two-run noninterference theorem over the reference pod
+  machine, whose step relation calls the extracted delivery oracle. Scope is
+  honest: a coarse monitor LTS with an opaque workload, labelled Phase 0.
+- **C4 (TESTED — promoted from NOT-YET 2026-08-10; held one notch below PROVED
+  while the live-release e2e is boot-gated).**
+  The clause names a specific live mechanism: a governor release via *a single-use
+  token*. Both legs now hold on the graph the shipping egress verdict reads — but
+  because the release's *shipping-path conformance* is a boot-gated end-to-end
+  (proven mechanism + unit-level flip over the real `FlowGraph` type + endpoint
+  wiring verified by inspection, not yet a running-pod HTTP e2e), the honest row
+  status is TESTED, not PROVED. It returns to PROVED when a `boot-a-real-pod` e2e
+  shows a `POST /v1/declassify` token flipping a live verdict for the committed
+  value and denying a substituted one.
+  * **Single-use, PROVED.** The absorbing `declass_step` machine (`no_second_apply`,
+    `single_use`) over the Aeneas-extracted decision core, enforced by the shared
+    one-shot burn ledger (`FlowGraph::release_burn_ledger`) and exercised at the
+    kernel API by `crates/portcullis/tests/kernel_token.rs` (mint → apply →
+    second-apply refused; a refusal never burns).
+  * **Live on the graph egress reads, PROVED-mechanism / TESTED-conformance.** The
+    demotion reason was that the proven token fired nowhere: `apply_declassification_token`
+    recorded its scope on the kernel's own `flow_graph`, which no request path
+    populated, so `POST /v1/declassify` returned `NodeNotFound` and the *actually*
+    live release was the unproven k-of-n memory path. That inversion is closed. The
+    apply is re-homed (`apply_declassification_token_on(&mut graph, token)`, #2235):
+    the endpoint (`nucleus-tool-proxy/src/declassify.rs`) locks `state.flow_graph`
+    — the graph egress reads — and lands the scope there, and egress honors per-node
+    scopes fail-closed. So a single-use token now **flips the egress verdict
+    Deny→Pass for exactly the committed value at exactly its signed sinks**, proven
+    on one graph by `crates/portcullis/tests/declassify_rehome_egress.rs#c4_flip_back_on_one_graph`,
+    with a boundary matrix that denies a substituted value (`ContentMismatch`), an
+    unsigned sink, a replay, a second secret node, and poison. The k-of-n mint now
+    feeds the *same* value-bound, sink-scoped, one-shot `DeclassScope` on that graph
+    (#2234), so there is one enforcement and two mint policies, not a proven-but-dead
+    path beside an unproven-but-live one.
+
+  **Honest caveat — which leg is TESTED.** The proven single-use/sink-scope theorems
+  and the value-bound apply→egress flip are exercised at the **unit level over the
+  real `FlowGraph` type** (the same type and API the endpoint uses), and the endpoint
+  wiring (`apply_declassification_token_on` on `state.flow_graph`) is asserted by
+  inspection in `scripts/check-declassify-value-bound.sh`. The full
+  **HTTP-`POST /v1/declassify`-against-a-running-pod e2e** — a real governor request
+  flipping a real tool-proxy egress verdict — is **boot-gated** (`boot-a-real-pod`,
+  requires `/dev/kvm`) and is the conformance leg, the same shape as C1's runtime
+  conformance. The falsifier `scripts/check-declassify-value-bound.sh` reds if the
+  value-binding is neutered OR the endpoint is re-pointed at the orphan kernel graph
+  (the exact #2235 regression), so the dead-mechanism inversion cannot return silently.
+- **C5 (PROVED — re-promoted 2026-08-10; had been demoted 2026-08-08).** The clause
+  is about the VALUE axis: an adversary controlling the inputs cannot steer *which*
+  value a governor release yields. This is now both **enforced** and **proven
+  relationally**, closing the sink-axis-only overclaim that demoted it (the old
+  citation `sink_outside_a_singleton_mask_denied` proves *where* data goes, not
+  *which value* is released).
+  * **Enforced (value-binding at apply).** The token carries a signed
+    `content_commitment: [u8; 32]` (SHA-256 of the exact authorized bytes, bound
+    into `canonical_bytes` at `canonical-v3`). Apply releases **only** for a node
+    whose monitor-recomputed ingest `content_hash` **equals** that commitment
+    (`FlowGraph::value_binding_ok`); a substituted value, an unbound (`[0u8;32]`)
+    commitment, or a node with no recorded hash is refused `ContentMismatch` —
+    fail-closed and **non-burning** (the token stays usable). The content hash is
+    a monitor-recorded fact (`observe_with_content_hash`, SHA-256 recomputed at
+    ingest, never an agent field), so the adversary cannot forge the equality.
+  * **Proven relationally (four-run robustness).** `four_run_value_robustness`
+    (`DeclassifySinkScopeExtracted.lean`) states that over the 2×2 grid of
+    attacker-controlled recorded content against one governor commitment, every run
+    releases **exactly the committed value or denies** — no attacker input releases
+    any other value. Sorry-free; `#print axioms = {propext}`. This is the value axis
+    of robust / non-malleable declassification (Sabelfeld–Sands; Cecchetti et al.,
+    CCS'17), which nucleus can reach because the proxy mediates every egress.
+
+  **Honest abstraction — the u64-tag / 32-byte nuance.** The extracted decision core
+  the theorem is stated over (`value_authorized`, in `EXTRACT_ROOTS`) models value
+  identity as a **u64 tag** and decides on **tag equality**. The runtime compares the
+  full **32-byte `ContentHash`**. The two are bound by the parity test
+  `crates/portcullis/tests/declassify_scope.rs#authorize_release_value_binding_matches_the_extracted_decision`
+  (equal bytes ⇔ equal tag; unequal ⇔ deny), so the relational theorem transfers to
+  the byte-level runtime decision **by tested parity**, not by a proof over 32-byte
+  arrays. That is the one gap between the proof and the shipped comparison, and it is
+  gated: the falsifier `scripts/check-declassify-value-bound.sh` runs both the
+  four-run test and the parity test, and reds if value-binding stops refusing a
+  substituted value.
+- **C6 (TESTED — promoted from NOT-YET 2026-08-11; complete-mediation Phases 1–3).** Five
+  legs now hold. (a) *Tier-A total mediation is a theorem:* over the closed
+  `SinkClass`/`Operation` enum, `no_sink_reachable_without_discharge`
+  (`MediationScopeExtracted.lean`, Aeneas-extracted, `sorry`-free, axioms ⊆
+  `[propext, Classical.choice, Quot.sound]`) proves no consequential sink is
+  reachable from idle without discharging an `Authority`; a new sink forces a
+  match arm (#2241). (b) *The effect boundary is enforced, not advisory:* the
+  `mediated` dylint pass runs enforcing-at-zero over the sealed effect home
+  `portcullis-effects` — counted by report count, not exit status, with a
+  reds-on-revert self-test (`scripts/check-mediation-dylint.sh`, #2244). (c)
+  *The transport/egress surface now has a unified, gated inventory:*
+  `docs/architecture/mediated-set.md` enumerates every outbound channel against
+  the closed `EgressChannel` enum, and `documented_inventory_equals_the_enum`
+  reds if the table and enum disagree on the key set or a channel's status
+  (Phase 0). The three Tier-B surfaces that kept this NOT-YET are now closed:
+  (d) *Phase 2* — the netns default-deny backstop for in-shell / raw-socket egress
+  (channels 5, 10) is **proven applied on boot** by the in-guest egress probe
+  (`scripts/check-egress-probe.sh`, x86_64 boot gate: an off-allowlist connect
+  from inside the live guest returns `ENETUNREACH`; #2246); (e) *Phase 3* — the
+  `effects()` escape hatch (channel 12, #1248) is closed (`unmediated_effects`
+  requires an opt-in token + strictest-sink discharge + `FlowTracker` observe,
+  fail-closed tested), and the `partial` transport channels (7, 8) rest on tested
+  structural refusals (host-CID pin `only_the_host_cid_is_accepted`, broker refusal
+  by absence). The inventory now carries **no open hole** —
+  `no_channel_is_an_open_hole` asserts it, the machine meaning of "every".
+  **TESTED, not PROVED:** "every" here is a *union* of tested properties plus one
+  theorem, not a single proof. The Tier-A theorem covers only the effect-API
+  surface (channels 1–4); the in-shell/raw-socket backstop (5, 10) rests on
+  "iptables applies the rules", which is TESTED-on-boot with the kernel in the TCB,
+  not proven; the partial transport channels (7, 8) rest on tested structural
+  refusals; and channel 12's audit-DAG granularity is coarse (one node per grant).
+  The falsifier is `scripts/check-egress-probe.sh` — it reds if the live-path
+  backstop stops confining egress; `no_channel_is_an_open_hole` reds if any channel
+  regresses to an open hole. Re-earning toward PROVED would need the network
+  backstop proven (not tested) applied and the theorem extended past the API
+  surface.
+- **C7 (TESTED — unchanged 2026-08-10; the declassify gap narrowed but C7 is
+  broader).** The theorems are about a scalar-only extracted restatement of the
+  enforcement predicates, re-extracted from the current Rust on every proof-workflow
+  run and bound to production by exhaustive parity tests and the boot-gate
+  conformance replay. The declassification arc (#2227–#2236) *narrowed* this gap for
+  its own slice — the declassify decision core (`value_authorized`) is now in
+  `EXTRACT_ROOTS`, so the proofs describe the graph the live egress actually reads,
+  and the u64-tag↔32-byte binding is parity-tested — but that does not promote C7,
+  which is the broader whole-slice↔shipped-code correspondence. The surrounding
+  kernel, classifier, and spawn path are still covered by tests and lints, not by
+  the theorem; and even the declassify slice's byte-level runtime comparison
+  transfers to the proof by *tested* parity, not by proof. C7 stays TESTED.
+- **C8 (TESTED — promoted from NOT-YET 2026-08-11).** Two gaps closed. (a) The
+  proof workflow's trigger was an *allowlist* of the extracted Lean files that
+  missed the production types the parity tests bind against (`IFCLabel`,
+  `SinkClass`, `ConfLevel` in `ifc_ops.rs`/`lib.rs`); it now triggers on the
+  whole `crates/nucleus-ifc-kernel/**` domain (derived, not enumerated), so a
+  change to the enforcement the theorems mirror re-extracts + re-parity-tests +
+  re-proves. (b) Nothing checked that the extracted predicates are still *wired*
+  into the live path — a theorem about a function nobody calls is a proof about
+  dead code. `scripts/check-extracted-callsites.sh` (required, runs every PR via
+  `ci.yml`) now asserts each manifest-covered predicate has a live production
+  call site (production region, test blocks excluded); it reds if the call site
+  is deleted. Every extracted family is accounted for (a call-site audit confirmed
+  none is proven-but-silently-unwired): the **wired** ones carry a live anchor —
+  identity delivery (`ident_may_deliver`, a direct call to the extracted
+  predicate), mediation (`classify_sink` for `sinkcode`, and `authorizes` — the
+  effect-gate `require_scope` — for `scope_admits`), declassify
+  (`authorize_release`), egress (`egress_chain`), and the capability lattice
+  (`CapabilityLevel`'s ordering, used live in the trifecta classifier for
+  `capleq`); the genuinely **structural** ones carry their construction anchor —
+  `channel_admits` (C1's no-secret-channel / distinct-uid fence) and
+  `cred_may_deliver` (the broker builds its store from the node env, never the
+  guest spec, so a Secret credential never reaches the Guest sink by
+  construction). **Ceiling:** these two are proof-only *by design* — there is no
+  runtime predicate call to check, so the gate anchors the construction instead;
+  and the base flows-to relations (`iflows_to`/`cflows_to`) are exercised
+  transitively by the decision predicates. TESTED, not PROVED: the correspondence
+  is a build-system + grep-gate check, not a proof.
+- **C9 (NOT-YET — demoted 2026-08-08, was TESTED; Inc 1 landed 2026-08-11).**
+  Increment 1 wired the first end-to-end vertical, but the leg is not yet fully
+  earned. **What now holds (node-signed *software* launch attestation):** the
+  producer no longer discards the attested cert — `fetch_attested_certificate`
+  caches it (`SecretManager::cache_certificate`) so the served `FETCH_SVID`
+  fast-path (`manager.fetch_certificate`) returns the cert carrying the
+  measurement, and `SelfSignedCa::sign_attested_csr` really does embed the DICE
+  extension (the prior note's "no CA implements `sign_attested_csr`" and
+  "`#[allow(dead_code)]`/discarded" facts are now false for the shipping path). A
+  **shipped relying party** exists — `nucleus_identity::verify_attested_svid`
+  (extract `LaunchAttestation` from the leaf, check against
+  `AttestationRequirements`) with a production CLI caller `nucleus
+  verify-attestation`. The teeth are exercised over the real serve path:
+  `identity::tests::attested_svid_is_served_and_verifier_reds_on_drift_and_absent`
+  proves (i) correct measurement verifies (non-vacuous), (ii) one byte of drift
+  reds, (iii) an absent extension fails closed under `require_attestation`;
+  `cli_verifies_attested_and_reds_on_drift_and_absent` proves the same through
+  the CLI entrypoint. **Trust boundary (why still NOT-YET, not overclaim):** the
+  measurement is the node's own SHA-256 of the kernel+rootfs it launched, signed
+  by the node's CA key — there is **no hardware root** (no TPM/SEV-SNP/TDX quote,
+  no UDS-in-ROM DICE identity), so the guarantee is conditional on trusting the
+  node key; a compromised node can sign any measurement. **Remaining for TESTED:**
+  (a) the verifier must run on a *live request/admission* path (peer mTLS gate /
+  node admission, fail-closed), not only a CLI self-check — the tool-proxy
+  `sandbox_proof.rs` verifier is still dead; (b) the served-attestation path is
+  exercised on the Firecracker driver only (a local-driver pod has no VM image to
+  measure) and the round-trip test drives the real cache→serve fast-path minus the
+  UDS transport; (c) signed provenance binding the artifact digest to the theorem
+  set (in-toto-style: subject = rootfs/kernel digest, predicate = ledger commit);
+  (d) the hardware-root gap named above. The adjacent real thing remains
+  `admit_posture` (self-measured rootfs digest, fail-closed,
+  `admit_posture_one_byte_of_drift_reds_the_gate`) — same TCB boundary, now also
+  exposed to an *outside* verifier. Note: OID PEN 57212 is an unregistered
+  placeholder; register it before any external-interop claim.
+
+The cross-pod leg is the open one, and it is deliberately sequenced audit-first:
+a lookup keyed on something a guest can forge is a far likelier defect than a
+flaw in the label lattice, and a real finding there is worth more than a theorem.
+Per-caller identity at the node API is the enabling step — until the node can
+tell *which* pod is calling, no cross-pod property is even statable, because the
+system cannot assign a secret to a pod any more than the model can.
+
 ### Theoretical Foundation
 
 This claim rests on the **capability safety theorem**: in an object-capability
@@ -49,27 +433,41 @@ The math core is small and sharp:
 3. **Trace semantics** (time) — ordered record of actions, authority, and exposure
    at each step. Free monoid with homomorphic exposure accumulation.
 
-4. **Monotonicity** (ratchet) — authority can only stay the same or tighten.
-   Budget can only decrease. Exposure can only increase. The nucleus operator ν is
-   idempotent and deflationary.
+4. **Monotonicity** (ratchet) — authority can only stay the same or tighten
+   **under the workload's own action**. Budget can only decrease. Exposure can
+   only increase. The nucleus operator ν is idempotent and deflationary.
+   The one widening is `POST /v1/escalate`, and it is not the workload's to
+   take: it requires a separate approver's authority (mTLS identity + a valid
+   trace chain), and the granted authority is intersected with the delegation
+   ceiling (`cert_bridge.rs`, `effective.leq(verified.effective)`), so it can
+   never exceed what was delegated. So the flagship's "can only tighten" holds
+   for the agent (the corollary "no talking your way into more permissions
+   mid-run" is exact), and an approver-authorized widening stays bounded by the
+   ceiling — it is a move within the lattice, not above it.
 
 Key design choice: **prove properties about the enforcement boundary**, not
 about LLM behavior. The agent is a black box. The kernel is the TCB.
 
-**Current state (March 2026):** 297 Verus proofs verified in CI covering
-lattice laws, uninhabitable state operator, Heyting algebra, modal operators (S4), exposure
-monoid, graded monad laws, Galois connections, fail-closed auth boundary,
-capability coverage theorem, budget monotonicity, and delegation ceiling
-theorem. Phase 0-2 partially complete.
+**Current state:** 113 Kani harnesses + ~277 Lean 4 theorems verify the security
+core in CI, covering lattice laws, uninhabitable state operator, Heyting algebra,
+modal operators (S4), exposure monoid, graded monad laws, Galois connections,
+fail-closed auth boundary, capability coverage theorem, budget monotonicity, and
+delegation ceiling theorem. (Verus was evaluated and removed; verification
+consolidated on Lean 4 + Kani — see the README verification table.) Phase 0-2
+partially complete.
 
 ### Pillar B — Formal Methods as a Product Feature
 
 Proofs are first-class artifacts, not academic exercises:
 
-- **Verus SMT proofs** — machine-checked invariants for the Rust kernel,
-  erased at compile time (zero runtime overhead). CI-gated minimum: 297 proofs.
-- **Lean 4 model** (planned) — deeper mathematical reasoning via Aeneas
-  translation and Mathlib connections.
+- **Kani bounded model checking** — 113 machine-checked harnesses over the Rust
+  kernel's decision logic; complete over the finite lattice state space. CI-gated
+  via `kani-nightly.yml`.
+- **Lean 4 model** — ~277 kernel-checked theorems for the security core (capability
+  Heyting algebra, IFC semilattice, taint monotonicity, exposure monoid,
+  delegation); the Aeneas pipeline mechanically translates the core capability
+  types from Rust to Lean so proofs run over generated code. CI-gated via
+  `lean-build.yml` / `aeneas-ifc-scoped.yml`.
 - **Differential testing** (planned) — Cedar pattern: millions of random inputs
   compared between Rust engine and Lean model.
 - **Public Verified Claims page** — each claim maps to a proof artifact and
@@ -203,20 +601,20 @@ or panics. No fail-open. No silent degradation.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Verified Core (Verus)              ~10-15K LOC     │
-│  ├── portcullis lattice engine     297 proofs       │
+│  Verified Core (Lean 4 + Kani)      ~10-15K LOC     │
+│  ├── portcullis lattice engine     113 Kani proofs  │
 │  ├── exposure guard + uninhabitable state        proven monotone  │
 │  ├── permission enforcement        fail-closed      │
 │  └── sandbox boundary              proven panics    │
 ├─────────────────────────────────────────────────────┤
-│  Formal Model (Lean 4 via Aeneas)  planned          │
-│  ├── lattice algebra               Mathlib links    │
-│  ├── Heyting adjunction            Lean 4 proofs    │
-│  └── graded monad laws             Lean 4 proofs    │
+│  Formal Model (Lean 4, hand-written) partial         │
+│  ├── CapabilityLevel HeytingAlgebra Lean 4 proofs   │
+│  ├── Aeneas pipeline (core types)  in progress      │
+│  └── graded monad laws             planned          │
 ├─────────────────────────────────────────────────────┤
 │  Differential Testing              planned          │
 │  ├── Rust engine vs Lean model     cargo fuzz       │
-│  └── AutoVerus proof generation    CI-gated         │
+│  └── Lean/Kani proof ratchet       CI-gated         │
 ├─────────────────────────────────────────────────────┤
 │  Runtime (standard Rust)           ~70K LOC         │
 │  ├── gRPC, tokio, tonic            Kani checks      │
@@ -287,9 +685,9 @@ or panics. No fail-open. No silent degradation.
 
 Each rung is shippable independently.
 
-### Rung 1 — Verus SMT Proofs (in progress)
+### Rung 1 — Kani + Lean Proofs (in progress)
 
-- 297 proofs verified in CI (minimum gate)
+- 113 Kani harnesses + ~277 Lean theorems verified in CI (minimum gate)
 - Covers: lattice laws, uninhabitable state operator, Heyting algebra, S4 modal
   operators, exposure monoid, graded monad laws, Galois connections, fail-closed
   auth, capability coverage, budget monotonicity, delegation ceiling
@@ -297,12 +695,15 @@ Each rung is shippable independently.
   counterexample — uninhabitable state fires for y but not x). This was discovered by
   the proofs, not by tests. The proofs are working.
 
-### Rung 2 — Lean 4 Model (planned, Phase 1)
+### Rung 2 — Lean 4 Model (partial)
 
-- Translate portcullis to Lean 4 via Aeneas
-- Link to Mathlib for established algebraic structures
-- Deeper reasoning: induction over recursive structures, higher-order
-  properties that SMT solvers struggle with
+- **Done**: hand-written kernel-checked proof of `CapabilityLevel` as a
+  `HeytingAlgebra` (Mathlib-linked, 27-case `decide`). Discriminant
+  correspondence enforced by `lean_tonat_matches_rust_discriminants` CI test.
+  Kani R1/R2/R3 harnesses bridge the Lean proofs to bounded model checking.
+- **Planned**: Aeneas/Charon pipeline translation (Rust MIR → LLBC → Lean)
+  for the full portcullis crate; Mathlib links for broader algebraic structures;
+  graded monad laws in Lean 4.
 
 ### Rung 3 — Differential Testing (planned, Phase 3)
 
@@ -359,7 +760,7 @@ The exposure lattice has a concrete day-one demo: supply chain safety.
 - Public "Verified Claims" matrix:
   - Claim → Proof artifact → Code hash
 - CI fails if a change violates the proven model
-- Verus proof count is monotonically non-decreasing (ratchet on proof count)
+- Proof count (Kani harnesses + Lean theorems) is monotonically non-decreasing (ratchet)
 
 ### Performance
 

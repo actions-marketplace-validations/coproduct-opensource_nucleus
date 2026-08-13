@@ -50,7 +50,7 @@
 //! assert!(safe.requires_approval(Operation::GitPush));
 //! ```
 //!
-//! ## Integration with Claude Code / OpenClaw
+//! ## Integration with AI agent frameworks
 //!
 //! See the `examples/` directory for integration patterns with popular AI agent frameworks.
 //!
@@ -85,35 +85,75 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+pub mod action_term;
 pub mod audit;
 #[cfg(feature = "serde")]
 pub mod audit_backend;
 mod budget;
 mod capability;
-#[cfg(feature = "crypto")]
+#[cfg(feature = "cedar")]
+pub mod cedar_bridge;
+// Always compiled: the certificate DATA types (LatticeCertificate, SinkScope,
+// VerifiedPermissions, …) and non-crypto logic are ring-free; only the
+// sign/verify/mint/delegate fns inside are `#[cfg(feature = "crypto")]`-gated
+// (ring can't compile to WASM). The kernel needs the types, not the signing.
 pub mod certificate;
 mod command;
 pub mod constraint;
+pub mod trace_monitor;
 pub mod uninhabitable_state;
 
+/// Attenuation tokens — compact delegation credentials for wire transport.
+///
+/// Requires the `serde` feature for serialization.
+/// The EU AI Act Article 12 decision-record type and its canonical preimage —
+/// shared by the tool-proxy that writes records and the audit tool that
+/// verifies them, so there is exactly one definition.
+///
+/// Gated on `serde`: a decision record exists to be serialized into a
+/// tamper-evident log and read back by a third-party verifier, so the type is
+/// meaningless without it. Both consumers (`nucleus-tool-proxy`,
+/// `nucleus-audit`) enable the feature.
+#[cfg(feature = "serde")]
+pub mod art12_record;
+// Mediation receipt: a portable proof of one agent↔tool crossing (crypto-gated).
+/// Kernel decision engine — complete mediation with monotone session state.
 pub mod delegation;
 pub mod dropout;
+/// Bash command egress analysis — detect network exfiltration.
+pub mod egress;
+/// Egress policy — host pattern matching for outbound traffic control.
+///
+/// Types and enforcement are always compiled. TOML loading methods
+/// (`load_from_dir`, `from_toml`) require the `spec` feature.
+pub mod egress_extract;
+pub mod egress_policy;
 pub mod escalation;
 pub mod exposure_core;
+pub mod flow_graph;
 pub mod frame;
 pub mod galois;
+/// Gate classification — which KIND of control decided an operation
+/// (hard gate / soft gate / none), for EU AI Act Article 12 decision records.
+pub mod gate_class;
 pub mod graded;
 pub mod guard;
 pub mod heyting;
-/// Kernel decision engine — complete mediation with monotone session state.
-#[cfg(all(feature = "serde", feature = "crypto"))]
+/// Verified hook adapter — pure decision pipeline for agent tool-call hooks.
+pub mod hook_adapter;
 pub mod kernel;
+/// Manifest behavioral enforcement — detect lying manifests post-execution.
+pub mod manifest_enforcement;
 /// MCP mediation: classify and gate arbitrary MCP tool calls against the
 /// permission lattice with exposure tracking.
 ///
 /// Requires the `spec` feature (includes `serde`, `serde_yaml`, `toml`).
 #[cfg(feature = "spec")]
+pub mod manifest_registry;
+#[cfg(feature = "spec")]
 pub mod mcp_mediation;
+#[cfg(feature = "crypto")]
+pub mod mediation_receipt;
 /// Progressive discovery: observe agent behavior and generate minimal policies.
 ///
 /// Requires the `spec` feature (includes `serde`, `serde_yaml`, `toml`).
@@ -123,15 +163,34 @@ pub mod observe;
 ///
 /// Requires the `spec` feature (includes `serde`, `cel`, `serde_yaml`, `toml`).
 #[cfg(feature = "spec")]
+pub mod policy;
+#[cfg(feature = "spec")]
 pub mod profile;
+/// Append-only receipt chain with hash-chain integrity enforcement.
+pub mod receipt_chain;
+#[cfg(feature = "crypto")]
+pub mod receipt_sign;
+/// DLC-D verified admission — cryptographic, proof-carrying admission conjunct
+/// (feature `dlc`); consulted by the kernel, composable as a `PolicyCheck`.
+#[cfg(feature = "dlc")]
+pub mod says_admission;
+#[cfg(feature = "crypto")]
+pub use receipt_sign::{receipt_hash, sign_receipt, verify_receipt};
 #[cfg(feature = "remote-audit")]
 pub mod s3_audit_backend;
-/// Attenuation tokens — compact delegation credentials for wire transport.
-///
-/// Requires the `serde` feature for serialization.
-#[cfg(feature = "crypto")]
 pub mod token;
+#[cfg(feature = "crypto")]
+/// Ed25519 signing and verification for declassification tokens.
+pub mod token_sign;
+/// MCP tool schema pinning: rug-pull detection for MCP servers.
+///
+/// Stores SHA-256 hashes of approved tool schemas and detects silent
+/// mutations post-approval.
+pub mod tool_schema;
 
+pub mod closure;
+pub mod enforcement;
+pub mod fabric;
 pub mod identity;
 pub mod intent;
 pub mod isolation;
@@ -142,9 +201,11 @@ mod path;
 pub mod permissive;
 pub mod pipeline;
 pub mod progress;
+pub mod quantale;
 pub mod region;
 mod time;
 pub mod trust;
+pub mod verdict_sink;
 pub mod weakening;
 pub mod workspace;
 
@@ -153,8 +214,8 @@ mod kani;
 
 pub use budget::BudgetLattice;
 pub use capability::{
-    CapabilityLattice, CapabilityLevel, ExtensionOperation, IncompatibilityConstraint, Obligations,
-    Operation, StateRisk,
+    default_sink_class, CapabilityLattice, CapabilityLevel, ExtensionOperation,
+    IncompatibilityConstraint, Obligations, Operation, OperationParseError, SinkClass, StateRisk,
 };
 pub use command::{ArgPattern, CommandLattice, CommandPattern};
 pub use exposure_core::{apply_record, classify_operation, project_exposure, should_deny};
@@ -204,28 +265,130 @@ pub use pipeline::{
 };
 
 // Re-export key audit and metrics types
+pub use action_term::{
+    preflight_action, ActionInput, ActionTerm, CapabilityRequest, EffectDisposition,
+    ObligationFailure, PreflightContext, PreflightResult, PreflightVerdict, PrimitiveAction,
+    ProofObligation, ProposedEffect, TaskRef,
+};
 pub use audit::{
     AuditEntry, AuditLog, ChainVerificationError, IdentityAuditSummary, PermissionEvent,
     RetentionPolicy,
 };
-#[cfg(feature = "crypto")]
 pub use certificate::{
-    canonical_permissions_hash, verify_certificate, CertificateDelegationError, CertificateError,
-    LatticeCertificate, VerifiedPermissions,
+    canonical_permissions_hash, CertificateDelegationError, CertificateError, LatticeCertificate,
+    SinkScope, VerifiedPermissions,
 };
+// `verify_certificate` performs Ed25519 verification via `ring` → crypto-only.
+#[cfg(feature = "crypto")]
+pub use certificate::verify_certificate;
 pub use delegation::{
     meet_with_justification, DelegationChain, DelegationLink, MeetJustification, RestrictionDetail,
     RestrictionReason,
 };
+pub use egress_extract::{extract_egress_destinations, EgressDestination};
+pub use egress_policy::{EgressPolicy, EgressPolicyError, EgressVerdict, HostPattern};
 pub use metrics::{
     build_deviation_report, DeviationDetail, DeviationReport, InMemoryMetrics, MetricEvent,
     MetricsCollector, MetricsReport, ReputationMetrics, ReputationWeights,
 };
-#[cfg(feature = "crypto")]
+#[cfg(feature = "serde")]
+pub use portcullis_core::policy_rules::PolicyLoadError;
+pub use portcullis_core::policy_rules::{
+    AdmissibilityRule, LabelPredicate, PolicyEvaluation, PolicyRuleSet, RuleVerdict,
+};
+#[cfg(feature = "serde")]
+pub use receipt_chain::verify_exported_chain;
+pub use receipt_chain::{
+    ChainAppendError, ChainVerifyError, ReceiptChain, VerdictReceipt, VerifyReport,
+};
+#[cfg(feature = "serde")]
 pub use token::{AttenuationToken, SessionProvenance, TokenError};
+pub use tool_schema::{ApprovedToolSchema, SchemaError, ToolSchemaRegistry};
 pub use uninhabitable_state::{ConstraintNucleus, CoreExposureRequirement, UninhabitableState};
+pub use verdict_sink::{ActorIdentity, SinkError, VerdictContext, VerdictOutcome, VerdictSink};
+
+// Re-export envelope and witness types from portcullis-core (envelope feature)
+pub use portcullis_core::envelope::{FieldEnvelope, RowEnvelope, SourceRef, TransformRef};
+pub use portcullis_core::witness::{ChainVerifyError as WitnessChainVerifyError, WitnessBundle};
+
+// Re-export the information-flow tracker so downstream runtimes (e.g. the MCP
+// server in nucleus-tool-proxy) can drive `Kernel::decide_term_with_flow`
+// without depending on portcullis-core directly (#1633).
+/// The kernel's flow module, re-exported so a downstream runtime can build a
+/// `ZkFlowInput` from a live `FlowTracker` without taking a direct
+/// portcullis-core dependency — the same reason `FlowTracker` is re-exported
+/// above.
+pub use portcullis_core::declassify;
+pub use portcullis_core::flow;
+pub use portcullis_core::flow::NodeKind;
+pub use portcullis_core::ifc_api::{FlowTracker, SafetyCheck};
 
 /// Check if a glob pattern matches a path.
 pub fn glob_match(pattern: &str, path: &str) -> bool {
     path::glob_match(pattern, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use portcullis_core::{effect::EffectKind, DerivationClass, IFCLabel};
+
+    /// Proves that FieldEnvelope, RowEnvelope, and WitnessBundle are
+    /// accessible from the portcullis crate (issue #781).
+    #[test]
+    fn envelope_types_are_accessible() {
+        let field = FieldEnvelope {
+            value_bytes: b"hello".to_vec(),
+            schema_type: "string".into(),
+            label: IFCLabel::default(),
+            derivation_class: DerivationClass::Deterministic,
+            effect_kind: EffectKind::PureTransform,
+            source_node_id: 1,
+            causal_parents: vec![],
+            source_refs: vec![],
+            transform_refs: vec![],
+            witness_bundle_id: None,
+            promoted_by: None,
+            promoted_reason: None,
+            created_at: 1_700_000_000,
+            content_hash: [0u8; 32],
+        };
+
+        // Verify content hash computation works (requires sha2 via envelope feature)
+        let hash = field.compute_content_hash();
+        assert_ne!(hash, [0u8; 32], "SHA-256 of 'hello' should not be zero");
+        assert!(
+            !field.verify_content_hash(),
+            "stored zero-hash should not match"
+        );
+
+        // RowEnvelope is constructible
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("f1".into(), field);
+        let row = RowEnvelope::new(
+            "row-1".into(),
+            "test_table".into(),
+            fields,
+            None,
+            "v1".into(),
+            1_700_000_000,
+        );
+        assert_eq!(row.fields.len(), 1);
+
+        // WitnessBundle is constructible
+        let wb = WitnessBundle {
+            witness_id: "wb-1".into(),
+            input_blobs: vec![],
+            parser_chain: vec![],
+            transform_chain: vec![],
+            validation_results: vec![],
+            final_output_hash: [0u8; 32],
+            signature: None,
+            created_at: 1_700_000_000,
+            field_witnesses: std::collections::BTreeMap::new(),
+            zkvm_receipt: None,
+        };
+        let digest = wb.compute_digest();
+        assert_eq!(digest.len(), 32);
+    }
 }

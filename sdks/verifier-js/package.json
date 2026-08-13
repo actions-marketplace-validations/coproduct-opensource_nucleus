@@ -1,0 +1,53 @@
+{
+  "name": "@coproduct_inc/verifier-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Public open-source WASM envelope verifier + recompute/creditworthiness bindings. NOT published standalone — this is the build source behind the live verifier-service /quickstart, and its capabilities are folded into the published @coproduct_inc/verify. (Was @coproduct/verify, an unowned npm scope.)",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/coproduct-opensource/nucleus",
+    "directory": "sdks/verifier-js"
+  },
+  "keywords": [
+    "verify",
+    "provenance",
+    "attestation",
+    "tamper-evident",
+    "merkle",
+    "ed25519",
+    "agent",
+    "wasm",
+    "nucleus"
+  ],
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "main": "./index.js",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "pkg/nucleus_verifier_wasm.js",
+    "pkg/nucleus_verifier_wasm.d.ts",
+    "pkg/nucleus_verifier_wasm_bg.wasm",
+    "pkg/nucleus_verifier_wasm_bg.wasm.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "build:wasm": "wasm-pack build --target web --release",
+    "test": "node --test test/*.test.mjs",
+    "test:smoke": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

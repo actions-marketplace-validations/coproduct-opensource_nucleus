@@ -1,13 +1,13 @@
-//! Shell command - Launch interactive Claude Code with nucleus security context
+//! Shell command - Launch an interactive agent session with nucleus security context
 //!
 //! Spawns nucleus-tool-proxy and nucleus-mcp as the security boundary,
-//! then launches `claude` in interactive mode with only sandboxed tools
+//! then launches the agent CLI in interactive mode with only sandboxed tools
 //! visible. All tool calls flow through the permission lattice.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use nucleus_spec::{CredentialsSpec, PodSpec as SpecPodSpec, PodSpecInner, PolicySpec};
-use portcullis::{BudgetLattice, PermissionLattice};
+use portcullis::PermissionLattice;
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -21,9 +21,9 @@ use uuid::Uuid;
 use crate::profiles;
 use crate::run::{build_mcp_allowed_tools, write_mcp_config, McpEnvConfig};
 
-/// Launch interactive Claude Code with nucleus as the security context.
+/// Launch an interactive agent session with nucleus as the security context.
 ///
-/// All built-in Claude tools are replaced by sandboxed equivalents that
+/// All built-in agent tools are replaced by sandboxed equivalents that
 /// flow through the nucleus permission lattice. The tool-proxy enforces
 /// capabilities, budget, command restrictions, and exposure tracking.
 #[derive(Args, Debug)]
@@ -70,17 +70,17 @@ pub struct ShellArgs {
     pub kernel_trace: Option<PathBuf>,
 
     /// Run a single prompt non-interactively instead of launching an interactive session.
-    /// Output is printed to stdout as JSON. No TTY required — works from within Claude Code.
+    /// Output is printed to stdout as JSON. No TTY required — works from within an agent session.
     #[arg(short = 'P', long)]
     pub prompt: Option<String>,
 
-    /// Print the MCP config and exit (useful for manual claude invocation)
+    /// Print the MCP config and exit (useful for manual agent-CLI invocation)
     #[arg(long)]
     pub print_config: bool,
 
-    /// Additional arguments to pass to claude
+    /// Additional arguments to pass to the agent CLI
     #[arg(last = true)]
-    pub claude_args: Vec<String>,
+    pub agent_args: Vec<String>,
 }
 
 /// Execute the shell command
@@ -100,17 +100,10 @@ pub async fn execute(args: ShellArgs) -> Result<()> {
     };
 
     // Override budget if specified
-    let policy = if let Some(max_cost) = args.max_cost {
-        PermissionLattice {
-            budget: BudgetLattice {
-                max_cost_usd: Decimal::try_from(max_cost).unwrap_or(Decimal::from(5)),
-                ..policy.budget
-            },
-            ..policy
-        }
-    } else {
-        policy
-    };
+    let mut policy = policy;
+    if let Some(max_cost) = args.max_cost {
+        policy.budget.max_cost_usd = Decimal::try_from(max_cost).unwrap_or(Decimal::from(5));
+    }
     let policy = policy.normalize();
 
     let run_id = Uuid::new_v4();
@@ -208,11 +201,13 @@ pub async fn execute(args: ShellArgs) -> Result<()> {
         println!();
         println!("Allowed tools: {}", allowed_tools.join(","));
         println!();
-        println!("Launch claude with:");
+        println!("Launch the agent CLI with:");
         println!(
-            "  claude --mcp-config {} --allowedTools {} --disallowedTools Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Agent",
+            "  {} --mcp-config {} --allowedTools {} --disallowedTools {}",
+            crate::constants::AGENT_CLI_BIN,
             mcp_config_path.display(),
-            allowed_tools.join(",")
+            allowed_tools.join(","),
+            crate::constants::DISALLOWED_BUILTIN_TOOLS,
         );
         println!();
         println!("Tool-proxy: {proxy_url}");
@@ -220,7 +215,7 @@ pub async fn execute(args: ShellArgs) -> Result<()> {
         if let Some(ref trace_path) = args.kernel_trace {
             println!("Kernel trace: {}", trace_path.display());
         }
-        // Keep proxy alive - user will launch claude manually
+        // Keep proxy alive - user will launch the agent CLI manually
         println!("\nProxy running. Press Ctrl+C to stop.");
         tokio::signal::ctrl_c().await?;
         let _ = proxy_child.kill().await;
@@ -246,22 +241,23 @@ pub async fn execute(args: ShellArgs) -> Result<()> {
     }
     eprintln!();
 
-    // Launch claude with nucleus MCP tools.
+    // Launch the agent CLI with nucleus MCP tools.
     //
     // --allowedTools: only nucleus MCP tools are auto-approved
-    // --disallowedTools: explicitly block built-in tools so Claude doesn't
+    // --disallowedTools: explicitly block built-in tools so the agent doesn't
     //   attempt to use them (they'd fail anyway, but this prevents wasted tokens
     //   on tool definitions and failed invocations).
     //
-    // CLAUDECODE env var must be removed to allow launching claude from within
-    // an existing Claude Code session (e.g. testing nucleus shell from claude).
-    let mut cmd = Command::new("claude");
+    // The agent CLI's session env var (intrinsic interop: `CLAUDECODE`) must be
+    // removed to allow launching the agent CLI from within an existing agent
+    // session (e.g. testing nucleus shell from inside one).
+    let mut cmd = Command::new(crate::constants::AGENT_CLI_BIN);
     cmd.arg("--mcp-config")
         .arg(&mcp_config_path)
         .arg("--allowedTools")
         .arg(allowed_tools.join(","))
         .arg("--disallowedTools")
-        .arg("Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Agent")
+        .arg(crate::constants::DISALLOWED_BUILTIN_TOOLS)
         .env_remove("CLAUDECODE")
         .current_dir(&work_dir);
 
@@ -270,8 +266,8 @@ pub async fn execute(args: ShellArgs) -> Result<()> {
         cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
     }
 
-    // Pass through any additional claude args
-    for arg in &args.claude_args {
+    // Pass through any additional agent-CLI args
+    for arg in &args.agent_args {
         cmd.arg(arg);
     }
 
@@ -280,7 +276,7 @@ pub async fn execute(args: ShellArgs) -> Result<()> {
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
-        .context("failed to spawn claude")?;
+        .with_context(|| format!("failed to spawn {}", crate::constants::AGENT_CLI_BIN))?;
 
     // Kill tool-proxy
     let _ = proxy_child.kill().await;
@@ -294,7 +290,11 @@ pub async fn execute(args: ShellArgs) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        bail!("claude exited with code {:?}", status.code())
+        bail!(
+            "{} exited with code {:?}",
+            crate::constants::AGENT_CLI_BIN,
+            status.code()
+        )
     }
 }
 
@@ -318,7 +318,10 @@ fn build_shell_pod_spec(
     let credentials = if env.is_empty() {
         None
     } else {
-        Some(CredentialsSpec { env })
+        Some(CredentialsSpec {
+            env,
+            ..Default::default()
+        })
     };
 
     Ok(SpecPodSpec::new(PodSpecInner {
@@ -331,6 +334,8 @@ fn build_shell_pod_spec(
         resources: None,
         network: None,
         image: None,
+        credentialed_egress: Vec::new(),
+        workload: None,
         vsock: None,
         seccomp: None,
         cgroup: None,

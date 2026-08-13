@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // #1216 exempt: TLS cert loading at startup
 //! Cryptographic sandbox proof verification.
 //!
 //! Tool-proxy refuses to start unless it can cryptographically prove it's
@@ -429,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_expired_token_rejected() {
-        use hmac::Mac;
+        use hmac::{digest::KeyInit, Mac};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let secret = b"test-secret";

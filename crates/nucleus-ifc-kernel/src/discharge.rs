@@ -1,0 +1,2338 @@
+//! Obligation discharge as typed evidence — `Discharged<O>` witness system.
+//!
+//! This module implements the architectural invariant described in issue #1206:
+//! policy obligation checking must be **structurally enforced** at the type
+//! level, not by convention. Callers that skip `preflight_action` cannot
+//! satisfy effect-site signatures that require a [`DischargedBundle`].
+//!
+//! ## Design
+//!
+//! ```text
+//! ActionTerm ──► preflight_action ──► PreflightResult
+//!                                           │
+//!                              ┌────────────┴──────────────┐
+//!                         Allowed(bundle)            Denied / RequiresApproval
+//!                              │
+//!                              ▼
+//!                        DischargedBundle  ──►  effect_fn(&term, &bundle)
+//! ```
+//!
+//! `DischargedBundle` is **sealed** — its constructor is private to this
+//! module. The only code path that produces one is a successful
+//! `preflight_action` call. Receiving a `DischargedBundle` is a compile-time
+//! proof that all eight obligations passed.
+//!
+//! ## Obligations checked
+//!
+//! | Token | Obligation |
+//! |---|---|
+//! | `Discharged<IntegrityGate>` | Artifact integrity ≥ sink minimum |
+//! | `Discharged<PathAllowed>` | Operation is structurally permitted for this sink |
+//! | `Discharged<DerivationClear>` | Derivation class is compatible with this sink |
+//! | `Discharged<NoAdversarialAncestry>` | No source label has `Adversarial` integrity |
+//! | `Discharged<BudgetNotExceeded>` | Estimated cost is within budget |
+//! | `Discharged<WithinDelegationCeiling>` | Requested capability ≤ policy ceiling for the op |
+//! | `Discharged<InScopeWithTask>` | Operation is within the verified task token's scope |
+//! | `Discharged<InputsAuthorized>` | Every action input is content-addressed (present) |
+//!
+//! ## Seam notes (cross-layer obligation correspondence)
+//!
+//! These document how the discharge vocabulary lines up with the upstream
+//! `portcullis::action_term` obligation set — no code, just the mapping a
+//! reviewer needs:
+//!
+//! - **`VerifiedSinkCompatible`** (upstream) is witnessed here by
+//!   `Discharged<DerivationClear>`: the discharge `DerivationClear` check
+//!   (`sink_requires_verified_derivation` ∧ `StorageLane::Verified.accepts`)
+//!   is the canonical form of "a verified sink only accepts Deterministic /
+//!   HumanPromoted derivation". There is deliberately **no** separate
+//!   `VerifiedSinkCompatible` field — it would be redundant with
+//!   `DerivationClear`.
+//! - **`NoAdversarialAncestry`** canonical semantics = the discharge
+//!   source-label check (`no source label carries `IntegLevel::Adversarial``).
+//!   Upstream keys off input `DerivationClass`; the discharge layer keys off
+//!   the propagated IFC integrity label, which is the source of truth.
+//! - **`InputsAuthorized`** (upstream) fails if any input's `source_hash` is
+//!   empty (`term.inputs.any(|i| i.source_hash.trim().is_empty())`). The
+//!   discharge layer attests the same property structurally: a kernel
+//!   [`ContentHash`] is a 32-byte recomputed digest **by construction** (bricks
+//!   3+4 recompute ingest hashes from bytes), so there is no "empty hash" state
+//!   to check per-element — the discharge obligation attests *presence*. A
+//!   `content_addressed_inputs` of `None` is the un-plumbed state and is
+//!   **denied** fail-closed; `Some(inputs)` mints the witness (an empty vec = an
+//!   action with no inputs = vacuously authorized, matching upstream's
+//!   `!any(empty_hash)` returning satisfied for zero inputs).
+//!
+//! ## Sealing
+//!
+//! `Discharged<O>` contains a private `Seal` field that cannot be named
+//! outside this module. External code cannot forge a `Discharged<T>` or
+//! a `DischargedBundle` — the only path is through `preflight_action`.
+
+use std::marker::PhantomData;
+
+use crate::storage_lane::StorageLane;
+use crate::{
+    CapabilityLevel, ContentHash, DerivationClass, IFCLabel, IntegLevel, Operation, SinkClass,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RepairHint — structured self-repair targets (#1189)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A machine-readable hint telling the agent exactly what to change to
+/// satisfy a failed obligation.
+///
+/// Instead of parsing English error messages, an agent receiving a
+/// `RepairHint` can:
+/// - Route to human approval automatically
+/// - Substitute a cleaner data source
+/// - Narrow its operation scope
+/// - Reduce its capability request
+///
+/// Each [`ProofObligation`] variant produces a distinct `RepairHint`
+/// on failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairHint {
+    /// Artifact integrity is too low for the sink. Either:
+    /// - Use a higher-integrity data source, or
+    /// - Route through human review to promote the label.
+    RaiseIntegrity {
+        /// The artifact's current integrity level.
+        actual: IntegLevel,
+        /// The minimum integrity the sink requires.
+        required: IntegLevel,
+        /// The sink class that imposed the requirement.
+        sink: SinkClass,
+    },
+    /// The operation/sink pair is structurally inconsistent.
+    /// Use the correct sink class for this operation.
+    CorrectOperationSinkPair {
+        operation: Operation,
+        declared_sink: SinkClass,
+    },
+    /// The artifact's derivation class is incompatible with the sink.
+    /// Either promote the derivation (human review) or write to a
+    /// non-verified sink.
+    PromoteDerivation {
+        /// The artifact's current derivation class.
+        actual: DerivationClass,
+        /// The sink that requires verified derivation.
+        sink: SinkClass,
+    },
+    /// A source label carries adversarial integrity. Either:
+    /// - Remove the adversarial source from the action's inputs, or
+    /// - Declassify the source through human review.
+    DeclassifyOrReplaceInput {
+        /// The subject that submitted the action.
+        subject: String,
+    },
+    /// The action has non-zero cost but no budget gate is wired.
+    /// Either set `estimated_cost_micro_usd` to 0 or wire a
+    /// `BudgetGate` at the application layer.
+    WireBudgetGate {
+        /// The cost that triggered the denial.
+        cost_micro_usd: u64,
+    },
+    /// Agent must route this action through human approval before retrying.
+    ObtainHumanApproval {
+        /// Why approval is needed.
+        reason: String,
+    },
+    /// Capability ceiling exceeded; request a lower privilege level.
+    ReduceCapabilityRequest {
+        /// The requested capability level.
+        requested: CapabilityLevel,
+        /// The policy ceiling for this dimension.
+        ceiling: CapabilityLevel,
+    },
+    /// The operation is outside the verified task token's scope (or no
+    /// verified scope was supplied). Either narrow the operation to one the
+    /// task authorizes, or obtain a task token whose scope covers it.
+    OutOfTaskScope {
+        /// The operation that fell outside scope.
+        operation: Operation,
+        /// The subject that submitted the action.
+        subject: String,
+    },
+    /// The action's inputs are not content-addressed (the `content_addressed_inputs`
+    /// channel is un-plumbed, `None`). Plumb the FlowTracker content hashes onto
+    /// the term (`Some(..)`) before retrying — the discharge layer will not mint
+    /// `Discharged<InputsAuthorized>` from an absent inputs channel.
+    ProvideContentAddressedInputs {
+        /// The subject that submitted the action.
+        subject: String,
+    },
+}
+
+impl std::fmt::Display for RepairHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RaiseIntegrity {
+                actual,
+                required,
+                sink,
+            } => write!(
+                f,
+                "raise artifact integrity from {actual:?} to at least {required:?} \
+                 (required by {sink:?})"
+            ),
+            Self::CorrectOperationSinkPair {
+                operation,
+                declared_sink,
+            } => write!(
+                f,
+                "operation {operation:?} is not valid for sink {declared_sink:?} — \
+                 use the correct sink class"
+            ),
+            Self::PromoteDerivation { actual, sink } => write!(
+                f,
+                "promote derivation from {actual:?} to Deterministic or HumanPromoted \
+                 (required by verified sink {sink:?})"
+            ),
+            Self::DeclassifyOrReplaceInput { subject } => write!(
+                f,
+                "remove adversarial-integrity source labels from action by '{subject}', \
+                 or declassify through human review"
+            ),
+            Self::WireBudgetGate { cost_micro_usd } => write!(
+                f,
+                "wire a BudgetGate before submitting actions with cost ({cost_micro_usd}µUSD)"
+            ),
+            Self::ObtainHumanApproval { reason } => {
+                write!(f, "obtain human approval: {reason}")
+            }
+            Self::ReduceCapabilityRequest { requested, ceiling } => write!(
+                f,
+                "reduce capability request from {requested:?} to at most {ceiling:?}"
+            ),
+            Self::OutOfTaskScope { operation, subject } => write!(
+                f,
+                "operation {operation:?} by '{subject}' is outside the verified task scope — \
+                 narrow the operation or obtain a task token that authorizes it"
+            ),
+            Self::ProvideContentAddressedInputs { subject } => write!(
+                f,
+                "action by '{subject}' has un-plumbed inputs — populate \
+                 content_addressed_inputs from the FlowTracker before retrying"
+            ),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Repair — program rewriting via RepairHint
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The result of applying a [`RepairHint`] to a denied [`ActionTerm`].
+///
+/// A repair is a *type-directed program transformation*: the denied term
+/// is rewritten into one that passes the specific obligation check that
+/// failed. The rewrite only modifies fields that the failing check examines.
+///
+/// ```text
+/// deny : ActionTerm → (reason, RepairHint)
+/// try_repair : RepairHint × ActionTerm → Option<Repair>
+/// preflight(repair.term()) = Allowed   (for the check that originally denied)
+/// ```
+///
+/// This is a retraction in the category of ActionTerms: `try_repair` is a
+/// right inverse of the specific check that produced the denial.
+#[derive(Debug, Clone)]
+pub enum Repair {
+    /// The term was automatically rewritten and can be retried without
+    /// human intervention. The rewrite is sound: the repaired term passes
+    /// the obligation check that denied the original.
+    Automatic(ActionTerm),
+    /// The term requires human approval before retry. The repaired term
+    /// has the approval gate inserted; the caller must route it through
+    /// the named gate before execution.
+    NeedsApproval {
+        /// The rewritten term (with approval-gated fields adjusted).
+        term: ActionTerm,
+        /// Human-readable description of what approval is needed.
+        gate: String,
+    },
+}
+
+impl Repair {
+    /// The rewritten term, regardless of whether it's automatic or gated.
+    pub fn term(&self) -> &ActionTerm {
+        match self {
+            Self::Automatic(t) | Self::NeedsApproval { term: t, .. } => t,
+        }
+    }
+
+    /// Returns `true` if the repair can proceed without human intervention.
+    pub fn is_automatic(&self) -> bool {
+        matches!(self, Self::Automatic(_))
+    }
+}
+
+impl RepairHint {
+    /// Attempt to rewrite a denied [`ActionTerm`] into one that passes
+    /// the obligation check this hint represents.
+    ///
+    /// Returns `None` for structural mismatches (`CorrectOperationSinkPair`)
+    /// where no automatic rewrite is meaningful — the caller must fix the
+    /// operation/sink pairing manually.
+    ///
+    /// # Soundness
+    ///
+    /// For each `RepairHint` variant, the repaired term is guaranteed to
+    /// pass the corresponding obligation check in `preflight_action`,
+    /// *assuming all other checks still pass*. The repair modifies only
+    /// the fields examined by the failing check.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use nucleus_ifc_kernel::discharge::{preflight_action, ActionTerm, PreflightResult};
+    /// use nucleus_ifc_kernel::{Operation, SinkClass, IFCLabel, IntegLevel};
+    ///
+    /// let mut term = ActionTerm {
+    ///     operation: Operation::WriteFiles,
+    ///     sink_class: SinkClass::WorkspaceWrite,
+    ///     source_labels: vec![],
+    ///     artifact_label: IFCLabel::default(),
+    ///     subject: "agent".to_string(),
+    ///     estimated_cost_micro_usd: 500, // non-zero cost, no budget gate
+    ///     capability_ceiling: None,
+    ///     requested_capability: None,
+    ///     verified_scope: None,
+    ///     content_addressed_inputs: Some(vec![]),
+    /// };
+    ///
+    /// let result = preflight_action(&term);
+    /// if let PreflightResult::Denied { hint, .. } = result {
+    ///     if let Some(repair) = hint.try_repair(&term) {
+    ///         // The repair zeroed the cost but requires approval
+    ///         assert!(!repair.is_automatic());
+    ///         assert_eq!(repair.term().estimated_cost_micro_usd, 0);
+    ///     }
+    /// }
+    /// ```
+    pub fn try_repair(&self, term: &ActionTerm) -> Option<Repair> {
+        let mut repaired = term.clone();
+        match self {
+            // IntegrityGate: raise artifact integrity to the required minimum.
+            // This requires human review — we can't fabricate integrity.
+            Self::RaiseIntegrity { required, sink, .. } => {
+                repaired.artifact_label.integrity = *required;
+                Some(Repair::NeedsApproval {
+                    term: repaired,
+                    gate: format!(
+                        "human review required to attest artifact integrity \
+                         at {:?} for sink {:?}",
+                        required, sink
+                    ),
+                })
+            }
+
+            // PathAllowed: structural mismatch — no automatic rewrite.
+            // The caller must fix the operation/sink pairing.
+            Self::CorrectOperationSinkPair { .. } => None,
+
+            // DerivationClear: promote derivation to HumanPromoted.
+            // Requires human attestation.
+            Self::PromoteDerivation { sink, .. } => {
+                repaired.artifact_label.derivation = DerivationClass::HumanPromoted;
+                Some(Repair::NeedsApproval {
+                    term: repaired,
+                    gate: format!(
+                        "human attestation required to promote derivation \
+                         to HumanPromoted for verified sink {:?}",
+                        sink
+                    ),
+                })
+            }
+
+            // NoAdversarialAncestry: strip adversarial source labels.
+            // NeedsApproval: stripping adversarial ancestry is a
+            // security-significant declassification — a naive agent loop
+            // must not auto-launder tainted inputs without human review.
+            Self::DeclassifyOrReplaceInput { subject } => {
+                repaired
+                    .source_labels
+                    .retain(|l| l.integrity != IntegLevel::Adversarial);
+                Some(Repair::NeedsApproval {
+                    term: repaired,
+                    gate: format!(
+                        "human review required: adversarial source labels stripped from '{}' — \
+                         verify the action was re-derived from clean sources",
+                        subject
+                    ),
+                })
+            }
+
+            // BudgetNotExceeded: zero the cost requires approval — silently
+            // zeroing cost to bypass budget enforcement is policy-significant.
+            Self::WireBudgetGate { cost_micro_usd } => {
+                repaired.estimated_cost_micro_usd = 0;
+                Some(Repair::NeedsApproval {
+                    term: repaired,
+                    gate: format!(
+                        "budget gate required: cost {}µ¢ zeroed — \
+                         wire a real budget tracker or obtain approval to waive cost",
+                        cost_micro_usd
+                    ),
+                })
+            }
+
+            // ObtainHumanApproval: the term itself is fine, just needs approval.
+            Self::ObtainHumanApproval { reason } => Some(Repair::NeedsApproval {
+                term: repaired,
+                gate: reason.clone(),
+            }),
+
+            // ReduceCapabilityRequest: lower the requested level to the ceiling.
+            Self::ReduceCapabilityRequest { ceiling, .. } => {
+                // We can't change the operation's capability from here
+                // (that's in the CapabilityLattice, not the ActionTerm).
+                // But we flag it as needing a policy change.
+                Some(Repair::NeedsApproval {
+                    term: repaired,
+                    gate: format!(
+                        "policy change required: raise capability ceiling \
+                         to at least {:?}",
+                        ceiling
+                    ),
+                })
+            }
+
+            // OutOfTaskScope: structural — the operation is not authorized by
+            // the verified task token. There is no automatic rewrite (we cannot
+            // widen a token from here — that would be exactly the forgery the
+            // token system prevents). The caller must obtain a broader token.
+            Self::OutOfTaskScope { operation, .. } => Some(Repair::NeedsApproval {
+                term: repaired,
+                gate: format!(
+                    "task token change required: obtain a verified task token whose \
+                     scope authorizes operation {:?}",
+                    operation
+                ),
+            }),
+
+            // InputsAuthorized: the inputs channel is un-plumbed (`None`). This is
+            // a wiring defect, not a policy decision — we cannot fabricate the
+            // FlowTracker content hashes here (that would be exactly the vacuous
+            // witness the fail-closed check exists to prevent). No automatic
+            // rewrite; the caller must populate `content_addressed_inputs` from the
+            // term-building seam. Structural, like `CorrectOperationSinkPair`.
+            Self::ProvideContentAddressedInputs { .. } => None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Sealing infrastructure
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Private sentinel type. Cannot be named by external code.
+///
+/// Presence of `Seal` as a field in `Discharged` and `DischargedBundle`
+/// prevents any external code from constructing those types.
+struct Seal;
+
+mod obligation_sealed {
+    /// Sealing supertrait — prevents external `ProofObligation` impls.
+    pub trait ObligationSealed {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ProofObligation — named policy obligations
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Marker trait for named policy obligations.
+///
+/// Each implementing type represents a distinct safety property that must
+/// be checked before an effect is permitted. All implementations live in
+/// this crate; external code cannot define new obligations (sealed via
+/// [`obligation_sealed::ObligationSealed`]).
+pub trait ProofObligation: obligation_sealed::ObligationSealed {}
+
+// ── Built-in obligation types ────────────────────────────────────────────────
+
+/// Obligation: the artifact IFC integrity label meets the sink's minimum.
+///
+/// For example, `GitPush` and `GitCommit` sinks require at least `Untrusted`
+/// integrity; `Adversarial`-integrity content is blocked.
+pub struct IntegrityGate;
+impl obligation_sealed::ObligationSealed for IntegrityGate {}
+impl ProofObligation for IntegrityGate {}
+
+/// Obligation: the operation is structurally permitted for this sink class.
+///
+/// Prevents mismatches such as a `GitPush` operation being submitted with a
+/// `WorkspaceWrite` sink — the operation/sink pair must be consistent.
+pub struct PathAllowed;
+impl obligation_sealed::ObligationSealed for PathAllowed {}
+impl ProofObligation for PathAllowed {}
+
+/// Obligation: the artifact derivation class is compatible with this sink.
+///
+/// `GitPush`, `GitCommit`, and `PRCommentWrite` sinks require `Deterministic`
+/// or `HumanPromoted` derivation. AI-derived content is blocked at these
+/// verified sinks.
+pub struct DerivationClear;
+impl obligation_sealed::ObligationSealed for DerivationClear {}
+impl ProofObligation for DerivationClear {}
+
+/// Obligation: no source label carries `Adversarial` integrity.
+///
+/// Ensures that adversarially-controlled inputs (web scraping, public issue
+/// bodies) cannot contaminate verified-sink writes.
+pub struct NoAdversarialAncestry;
+impl obligation_sealed::ObligationSealed for NoAdversarialAncestry {}
+impl ProofObligation for NoAdversarialAncestry {}
+
+/// Obligation: the estimated cost fits within the budget gate.
+///
+/// For zero-cost operations this always passes. Non-zero costs require a
+/// budget evaluator (wired at the application layer in `portcullis-effects`).
+pub struct BudgetNotExceeded;
+impl obligation_sealed::ObligationSealed for BudgetNotExceeded {}
+impl ProofObligation for BudgetNotExceeded {}
+
+/// Obligation: the requested capability level is within the policy ceiling for
+/// this operation.
+///
+/// Lifts the upstream `WithinDelegationCeiling` check
+/// (`portcullis::action_term`): a requested authority must not exceed the level
+/// the capability lattice grants for the operation. Fail-closed — if
+/// either the ceiling or the requested level is absent, the obligation is
+/// **denied**, never minted (see [`preflight_action`]).
+pub struct WithinDelegationCeiling;
+impl obligation_sealed::ObligationSealed for WithinDelegationCeiling {}
+impl ProofObligation for WithinDelegationCeiling {}
+
+/// Obligation: the operation is within the verified task token's scope.
+///
+/// Lifts the upstream `InScopeWithTask` check (`portcullis::action_term`): the
+/// operation must be a member of the verified token's `allowed_operations`.
+/// Fail-closed — if no [`VerifiedScope`] is present (no verified token), the
+/// obligation is **denied**, never minted (the NO-VACUOUS-WITNESS guard). See
+/// [`preflight_action`].
+pub struct InScopeWithTask;
+impl obligation_sealed::ObligationSealed for InScopeWithTask {}
+impl ProofObligation for InScopeWithTask {}
+
+/// Obligation: every input feeding this action is content-addressed.
+///
+/// Lifts the upstream `InputsAuthorized` check (`portcullis::action_term`),
+/// which fails when any input carries an empty `source_hash`. The discharge
+/// layer attests the same property *structurally*: the content-addressed inputs
+/// flow onto the [`ActionTerm`] as kernel [`ContentHash`]es, and a `ContentHash`
+/// is a 32-byte recomputed digest **by construction** (bricks 3+4 recompute
+/// ingest hashes from bytes) — so there is no empty-hash state to reject
+/// per-element; the obligation attests *presence*. Fail-closed — if the
+/// [`ActionTerm`]'s `content_addressed_inputs` is `None` (the un-plumbed state),
+/// the obligation is **denied**, never minted (the NO-VACUOUS-WITNESS guard). A
+/// `Some(vec![])` (an action with no inputs) mints vacuously, matching upstream's
+/// `!inputs.any(empty_hash)` returning satisfied for zero inputs. See
+/// [`preflight_action`].
+pub struct InputsAuthorized;
+impl obligation_sealed::ObligationSealed for InputsAuthorized {}
+impl ProofObligation for InputsAuthorized {}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VerifiedScope — dependency-free carrier for the verified task-token scope
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The verified effective scope of a task capability token, mirrored locally.
+///
+/// This is a **fallback carrier** for the shape of
+/// `nucleus_provenance_memory::taskref_token::TokenScope`
+/// (`allowed_operations` + `allowed_paths`). The canonical `TokenScope` lives in
+/// `nucleus-provenance-memory`, which depends on `portcullis-core`, which
+/// re-exports **this** crate — so `nucleus-ifc-kernel` cannot depend on
+/// `nucleus-provenance-memory` without forming the cycle
+/// `nucleus-ifc-kernel → nucleus-provenance-memory → portcullis-core →
+/// nucleus-ifc-kernel`. The dependency-free Aeneas kernel must stay acyclic, so
+/// the scope is carried in this local struct and `portcullis-effects` converts
+/// `TokenScope → VerifiedScope` at the term-building seam (`build_term_scoped`).
+///
+/// Only the `allowed_operations` dimension is enforced by
+/// [`InScopeWithTask`] today: the discharge [`ActionTerm`] carries no path, so
+/// `allowed_paths` is retained for completeness/audit but not checked here (this
+/// mirrors upstream's behavior when `action_path()` is `None`). A follow-up that
+/// adds a path to the discharge term can lift the path dimension too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedScope {
+    /// Operations the verified token authorizes (allowlist; empty = none).
+    pub allowed_operations: Vec<Operation>,
+    /// Path patterns the token authorizes. Retained for audit; not enforced by
+    /// `InScopeWithTask` because the discharge `ActionTerm` carries no path.
+    pub allowed_paths: Vec<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Discharged<O> — zero-sized proof token
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A zero-sized proof that obligation `O` was checked and passed.
+///
+/// Can only be constructed by [`preflight_action`] (the `_seal` field
+/// contains a private [`Seal`] type that external code cannot name).
+///
+/// Presence of a `Discharged<O>` is a compile-time witness that the
+/// corresponding obligation check ran and produced `Allow`.
+pub struct Discharged<O: ProofObligation> {
+    _marker: PhantomData<O>,
+    _seal: Seal,
+}
+
+impl<O: ProofObligation> Discharged<O> {
+    /// Mint a discharge token. Only callable within this module.
+    fn mint() -> Self {
+        Self {
+            _marker: PhantomData,
+            _seal: Seal,
+        }
+    }
+}
+
+impl<O: ProofObligation> std::fmt::Debug for Discharged<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Discharged<{}>", std::any::type_name::<O>())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DischargedBundle — the full authorization package
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The result of a successful [`preflight_action`] call.
+///
+/// Holds typed discharge witnesses for all eight policy obligations. Effect
+/// functions require a `&DischargedBundle` to proceed; there is **no other
+/// way to construct one** — the `_seal` field is private to this module.
+///
+/// # Sealing guarantee
+///
+/// The `_seal` field is unnameable outside this module, so **no**
+/// `DischargedBundle` struct literal compiles externally — even one that names
+/// every one of the eight public obligation fields (the missing `_seal` alone
+/// is fatal, and `Discharged::mint()` is private too):
+///
+/// ```compile_fail
+/// // This code does NOT compile — neither Seal nor mint() is accessible.
+/// use nucleus_ifc_kernel::discharge::{
+///     DischargedBundle, Discharged, IntegrityGate, PathAllowed, DerivationClear,
+///     NoAdversarialAncestry, BudgetNotExceeded, WithinDelegationCeiling, InScopeWithTask,
+///     InputsAuthorized,
+/// };
+/// let bundle = DischargedBundle {
+///     integrity_gate: Discharged::<IntegrityGate>::mint(),  // mint() is private
+///     path_allowed: Discharged::<PathAllowed>::mint(),
+///     derivation_clear: Discharged::<DerivationClear>::mint(),
+///     no_adversarial_ancestry: Discharged::<NoAdversarialAncestry>::mint(),
+///     budget_not_exceeded: Discharged::<BudgetNotExceeded>::mint(),
+///     within_delegation_ceiling: Discharged::<WithinDelegationCeiling>::mint(),
+///     in_scope_with_task: Discharged::<InScopeWithTask>::mint(),
+///     inputs_authorized: Discharged::<InputsAuthorized>::mint(),
+///     // no `_seal`: the field is private — and even with all eight fields
+///     // above this literal cannot be completed outside the module.
+/// };
+/// ```
+///
+/// Receiving a `DischargedBundle` is proof that `preflight_action` ran and
+/// all obligations passed.
+#[must_use = "a DischargedBundle must be passed to the effect function it authorizes"]
+pub struct DischargedBundle {
+    /// Artifact integrity ≥ sink minimum.
+    pub integrity_gate: Discharged<IntegrityGate>,
+    /// Operation is structurally permitted for this sink.
+    pub path_allowed: Discharged<PathAllowed>,
+    /// Derivation class is compatible with this sink.
+    pub derivation_clear: Discharged<DerivationClear>,
+    /// No source label carries adversarial integrity.
+    pub no_adversarial_ancestry: Discharged<NoAdversarialAncestry>,
+    /// Estimated cost fits within the budget gate.
+    pub budget_not_exceeded: Discharged<BudgetNotExceeded>,
+    /// Requested capability ≤ policy ceiling for the operation.
+    pub within_delegation_ceiling: Discharged<WithinDelegationCeiling>,
+    /// Operation is within the verified task token's scope.
+    pub in_scope_with_task: Discharged<InScopeWithTask>,
+    /// Every action input is content-addressed (present on the term).
+    pub inputs_authorized: Discharged<InputsAuthorized>,
+    /// The operation this bundle was discharged FOR.
+    ///
+    /// Without this the bundle proved only "a preflight ran somewhere", never
+    /// "a preflight ran for THIS action" — the effect functions take it as
+    /// `_proof`, an unused type-level token, so a bundle earned for a workspace
+    /// write was structurally usable to authorise a shell spawn. That is the
+    /// confused deputy, and the standard remedy is to bind the token to the
+    /// approved operation and scope (the macaroon "request-hash caveat"
+    /// pattern).
+    operation: Operation,
+    /// The sink class this bundle was discharged FOR.
+    sink_class: SinkClass,
+    _seal: Seal,
+}
+
+impl DischargedBundle {
+    /// Private constructor — only callable from within this module.
+    fn new(operation: Operation, sink_class: SinkClass) -> Self {
+        Self {
+            integrity_gate: Discharged::mint(),
+            path_allowed: Discharged::mint(),
+            derivation_clear: Discharged::mint(),
+            no_adversarial_ancestry: Discharged::mint(),
+            budget_not_exceeded: Discharged::mint(),
+            within_delegation_ceiling: Discharged::mint(),
+            in_scope_with_task: Discharged::mint(),
+            inputs_authorized: Discharged::mint(),
+            operation,
+            sink_class,
+            _seal: Seal,
+        }
+    }
+
+    /// The operation this bundle authorises. Read-only: the scope is fixed at
+    /// discharge and cannot be widened afterwards.
+    pub fn operation(&self) -> Operation {
+        self.operation
+    }
+
+    /// The sink class this bundle authorises.
+    pub fn sink_class(&self) -> SinkClass {
+        self.sink_class
+    }
+
+    /// **Does this bundle authorise `op` at `sink`?**
+    ///
+    /// The check the effect functions never made. Each effect knows which
+    /// operation IT is, so it can ask this without needing the original
+    /// `ActionTerm` threaded through its signature — the reason the binding is
+    /// on (operation, sink_class) rather than a full term hash. It is the
+    /// binding the 2026 confused-deputy guidance recommends: bind the token to
+    /// the approved operation and scope, so a bundle earned for one action
+    /// cannot be presented for another.
+    #[must_use]
+    pub fn authorizes(&self, op: Operation, sink: SinkClass) -> bool {
+        self.operation == op && self.sink_class == sink
+    }
+}
+
+impl std::fmt::Debug for DischargedBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DischargedBundle")
+            .field("integrity_gate", &self.integrity_gate)
+            .field("path_allowed", &self.path_allowed)
+            .field("derivation_clear", &self.derivation_clear)
+            .field("no_adversarial_ancestry", &self.no_adversarial_ancestry)
+            .field("budget_not_exceeded", &self.budget_not_exceeded)
+            .field("within_delegation_ceiling", &self.within_delegation_ceiling)
+            .field("in_scope_with_task", &self.in_scope_with_task)
+            .field("inputs_authorized", &self.inputs_authorized)
+            .finish()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ActionTerm — the proposed action to evaluate
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A proposed action to be evaluated by [`preflight_action`].
+///
+/// Carries the full context needed to run all obligation checks:
+/// the operation being attempted, the IFC labels on data inputs,
+/// the target sink class, and the subject identity.
+///
+/// # Example
+///
+/// ```rust
+/// use nucleus_ifc_kernel::discharge::ActionTerm;
+/// use nucleus_ifc_kernel::{Operation, SinkClass, IFCLabel};
+///
+/// let term = ActionTerm {
+///     operation: Operation::GitCommit,
+///     sink_class: SinkClass::GitCommit,
+///     source_labels: vec![],
+///     artifact_label: IFCLabel::default(),
+///     subject: "spiffe://nucleus/agent/ci-bot".to_string(),
+///     estimated_cost_micro_usd: 0,
+///     capability_ceiling: None,
+///     requested_capability: None,
+///     verified_scope: None,
+///     content_addressed_inputs: Some(vec![]),
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct ActionTerm {
+    /// The operation being attempted.
+    pub operation: Operation,
+    /// The target sink class for this action.
+    pub sink_class: SinkClass,
+    /// IFC labels on the data inputs feeding this action.
+    pub source_labels: Vec<IFCLabel>,
+    /// The propagated IFC label of the artifact being written or sent.
+    pub artifact_label: IFCLabel,
+    /// SPIFFE or session identity of the subject requesting this action.
+    pub subject: String,
+    /// Estimated cost of this action in micro-USD (0 = free / unknown).
+    ///
+    /// When non-zero, a budget gate must be wired at the application layer
+    /// (in `portcullis-effects`). Passing non-zero cost through `preflight_action`
+    /// without a budget gate produces a `Denied` result.
+    ///
+    /// **Known gap (#1362)**: All current callsites pass 0 because no cost
+    /// estimation is wired yet. The `BudgetNotExceeded` obligation is
+    /// structurally sound but operationally dormant until a cost estimator
+    /// is integrated (e.g., LLM token pricing, API call metering).
+    pub estimated_cost_micro_usd: u64,
+    /// The policy ceiling: the capability level the capability lattice
+    /// grants for `operation`. `None` when unknown — which **denies**
+    /// [`WithinDelegationCeiling`] fail-closed (never mints a vacuous witness).
+    pub capability_ceiling: Option<CapabilityLevel>,
+    /// The capability level this action requests for `operation`. `None` denies
+    /// [`WithinDelegationCeiling`] fail-closed. Callers building real terms set
+    /// this to the operation's inherent floor (see `build_term` in
+    /// `portcullis-effects`); the ceiling check is `requested ≤ ceiling`.
+    pub requested_capability: Option<CapabilityLevel>,
+    /// The verified effective scope of the session's task capability token, if
+    /// any. `None` denies [`InScopeWithTask`] fail-closed — the
+    /// NO-VACUOUS-WITNESS guard: an action with no verified scope can never mint
+    /// `Discharged<InScopeWithTask>`.
+    pub verified_scope: Option<VerifiedScope>,
+    /// The content-addressed inputs feeding this action, one [`ContentHash`] per
+    /// source node that carries a recorded digest (InputsAuthorized bricks 1+3).
+    ///
+    /// `None` is the **un-plumbed** state and denies [`InputsAuthorized`]
+    /// fail-closed (the NO-VACUOUS-WITNESS guard: no witness is minted from an
+    /// absent inputs channel). `Some(inputs)` mints the witness — every
+    /// `ContentHash` is a 32-byte recomputed digest by construction, so the
+    /// discharge layer attests *presence*, not per-element validity. A
+    /// `Some(vec![])` (an action with no inputs) mints vacuously. Callers building
+    /// real terms collect these from the FlowTracker (see `build_term_scoped` in
+    /// `portcullis-effects`).
+    pub content_addressed_inputs: Option<Vec<ContentHash>>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PreflightResult — outcome of preflight_action
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The outcome of a [`preflight_action`] evaluation.
+///
+/// Only [`PreflightResult::Allowed`] contains a [`DischargedBundle`] that
+/// authorizes the effect to proceed. `Denied` and `RequiresApproval` must
+/// never reach an effect call site.
+#[must_use = "PreflightResult must be checked before executing any effect"]
+#[derive(Debug)]
+pub enum PreflightResult {
+    /// All obligations passed. The bundle authorizes the effect.
+    Allowed(DischargedBundle),
+    /// At least one obligation failed. Contains a human-readable reason
+    /// and a machine-readable [`RepairHint`] for automated self-repair.
+    Denied {
+        /// Human-readable explanation of the denial.
+        reason: String,
+        /// Structured repair target — tells the agent exactly what to fix.
+        hint: RepairHint,
+    },
+    /// The action requires explicit human approval before it may proceed.
+    RequiresApproval { reason: String },
+}
+
+impl PreflightResult {
+    /// Returns `true` if the preflight check passed.
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed(_))
+    }
+
+    /// Returns `true` if the preflight check was denied.
+    pub fn is_denied(&self) -> bool {
+        matches!(self, Self::Denied { .. })
+    }
+
+    /// Returns `true` if human approval is required.
+    pub fn requires_approval(&self) -> bool {
+        matches!(self, Self::RequiresApproval { .. })
+    }
+
+    /// Unwrap the [`DischargedBundle`], panicking if not `Allowed`.
+    ///
+    /// **Only use in tests** or code where the outcome is statically known.
+    /// Production code must exhaustively match all variants.
+    #[track_caller]
+    pub fn unwrap_bundle(self) -> DischargedBundle {
+        match self {
+            Self::Allowed(bundle) => bundle,
+            Self::Denied { reason, .. } => panic!("preflight denied: {reason}"),
+            Self::RequiresApproval { reason } => {
+                panic!("preflight requires approval: {reason}")
+            }
+        }
+    }
+
+    /// Extract the denial reason, or `None` if not `Denied`.
+    pub fn denial_reason(&self) -> Option<&str> {
+        match self {
+            Self::Denied { reason, .. } => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Extract the repair hint, or `None` if not `Denied`.
+    pub fn repair_hint(&self) -> Option<&RepairHint> {
+        match self {
+            Self::Denied { hint, .. } => Some(hint),
+            _ => None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// preflight_action — the obligation evaluator
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Evaluates all policy obligations for a proposed action.
+///
+/// This is the **only** function that can produce a [`DischargedBundle`].
+/// Callers must call this before executing any effect and pass the resulting
+/// bundle to the effect function.
+///
+/// # Obligation evaluation order
+///
+/// 1. **IntegrityGate** — artifact integrity ≥ sink minimum requirement
+/// 2. **PathAllowed** — operation/sink class pair is structurally consistent
+/// 3. **DerivationClear** — derivation class is compatible with this sink
+/// 4. **NoAdversarialAncestry** — no source label carries `Adversarial` integrity
+/// 5. **BudgetNotExceeded** — zero-cost always passes; non-zero requires budget gate
+/// 6. **WithinDelegationCeiling** — requested capability ≤ policy ceiling for the op;
+///    fail-closed if either level is absent
+/// 7. **InScopeWithTask** — operation is within the verified task token's scope;
+///    fail-closed if no verified scope is present (NO-VACUOUS-WITNESS guard)
+/// 8. **InputsAuthorized** — every action input is content-addressed (present);
+///    fail-closed if the inputs channel is un-plumbed (`None`) — NO-VACUOUS-WITNESS
+///
+/// Checks short-circuit on the first denial for latency. All non-denial
+/// states are fully evaluated before the bundle is minted.
+///
+/// # Example
+///
+/// ```rust
+/// use nucleus_ifc_kernel::discharge::{ActionTerm, VerifiedScope, preflight_action, PreflightResult};
+/// use nucleus_ifc_kernel::{CapabilityLevel, Operation, SinkClass, IFCLabel};
+///
+/// let term = ActionTerm {
+///     operation: Operation::WriteFiles,
+///     sink_class: SinkClass::WorkspaceWrite,
+///     source_labels: vec![],
+///     artifact_label: IFCLabel::default(),
+///     subject: "spiffe://nucleus/agent/test".to_string(),
+///     estimated_cost_micro_usd: 0,
+///     // Fail-closed inputs for the two new obligations: without these the
+///     // action is denied (WithinDelegationCeiling / InScopeWithTask).
+///     capability_ceiling: Some(CapabilityLevel::LowRisk),
+///     requested_capability: Some(CapabilityLevel::LowRisk),
+///     verified_scope: Some(VerifiedScope {
+///         allowed_operations: vec![Operation::WriteFiles],
+///         allowed_paths: vec![],
+///     }),
+///     // Inputs channel plumbed (no inputs → vacuously authorized).
+///     content_addressed_inputs: Some(vec![]),
+/// };
+///
+/// match preflight_action(&term) {
+///     PreflightResult::Allowed(_bundle) => { /* pass bundle to effect fn */ }
+///     PreflightResult::Denied { reason, hint } => { /* log and abort */ }
+///     PreflightResult::RequiresApproval { reason } => { /* await approval */ }
+/// }
+/// ```
+/// Test helpers for producing `DischargedBundle`s in tests.
+///
+/// These run a real `preflight_action` on a known-good term, so they mint
+/// nothing that was not earned — but a production build has no business being
+/// able to obtain a bundle it did not discharge itself, and "only use in tests"
+/// in a doc comment is a convention, not an enforcement.
+///
+/// GATED behind `test-helpers` (2026-07-26). `#[cfg(test)]` alone cannot work
+/// here: three crates consume this ACROSS the crate boundary, where `cfg(test)`
+/// is false because the kernel is compiled as a dependency rather than as the
+/// crate under test. A feature is the only gate that reaches them, and it keeps
+/// the helper out of any build that does not ask for it by name.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers {
+    use super::*;
+    use crate::{
+        AuthorityLevel, ConfLevel, DerivationClass, Freshness, IntegLevel, Operation,
+        ProvenanceSet, SinkClass,
+    };
+
+    /// Produce a bundle scoped to a SPECIFIC operation and sink.
+    ///
+    /// `allowed_bundle` mints a WriteFiles/WorkspaceWrite bundle, and tests were
+    /// using it to authorise shell spawns — the confused deputy, sitting in the
+    /// test suite. Now that a bundle is bound to what it was earned for, a test
+    /// that needs to authorise a shell spawn must mint a shell-scoped bundle.
+    pub fn bundle_for(operation: Operation, sink_class: SinkClass) -> DischargedBundle {
+        let term = ActionTerm {
+            operation,
+            sink_class,
+            source_labels: vec![],
+            artifact_label: crate::IFCLabel {
+                confidentiality: ConfLevel::Internal,
+                integrity: IntegLevel::Trusted,
+                authority: AuthorityLevel::Directive,
+                provenance: ProvenanceSet::SYSTEM,
+                freshness: Freshness {
+                    observed_at: 1000,
+                    ttl_secs: 0,
+                },
+                derivation: DerivationClass::Deterministic,
+            },
+            subject: "test-helper".to_string(),
+            estimated_cost_micro_usd: 0,
+            capability_ceiling: Some(crate::CapabilityLevel::LowRisk),
+            requested_capability: Some(crate::CapabilityLevel::LowRisk),
+            verified_scope: Some(VerifiedScope {
+                allowed_operations: vec![operation],
+                allowed_paths: vec![],
+            }),
+            content_addressed_inputs: Some(vec![]),
+        };
+        match preflight_action(&term) {
+            PreflightResult::Allowed(bundle) => bundle,
+            other => panic!("test_helpers::bundle_for: expected Allowed, got {other:?}"),
+        }
+    }
+
+    /// Like [`bundle_for`], but `None` instead of a panic when the pair is not
+    /// dischargeable.
+    ///
+    /// Not every `(Operation, SinkClass)` pair is structurally permitted —
+    /// `PathAllowed` rejects e.g. `ReadFiles`/`WorkspaceWrite`. A test that wants
+    /// to sweep the whole product needs to distinguish "this pair cannot be
+    /// earned" from "this pair was earned and then misused", which the panicking
+    /// form cannot express.
+    pub fn try_bundle_for(operation: Operation, sink_class: SinkClass) -> Option<DischargedBundle> {
+        let term = ActionTerm {
+            operation,
+            sink_class,
+            source_labels: vec![],
+            artifact_label: crate::IFCLabel {
+                confidentiality: ConfLevel::Internal,
+                integrity: IntegLevel::Trusted,
+                authority: AuthorityLevel::Directive,
+                provenance: ProvenanceSet::SYSTEM,
+                freshness: Freshness {
+                    observed_at: 1000,
+                    ttl_secs: 0,
+                },
+                derivation: DerivationClass::Deterministic,
+            },
+            subject: "test-helper".to_string(),
+            estimated_cost_micro_usd: 0,
+            capability_ceiling: Some(crate::CapabilityLevel::LowRisk),
+            requested_capability: Some(crate::CapabilityLevel::LowRisk),
+            verified_scope: Some(VerifiedScope {
+                allowed_operations: vec![operation],
+                allowed_paths: vec![],
+            }),
+            content_addressed_inputs: Some(vec![]),
+        };
+        match preflight_action(&term) {
+            PreflightResult::Allowed(bundle) => Some(bundle),
+            _ => None,
+        }
+    }
+
+    /// Produce a `DischargedBundle` by running preflight on a known-good term.
+    pub fn allowed_bundle() -> DischargedBundle {
+        let term = ActionTerm {
+            operation: Operation::WriteFiles,
+            sink_class: SinkClass::WorkspaceWrite,
+            source_labels: vec![],
+            artifact_label: crate::IFCLabel {
+                confidentiality: ConfLevel::Internal,
+                integrity: IntegLevel::Trusted,
+                authority: AuthorityLevel::Directive,
+                provenance: ProvenanceSet::SYSTEM,
+                freshness: Freshness {
+                    observed_at: 1000,
+                    ttl_secs: 0,
+                },
+                derivation: DerivationClass::Deterministic,
+            },
+            subject: "test-helper".to_string(),
+            estimated_cost_micro_usd: 0,
+            // Happy-path inputs for the two new obligations (widen 5 → 7):
+            // the op is granted at LowRisk and is in the verified token scope.
+            capability_ceiling: Some(crate::CapabilityLevel::LowRisk),
+            requested_capability: Some(crate::CapabilityLevel::LowRisk),
+            verified_scope: Some(VerifiedScope {
+                allowed_operations: vec![Operation::WriteFiles],
+                allowed_paths: vec![],
+            }),
+            // Happy-path input for the widen 7 → 8 obligation (InputsAuthorized):
+            // the inputs channel is plumbed (no inputs → vacuously authorized).
+            content_addressed_inputs: Some(vec![]),
+        };
+        match preflight_action(&term) {
+            PreflightResult::Allowed(bundle) => bundle,
+            other => panic!("test_helpers::allowed_bundle: expected Allowed, got {other:?}"),
+        }
+    }
+}
+
+pub fn preflight_action(term: &ActionTerm) -> PreflightResult {
+    // 1. IntegrityGate: artifact integrity must meet the sink minimum.
+    let min_integ = sink_min_integrity(term.sink_class);
+    if term.artifact_label.integrity < min_integ {
+        return PreflightResult::Denied {
+            reason: format!(
+                "IntegrityGate: artifact integrity {:?} below minimum {:?} required for {:?}",
+                term.artifact_label.integrity, min_integ, term.sink_class
+            ),
+            hint: RepairHint::RaiseIntegrity {
+                actual: term.artifact_label.integrity,
+                required: min_integ,
+                sink: term.sink_class,
+            },
+        };
+    }
+
+    // 2. PathAllowed: operation/sink pair must be structurally consistent.
+    if !operation_allowed_for_sink(term.operation, term.sink_class) {
+        return PreflightResult::Denied {
+            reason: format!(
+                "PathAllowed: operation {:?} is not permitted for sink {:?}",
+                term.operation, term.sink_class
+            ),
+            hint: RepairHint::CorrectOperationSinkPair {
+                operation: term.operation,
+                declared_sink: term.sink_class,
+            },
+        };
+    }
+
+    // 3. DerivationClear: derivation class must be compatible with the sink.
+    if sink_requires_verified_derivation(term.sink_class)
+        && !StorageLane::Verified.accepts(term.artifact_label.derivation)
+    {
+        return PreflightResult::Denied {
+            reason: format!(
+                "DerivationClear: {:?} derivation is not permitted at verified sink {:?} \
+                 (requires Deterministic or HumanPromoted)",
+                term.artifact_label.derivation, term.sink_class
+            ),
+            hint: RepairHint::PromoteDerivation {
+                actual: term.artifact_label.derivation,
+                sink: term.sink_class,
+            },
+        };
+    }
+
+    // 4. NoAdversarialAncestry: no source label may carry Adversarial integrity.
+    for label in &term.source_labels {
+        if label.integrity == IntegLevel::Adversarial {
+            return PreflightResult::Denied {
+                reason: format!(
+                    "NoAdversarialAncestry: adversarial-integrity source label present \
+                     in action by subject '{}'",
+                    term.subject
+                ),
+                hint: RepairHint::DeclassifyOrReplaceInput {
+                    subject: term.subject.clone(),
+                },
+            };
+        }
+    }
+
+    // 5. BudgetNotExceeded: non-zero cost requires a wired budget gate.
+    if term.estimated_cost_micro_usd > 0 {
+        return PreflightResult::Denied {
+            reason: format!(
+                "BudgetNotExceeded: non-zero cost {}µUSD requires a budget gate \
+                 (wire BudgetGate via portcullis-effects before submitting non-zero-cost terms)",
+                term.estimated_cost_micro_usd
+            ),
+            hint: RepairHint::WireBudgetGate {
+                cost_micro_usd: term.estimated_cost_micro_usd,
+            },
+        };
+    }
+
+    // 6. WithinDelegationCeiling: the requested capability must not exceed the
+    //    policy ceiling for this operation. FAIL-CLOSED — if either the ceiling
+    //    or the requested level is absent, DENY (never mint a vacuous witness).
+    //    Mirrors `portcullis::action_term`'s `requested_level > available` gate
+    //    (level_for(op) is the ceiling); with the runtime's inherent per-op
+    //    floor for `requested`, this denies exactly the operations the policy
+    //    forbids (ceiling == Never).
+    match (term.capability_ceiling, term.requested_capability) {
+        (Some(ceiling), Some(requested)) => {
+            if requested > ceiling {
+                return PreflightResult::Denied {
+                    reason: format!(
+                        "WithinDelegationCeiling: requested capability {requested:?} exceeds \
+                         policy ceiling {ceiling:?} for operation {:?}",
+                        term.operation
+                    ),
+                    hint: RepairHint::ReduceCapabilityRequest { requested, ceiling },
+                };
+            }
+        }
+        _ => {
+            return PreflightResult::Denied {
+                reason: format!(
+                    "WithinDelegationCeiling: missing capability ceiling/request for \
+                     operation {:?} — denied fail-closed (no vacuous witness)",
+                    term.operation
+                ),
+                hint: RepairHint::ReduceCapabilityRequest {
+                    // No known request/ceiling: surface the strictest hint (Never
+                    // ceiling) so any non-Never request is flagged.
+                    requested: term.requested_capability.unwrap_or(CapabilityLevel::Always),
+                    ceiling: term.capability_ceiling.unwrap_or(CapabilityLevel::Never),
+                },
+            };
+        }
+    }
+
+    // 7. InScopeWithTask: the operation must be within the verified task token's
+    //    scope. FAIL-CLOSED — if no VerifiedScope is present (no verified token),
+    //    DENY and never mint (the NO-VACUOUS-WITNESS guard). Mirrors
+    //    `portcullis::action_term`'s `InScopeWithTask`: op ∈ allowed_operations.
+    //    (The discharge ActionTerm carries no path, so the allowed_paths
+    //    dimension is not enforced here — see `VerifiedScope`.)
+    match &term.verified_scope {
+        Some(scope) if scope.allowed_operations.contains(&term.operation) => {
+            // in scope — fall through to mint.
+        }
+        _ => {
+            return PreflightResult::Denied {
+                reason: format!(
+                    "InScopeWithTask: operation {:?} is not within the verified task scope \
+                     (or no verified scope present) for subject '{}'",
+                    term.operation, term.subject
+                ),
+                hint: RepairHint::OutOfTaskScope {
+                    operation: term.operation,
+                    subject: term.subject.clone(),
+                },
+            };
+        }
+    }
+
+    // 8. InputsAuthorized: every input feeding this action must be
+    //    content-addressed. FAIL-CLOSED — if `content_addressed_inputs` is `None`
+    //    (the un-plumbed state), DENY and never mint (the NO-VACUOUS-WITNESS
+    //    guard). `Some(inputs)` mints: each `ContentHash` is a 32-byte recomputed
+    //    digest by construction (bricks 3+4 recompute ingest hashes from bytes),
+    //    so the discharge layer attests PRESENCE — there is no empty-hash state to
+    //    reject per-element. An empty vec = an action with no inputs = vacuously
+    //    authorized = mint, matching `portcullis::action_term`'s
+    //    `!inputs.any(|i| i.source_hash.is_empty())` returning satisfied for zero
+    //    inputs.
+    if term.content_addressed_inputs.is_none() {
+        return PreflightResult::Denied {
+            reason: format!(
+                "InputsAuthorized: content-addressed inputs channel is un-plumbed (None) \
+                 for operation {:?} by subject '{}' — denied fail-closed (no vacuous witness)",
+                term.operation, term.subject
+            ),
+            hint: RepairHint::ProvideContentAddressedInputs {
+                subject: term.subject.clone(),
+            },
+        };
+    }
+
+    PreflightResult::Allowed(DischargedBundle::new(term.operation, term.sink_class))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Policy helper functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Returns the minimum `IntegLevel` required to write to `sink`.
+///
+/// Sinks that publish or persist data to external/shared systems require
+/// at least `Untrusted` integrity (no adversarial-tainted data).
+/// Local workspace writes accept any integrity level.
+fn sink_min_integrity(sink: SinkClass) -> IntegLevel {
+    match sink {
+        // High-trust publish sinks — no adversarial input.
+        SinkClass::GitPush
+        | SinkClass::GitCommit
+        | SinkClass::PRCommentWrite
+        | SinkClass::EmailSend
+        | SinkClass::HTTPEgress
+        | SinkClass::MCPWrite
+        | SinkClass::CloudMutation
+        | SinkClass::VerifiedTableWrite
+        | SinkClass::TicketWrite => IntegLevel::Untrusted,
+
+        // Memory persistence — adversarial writes create cross-session laundering.
+        SinkClass::MemoryPersist => IntegLevel::Untrusted,
+
+        // Agent spawning — adversarial instructions would propagate to child.
+        SinkClass::AgentSpawn => IntegLevel::Untrusted,
+
+        // System writes — no adversarial data to system files.
+        SinkClass::SystemWrite => IntegLevel::Untrusted,
+
+        // Local / low-trust sinks — accept any integrity (including Adversarial).
+        SinkClass::WorkspaceWrite
+        | SinkClass::BashExec
+        | SinkClass::ProposedTableWrite
+        | SinkClass::SearchIndexWrite
+        | SinkClass::CacheWrite
+        | SinkClass::AuditLogAppend
+        | SinkClass::SecretRead => IntegLevel::Adversarial,
+    }
+}
+
+/// Returns `true` if the operation/sink pairing is structurally consistent.
+///
+/// This is the `PathAllowed` gate: it ensures that the `Operation` variant
+/// in the `ActionTerm` is compatible with the declared `SinkClass`. A mismatch
+/// indicates a caller bug (e.g., submitting `Operation::GitPush` with
+/// `SinkClass::WorkspaceWrite`).
+///
+/// Returns `true` (permissive) for combinations not explicitly restricted,
+/// so adding new `Operation` or `SinkClass` variants does not break existing
+/// callers by default.
+fn operation_allowed_for_sink(op: Operation, sink: SinkClass) -> bool {
+    match op {
+        Operation::WriteFiles => {
+            matches!(
+                sink,
+                SinkClass::WorkspaceWrite
+                    | SinkClass::SystemWrite
+                    | SinkClass::ProposedTableWrite
+                    | SinkClass::VerifiedTableWrite
+                    | SinkClass::CacheWrite
+                    | SinkClass::SearchIndexWrite
+                    | SinkClass::AuditLogAppend
+            )
+        }
+        Operation::EditFiles => {
+            matches!(sink, SinkClass::WorkspaceWrite | SinkClass::SystemWrite)
+        }
+        Operation::GitCommit => matches!(sink, SinkClass::GitCommit),
+        Operation::GitPush => matches!(sink, SinkClass::GitPush),
+        Operation::CreatePr => matches!(sink, SinkClass::PRCommentWrite),
+        Operation::RunBash => matches!(sink, SinkClass::BashExec),
+        Operation::WebSearch | Operation::WebFetch => matches!(sink, SinkClass::HTTPEgress),
+        Operation::SpawnAgent => matches!(sink, SinkClass::AgentSpawn),
+        Operation::ManagePods => matches!(sink, SinkClass::CloudMutation | SinkClass::AgentSpawn),
+        // Read-only operations: structurally they produce no writes.
+        // Accept AuditLogAppend and MemoryPersist (reading can trigger audit events
+        // or cache population). All other write sinks are incoherent for reads.
+        Operation::ReadFiles | Operation::GlobSearch | Operation::GrepSearch => matches!(
+            sink,
+            SinkClass::AuditLogAppend | SinkClass::MemoryPersist | SinkClass::CacheWrite
+        ),
+    }
+}
+
+/// Returns `true` if this sink class requires `Deterministic` or `HumanPromoted`
+/// derivation (i.e., the sink participates in the verified storage lane).
+///
+/// This mirrors the Rule 6 check in [`crate::flow`] but at the discharge layer,
+/// ensuring that obligation checking and flow checking are consistent.
+fn sink_requires_verified_derivation(sink: SinkClass) -> bool {
+    matches!(
+        sink,
+        SinkClass::GitPush | SinkClass::GitCommit | SinkClass::PRCommentWrite
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+
+    /// **A bundle earned for one action does not authorise another.**
+    ///
+    /// This is the confused deputy in its authorisation form. The effect
+    /// functions in `portcullis-effects` take the bundle as `_proof` — an
+    /// UNUSED type-level token — so before this the bundle proved only that
+    /// "a preflight ran somewhere", never that "a preflight ran for THIS
+    /// action". A bundle legitimately earned for a workspace write was
+    /// structurally usable to authorise a shell spawn.
+    ///
+    /// The 2026 guidance on confused-deputy prevention is to bind the token to
+    /// the approved operation and scope — the macaroon "request-hash caveat"
+    /// pattern — so that authority cannot be exercised for an action the
+    /// principal never approved.
+    #[test]
+    fn a_bundle_does_not_authorise_a_different_action() {
+        let term = ActionTerm {
+            operation: Operation::WriteFiles,
+            sink_class: SinkClass::WorkspaceWrite,
+            source_labels: vec![],
+            artifact_label: crate::IFCLabel {
+                confidentiality: ConfLevel::Internal,
+                integrity: IntegLevel::Trusted,
+                authority: AuthorityLevel::Directive,
+                provenance: ProvenanceSet::SYSTEM,
+                freshness: Freshness {
+                    observed_at: 1000,
+                    ttl_secs: 0,
+                },
+                derivation: DerivationClass::Deterministic,
+            },
+            subject: "scope-binding-test".to_string(),
+            estimated_cost_micro_usd: 0,
+            capability_ceiling: Some(crate::CapabilityLevel::LowRisk),
+            requested_capability: Some(crate::CapabilityLevel::LowRisk),
+            verified_scope: Some(VerifiedScope {
+                allowed_operations: vec![Operation::WriteFiles],
+                allowed_paths: vec![],
+            }),
+            content_addressed_inputs: Some(vec![]),
+        };
+        let bundle = match preflight_action(&term) {
+            PreflightResult::Allowed(b) => b,
+            other => panic!("expected Allowed, got {other:?}"),
+        };
+
+        // It authorises what it was earned for.
+        assert!(
+            bundle.authorizes(Operation::WriteFiles, SinkClass::WorkspaceWrite),
+            "a bundle must authorise the action it was discharged for"
+        );
+
+        // It does NOT authorise a different operation at a different sink —
+        // the escalation a confused deputy performs.
+        assert!(
+            !bundle.authorizes(Operation::RunBash, SinkClass::WorkspaceWrite),
+            "a workspace-write bundle must not authorise a shell spawn"
+        );
+        assert!(
+            !bundle.authorizes(Operation::WriteFiles, SinkClass::HTTPEgress),
+            "a workspace-write bundle must not authorise http egress"
+        );
+    }
+
+    use super::*;
+    use crate::{AuthorityLevel, ConfLevel, DerivationClass, Freshness, ProvenanceSet};
+
+    fn trusted_label() -> IFCLabel {
+        IFCLabel {
+            confidentiality: ConfLevel::Internal,
+            integrity: IntegLevel::Trusted,
+            authority: AuthorityLevel::Directive,
+            provenance: ProvenanceSet::SYSTEM,
+            freshness: Freshness {
+                observed_at: 1000,
+                ttl_secs: 0,
+            },
+            derivation: DerivationClass::Deterministic,
+        }
+    }
+
+    fn adversarial_label() -> IFCLabel {
+        IFCLabel {
+            confidentiality: ConfLevel::Public,
+            integrity: IntegLevel::Adversarial,
+            authority: AuthorityLevel::NoAuthority,
+            provenance: ProvenanceSet::WEB,
+            freshness: Freshness {
+                observed_at: 1000,
+                ttl_secs: 0,
+            },
+            derivation: DerivationClass::OpaqueExternal,
+        }
+    }
+
+    fn ai_derived_label() -> IFCLabel {
+        IFCLabel {
+            confidentiality: ConfLevel::Internal,
+            integrity: IntegLevel::Trusted,
+            authority: AuthorityLevel::Directive,
+            provenance: ProvenanceSet::MODEL,
+            freshness: Freshness {
+                observed_at: 1000,
+                ttl_secs: 0,
+            },
+            derivation: DerivationClass::AIDerived,
+        }
+    }
+
+    fn human_promoted_label() -> IFCLabel {
+        IFCLabel {
+            derivation: DerivationClass::HumanPromoted,
+            ..trusted_label()
+        }
+    }
+
+    fn workspace_write_term() -> ActionTerm {
+        ActionTerm {
+            operation: Operation::WriteFiles,
+            sink_class: SinkClass::WorkspaceWrite,
+            source_labels: vec![],
+            artifact_label: trusted_label(),
+            subject: "spiffe://nucleus/agent/test".to_string(),
+            estimated_cost_micro_usd: 0,
+            // Happy-path inputs for the two widen-added obligations. The base
+            // scope authorizes every operation the happy-path tests exercise;
+            // denial tests override `operation`/labels to trip an *earlier*
+            // check (integrity/path/derivation/ancestry/budget), which
+            // short-circuits before the ceiling/scope checks.
+            capability_ceiling: Some(CapabilityLevel::LowRisk),
+            requested_capability: Some(CapabilityLevel::LowRisk),
+            verified_scope: Some(VerifiedScope {
+                allowed_operations: vec![
+                    Operation::WriteFiles,
+                    Operation::GitCommit,
+                    Operation::GitPush,
+                    Operation::CreatePr,
+                ],
+                allowed_paths: vec![],
+            }),
+            // Happy-path input for the widen 7 → 8 obligation (InputsAuthorized).
+            // The channel is plumbed; denial tests that must trip InputsAuthorized
+            // override this to `None`. Denial tests for *earlier* checks
+            // short-circuit before check 8, so they inherit the happy-path value.
+            content_addressed_inputs: Some(vec![]),
+        }
+    }
+
+    // ── Happy path ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn workspace_write_with_trusted_label_allowed() {
+        let result = preflight_action(&workspace_write_term());
+        assert!(result.is_allowed(), "workspace write should be allowed");
+    }
+
+    #[test]
+    fn git_commit_with_deterministic_label_allowed() {
+        let term = ActionTerm {
+            operation: Operation::GitCommit,
+            sink_class: SinkClass::GitCommit,
+            artifact_label: trusted_label(),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_allowed());
+    }
+
+    #[test]
+    fn git_push_with_human_promoted_label_allowed() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: human_promoted_label(),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_allowed());
+    }
+
+    #[test]
+    fn create_pr_with_deterministic_label_allowed() {
+        let term = ActionTerm {
+            operation: Operation::CreatePr,
+            sink_class: SinkClass::PRCommentWrite,
+            artifact_label: trusted_label(),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_allowed());
+    }
+
+    // ── IntegrityGate denials ───────────────────────────────────────────────
+
+    #[test]
+    fn git_push_with_adversarial_artifact_denied_integrity_gate() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: adversarial_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(
+            result.is_denied(),
+            "adversarial artifact at GitPush should be denied"
+        );
+        let reason = result.denial_reason().unwrap();
+        assert!(
+            reason.contains("IntegrityGate"),
+            "denial should mention IntegrityGate, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn memory_persist_adversarial_artifact_denied_integrity_gate() {
+        let term = ActionTerm {
+            operation: Operation::WriteFiles,
+            sink_class: SinkClass::MemoryPersist,
+            artifact_label: adversarial_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(result.is_denied());
+        assert!(result.denial_reason().unwrap().contains("IntegrityGate"));
+    }
+
+    // ── PathAllowed denials ─────────────────────────────────────────────────
+
+    #[test]
+    fn git_push_operation_to_workspace_sink_denied_path() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::WorkspaceWrite, // wrong sink for GitPush
+            artifact_label: trusted_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(
+            result.is_denied(),
+            "GitPush to WorkspaceWrite should be denied"
+        );
+        let reason = result.denial_reason().unwrap();
+        assert!(
+            reason.contains("PathAllowed"),
+            "denial should mention PathAllowed, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn run_bash_operation_to_git_push_sink_denied_path() {
+        let term = ActionTerm {
+            operation: Operation::RunBash,
+            sink_class: SinkClass::GitPush, // wrong sink for RunBash
+            artifact_label: trusted_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(result.is_denied());
+        assert!(result.denial_reason().unwrap().contains("PathAllowed"));
+    }
+
+    // ── DerivationClear denials ─────────────────────────────────────────────
+
+    #[test]
+    fn ai_derived_artifact_at_git_push_denied_derivation() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: ai_derived_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(
+            result.is_denied(),
+            "AI-derived artifact at GitPush should be denied"
+        );
+        let reason = result.denial_reason().unwrap();
+        assert!(
+            reason.contains("DerivationClear"),
+            "denial should mention DerivationClear, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn ai_derived_artifact_at_git_commit_denied_derivation() {
+        let term = ActionTerm {
+            operation: Operation::GitCommit,
+            sink_class: SinkClass::GitCommit,
+            artifact_label: ai_derived_label(),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_denied());
+    }
+
+    #[test]
+    fn ai_derived_artifact_at_workspace_write_allowed() {
+        // WorkspaceWrite does NOT require verified derivation.
+        let term = ActionTerm {
+            operation: Operation::WriteFiles,
+            sink_class: SinkClass::WorkspaceWrite,
+            artifact_label: ai_derived_label(),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_allowed());
+    }
+
+    // ── NoAdversarialAncestry denials ───────────────────────────────────────
+
+    #[test]
+    fn adversarial_source_label_denied_ancestry() {
+        let term = ActionTerm {
+            operation: Operation::WriteFiles,
+            sink_class: SinkClass::WorkspaceWrite,
+            source_labels: vec![adversarial_label()],
+            artifact_label: trusted_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(result.is_denied(), "adversarial source should be denied");
+        let reason = result.denial_reason().unwrap();
+        assert!(
+            reason.contains("NoAdversarialAncestry"),
+            "denial should mention NoAdversarialAncestry, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn mixed_sources_with_one_adversarial_denied() {
+        let term = ActionTerm {
+            operation: Operation::WriteFiles,
+            sink_class: SinkClass::WorkspaceWrite,
+            source_labels: vec![trusted_label(), adversarial_label()],
+            artifact_label: trusted_label(),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_denied());
+    }
+
+    #[test]
+    fn trusted_source_labels_allowed() {
+        let term = ActionTerm {
+            source_labels: vec![trusted_label(), trusted_label()],
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_allowed());
+    }
+
+    // ── BudgetNotExceeded denials ───────────────────────────────────────────
+
+    #[test]
+    fn non_zero_cost_without_budget_gate_denied() {
+        let term = ActionTerm {
+            estimated_cost_micro_usd: 1_000, // 0.001 USD
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(
+            result.is_denied(),
+            "non-zero cost without budget gate should be denied"
+        );
+        let reason = result.denial_reason().unwrap();
+        assert!(
+            reason.contains("BudgetNotExceeded"),
+            "denial should mention BudgetNotExceeded, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn zero_cost_always_passes_budget() {
+        let term = ActionTerm {
+            estimated_cost_micro_usd: 0,
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_allowed());
+    }
+
+    // ── Sealing: DischargedBundle cannot be forged ──────────────────────────
+
+    #[test]
+    fn discharged_bundle_only_obtainable_via_preflight() {
+        // This test validates the sealing contract: the only way to get a
+        // DischargedBundle is through a successful preflight_action call.
+        // The compile-fail aspect is verified by the doc-test on DischargedBundle.
+        let bundle = preflight_action(&workspace_write_term()).unwrap_bundle();
+        // We can inspect the bundle debug output, confirming fields are present.
+        let debug_str = format!("{bundle:?}");
+        assert!(debug_str.contains("DischargedBundle"));
+        assert!(debug_str.contains("IntegrityGate"));
+        assert!(debug_str.contains("DerivationClear"));
+    }
+
+    // ── PreflightResult helpers ─────────────────────────────────────────────
+
+    #[test]
+    fn preflight_result_is_denied_and_is_allowed_are_exclusive() {
+        let allowed = preflight_action(&workspace_write_term());
+        assert!(allowed.is_allowed());
+        assert!(!allowed.is_denied());
+        assert!(!allowed.requires_approval());
+
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: adversarial_label(),
+            ..workspace_write_term()
+        };
+        let denied = preflight_action(&term);
+        assert!(!denied.is_allowed());
+        assert!(denied.is_denied());
+        assert!(!denied.requires_approval());
+    }
+
+    #[test]
+    fn denial_reason_present_on_denied_result() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: ai_derived_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(result.denial_reason().is_some());
+        assert!(!result.denial_reason().unwrap().is_empty());
+    }
+
+    #[test]
+    fn denial_reason_none_on_allowed_result() {
+        let result = preflight_action(&workspace_write_term());
+        assert!(result.denial_reason().is_none());
+    }
+
+    // ── Obligation ordering: earlier checks take precedence ─────────────────
+
+    #[test]
+    fn integrity_gate_fires_before_derivation_check() {
+        // Artifact is both adversarial AND AI-derived.
+        // IntegrityGate (check 1) should fire before DerivationClear (check 3).
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: IFCLabel {
+                integrity: IntegLevel::Adversarial,
+                derivation: DerivationClass::AIDerived,
+                ..trusted_label()
+            },
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(result.is_denied());
+        assert!(
+            result.denial_reason().unwrap().contains("IntegrityGate"),
+            "IntegrityGate should fire first"
+        );
+    }
+
+    // ── Helper function unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn git_push_sink_requires_verified_derivation() {
+        assert!(sink_requires_verified_derivation(SinkClass::GitPush));
+        assert!(sink_requires_verified_derivation(SinkClass::GitCommit));
+        assert!(sink_requires_verified_derivation(SinkClass::PRCommentWrite));
+    }
+
+    #[test]
+    fn workspace_write_does_not_require_verified_derivation() {
+        assert!(!sink_requires_verified_derivation(
+            SinkClass::WorkspaceWrite
+        ));
+        assert!(!sink_requires_verified_derivation(SinkClass::BashExec));
+        assert!(!sink_requires_verified_derivation(SinkClass::HTTPEgress));
+    }
+
+    #[test]
+    fn git_push_sink_requires_untrusted_min_integrity() {
+        assert_eq!(
+            sink_min_integrity(SinkClass::GitPush),
+            IntegLevel::Untrusted
+        );
+        assert_eq!(
+            sink_min_integrity(SinkClass::GitCommit),
+            IntegLevel::Untrusted
+        );
+        assert_eq!(
+            sink_min_integrity(SinkClass::PRCommentWrite),
+            IntegLevel::Untrusted
+        );
+    }
+
+    #[test]
+    fn workspace_write_accepts_adversarial_min_integrity() {
+        assert_eq!(
+            sink_min_integrity(SinkClass::WorkspaceWrite),
+            IntegLevel::Adversarial
+        );
+    }
+
+    #[test]
+    fn operation_sink_consistency_git_operations() {
+        assert!(operation_allowed_for_sink(
+            Operation::GitPush,
+            SinkClass::GitPush
+        ));
+        assert!(!operation_allowed_for_sink(
+            Operation::GitPush,
+            SinkClass::WorkspaceWrite
+        ));
+        assert!(operation_allowed_for_sink(
+            Operation::GitCommit,
+            SinkClass::GitCommit
+        ));
+        assert!(!operation_allowed_for_sink(
+            Operation::GitCommit,
+            SinkClass::GitPush
+        ));
+        assert!(operation_allowed_for_sink(
+            Operation::CreatePr,
+            SinkClass::PRCommentWrite
+        ));
+    }
+
+    // ── RepairHint tests (#1189) ────────────────────────────────────────────
+
+    #[test]
+    fn integrity_gate_hint_is_raise_integrity() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: adversarial_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        let hint = result.repair_hint().unwrap();
+        assert!(matches!(
+            hint,
+            RepairHint::RaiseIntegrity {
+                actual: IntegLevel::Adversarial,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn path_allowed_hint_is_correct_pair() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::WorkspaceWrite,
+            artifact_label: trusted_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        let hint = result.repair_hint().unwrap();
+        assert!(matches!(
+            hint,
+            RepairHint::CorrectOperationSinkPair {
+                operation: Operation::GitPush,
+                declared_sink: SinkClass::WorkspaceWrite,
+            }
+        ));
+    }
+
+    #[test]
+    fn derivation_hint_is_promote_derivation() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: ai_derived_label(),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        let hint = result.repair_hint().unwrap();
+        assert!(matches!(
+            hint,
+            RepairHint::PromoteDerivation {
+                actual: DerivationClass::AIDerived,
+                sink: SinkClass::GitPush,
+            }
+        ));
+    }
+
+    #[test]
+    fn adversarial_ancestry_hint_is_declassify() {
+        let term = ActionTerm {
+            source_labels: vec![adversarial_label()],
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        let hint = result.repair_hint().unwrap();
+        assert!(matches!(hint, RepairHint::DeclassifyOrReplaceInput { .. }));
+    }
+
+    #[test]
+    fn budget_hint_is_wire_budget_gate() {
+        let term = ActionTerm {
+            estimated_cost_micro_usd: 5_000,
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        let hint = result.repair_hint().unwrap();
+        assert!(matches!(
+            hint,
+            RepairHint::WireBudgetGate {
+                cost_micro_usd: 5_000
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_result_has_no_hint() {
+        let result = preflight_action(&workspace_write_term());
+        assert!(result.repair_hint().is_none());
+    }
+
+    #[test]
+    fn repair_hint_display_is_human_readable() {
+        let hint = RepairHint::RaiseIntegrity {
+            actual: IntegLevel::Adversarial,
+            required: IntegLevel::Untrusted,
+            sink: SinkClass::GitPush,
+        };
+        let msg = hint.to_string();
+        assert!(msg.contains("raise artifact integrity"));
+        assert!(msg.contains("Adversarial"));
+        assert!(msg.contains("Untrusted"));
+    }
+
+    // ── Repair rewriting system tests ───────────────────────────────────
+
+    #[test]
+    fn repair_budget_needs_approval_and_zeroes_cost() {
+        let term = ActionTerm {
+            estimated_cost_micro_usd: 5000,
+            ..workspace_write_term()
+        };
+        let hint = RepairHint::WireBudgetGate {
+            cost_micro_usd: 5000,
+        };
+        let repair = hint.try_repair(&term).unwrap();
+        // Budget zeroing is policy-significant — requires human approval
+        assert!(!repair.is_automatic());
+        assert_eq!(repair.term().estimated_cost_micro_usd, 0);
+        // The repaired term should pass preflight
+        assert!(preflight_action(repair.term()).is_allowed());
+    }
+
+    #[test]
+    fn repair_adversarial_ancestry_needs_approval() {
+        let term = ActionTerm {
+            source_labels: vec![trusted_label(), adversarial_label()],
+            ..workspace_write_term()
+        };
+        let hint = RepairHint::DeclassifyOrReplaceInput {
+            subject: "test".to_string(),
+        };
+        let repair = hint.try_repair(&term).unwrap();
+        // Declassifying adversarial ancestry is security-significant — no auto-laundering
+        assert!(!repair.is_automatic());
+        // Adversarial source removed, trusted remains
+        assert_eq!(repair.term().source_labels.len(), 1);
+        assert_eq!(
+            repair.term().source_labels[0].integrity,
+            IntegLevel::Trusted
+        );
+        // Repaired term should pass preflight
+        assert!(preflight_action(repair.term()).is_allowed());
+    }
+
+    #[test]
+    fn repair_integrity_needs_approval() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: adversarial_label(),
+            ..workspace_write_term()
+        };
+        let hint = RepairHint::RaiseIntegrity {
+            actual: IntegLevel::Adversarial,
+            required: IntegLevel::Untrusted,
+            sink: SinkClass::GitPush,
+        };
+        let repair = hint.try_repair(&term).unwrap();
+        assert!(!repair.is_automatic());
+        // Repaired term has raised integrity
+        assert_eq!(
+            repair.term().artifact_label.integrity,
+            IntegLevel::Untrusted
+        );
+    }
+
+    #[test]
+    fn repair_derivation_needs_approval() {
+        let term = ActionTerm {
+            operation: Operation::GitPush,
+            sink_class: SinkClass::GitPush,
+            artifact_label: ai_derived_label(),
+            ..workspace_write_term()
+        };
+        let hint = RepairHint::PromoteDerivation {
+            actual: DerivationClass::AIDerived,
+            sink: SinkClass::GitPush,
+        };
+        let repair = hint.try_repair(&term).unwrap();
+        assert!(!repair.is_automatic());
+        assert_eq!(
+            repair.term().artifact_label.derivation,
+            DerivationClass::HumanPromoted
+        );
+    }
+
+    #[test]
+    fn repair_operation_sink_mismatch_returns_none() {
+        let term = workspace_write_term();
+        let hint = RepairHint::CorrectOperationSinkPair {
+            operation: Operation::GitPush,
+            declared_sink: SinkClass::WorkspaceWrite,
+        };
+        assert!(hint.try_repair(&term).is_none());
+    }
+
+    #[test]
+    fn full_deny_repair_retry_loop() {
+        // End-to-end: deny → hint → repair (needs approval) → approved term passes
+        let term = ActionTerm {
+            estimated_cost_micro_usd: 1000,
+            ..workspace_write_term()
+        };
+        // First attempt: denied (non-zero cost)
+        let result = preflight_action(&term);
+        assert!(result.is_denied());
+        let hint = result.repair_hint().unwrap();
+        // Repair: cost zeroed, but requires human approval
+        let repair = hint.try_repair(&term).unwrap();
+        assert!(!repair.is_automatic());
+        // After approval, the repaired term passes preflight
+        let retry = preflight_action(repair.term());
+        assert!(retry.is_allowed());
+    }
+
+    // ── Widen 5 → 7: WithinDelegationCeiling + InScopeWithTask ──────────────
+    //
+    // These are the soundness guards for PR-B. The central property is the
+    // NO-VACUOUS-WITNESS rule: a term that is MISSING an input required by one
+    // of the two new obligations must be DENIED — a witness is never minted
+    // from absent evidence.
+
+    #[test]
+    fn happy_path_mints_full_eight_field_bundle() {
+        // All inputs present + in-scope + within ceiling + inputs plumbed →
+        // Allowed with a bundle whose Debug shows all eight obligation witnesses.
+        let bundle = preflight_action(&workspace_write_term()).unwrap_bundle();
+        let dbg = format!("{bundle:?}");
+        for needle in [
+            "IntegrityGate",
+            "PathAllowed",
+            "DerivationClear",
+            "NoAdversarialAncestry",
+            "BudgetNotExceeded",
+            "WithinDelegationCeiling",
+            "InScopeWithTask",
+            "InputsAuthorized",
+        ] {
+            assert!(dbg.contains(needle), "bundle debug missing {needle}: {dbg}");
+        }
+    }
+
+    // ── NO-VACUOUS-WITNESS: InputsAuthorized (widen 7 → 8) ─────────────────
+
+    #[test]
+    fn missing_content_addressed_inputs_denies_inputs_authorized() {
+        // content_addressed_inputs: None (un-plumbed) → must DENY (never mint
+        // InputsAuthorized from an absent inputs channel).
+        let term = ActionTerm {
+            content_addressed_inputs: None,
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(
+            result.is_denied(),
+            "absent content-addressed inputs channel must deny fail-closed"
+        );
+        assert!(
+            result.denial_reason().unwrap().contains("InputsAuthorized"),
+            "denial should name InputsAuthorized, got: {:?}",
+            result.denial_reason()
+        );
+        assert!(matches!(
+            result.repair_hint().unwrap(),
+            RepairHint::ProvideContentAddressedInputs { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_inputs_vec_mints_inputs_authorized_vacuously() {
+        // Some(vec![]) = an action with no inputs = vacuously authorized → Allowed.
+        // Mirrors upstream `!inputs.any(empty_hash)` returning satisfied for zero
+        // inputs. This is the deliberate empty-vec-vs-None asymmetry.
+        let term = ActionTerm {
+            content_addressed_inputs: Some(vec![]),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_allowed());
+    }
+
+    #[test]
+    fn present_content_hashes_mint_inputs_authorized() {
+        // Some(non-empty) with real 32-byte digests → Allowed (presence attested).
+        let term = ActionTerm {
+            content_addressed_inputs: Some(vec![
+                ContentHash::from_bytes([0x11; 32]),
+                ContentHash::from_bytes([0x22; 32]),
+            ]),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_allowed());
+    }
+
+    #[test]
+    fn scope_check_precedes_inputs_check() {
+        // Both scope and inputs un-plumbed: scope (check 7) fires before inputs
+        // (check 8), confirming ordering and short-circuit.
+        let term = ActionTerm {
+            verified_scope: None,
+            content_addressed_inputs: None,
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(
+            result.denial_reason().unwrap().contains("InScopeWithTask"),
+            "scope (check 7) should fire before inputs (check 8)"
+        );
+    }
+
+    #[test]
+    fn provide_inputs_hint_has_no_automatic_repair() {
+        // The un-plumbed inputs state is a wiring defect, not a policy decision —
+        // try_repair returns None (we cannot fabricate content hashes).
+        let term = ActionTerm {
+            content_addressed_inputs: None,
+            ..workspace_write_term()
+        };
+        let hint = preflight_action(&term).repair_hint().unwrap().clone();
+        assert!(matches!(
+            hint,
+            RepairHint::ProvideContentAddressedInputs { .. }
+        ));
+        assert!(hint.try_repair(&term).is_none());
+    }
+
+    // ── NO-VACUOUS-WITNESS: InScopeWithTask ────────────────────────────────
+
+    #[test]
+    fn missing_verified_scope_denies_in_scope_with_task() {
+        // verified_scope: None → must DENY (never mint InScopeWithTask).
+        let term = ActionTerm {
+            verified_scope: None,
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(
+            result.is_denied(),
+            "absent verified scope must deny fail-closed"
+        );
+        assert!(
+            result.denial_reason().unwrap().contains("InScopeWithTask"),
+            "denial should name InScopeWithTask, got: {:?}",
+            result.denial_reason()
+        );
+        assert!(matches!(
+            result.repair_hint().unwrap(),
+            RepairHint::OutOfTaskScope { .. }
+        ));
+    }
+
+    #[test]
+    fn operation_outside_scope_denies_in_scope_with_task() {
+        // scope present but does NOT authorize the operation → DENY.
+        let term = ActionTerm {
+            verified_scope: Some(VerifiedScope {
+                allowed_operations: vec![Operation::ReadFiles], // not WriteFiles
+                allowed_paths: vec![],
+            }),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(result.is_denied());
+        assert!(result.denial_reason().unwrap().contains("InScopeWithTask"));
+    }
+
+    #[test]
+    fn empty_scope_denies_in_scope_with_task_fail_closed() {
+        // Empty allowed_operations = nothing authorized (TokenScope allowlist
+        // semantics) → DENY. This is STRICTER than upstream's empty=allow-all
+        // TaskRef guard, on purpose: a VerifiedScope is a capability-token scope.
+        let term = ActionTerm {
+            verified_scope: Some(VerifiedScope {
+                allowed_operations: vec![],
+                allowed_paths: vec![],
+            }),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_denied());
+    }
+
+    // ── NO-VACUOUS-WITNESS: WithinDelegationCeiling ────────────────────────
+
+    #[test]
+    fn missing_capability_ceiling_denies_within_delegation_ceiling() {
+        let term = ActionTerm {
+            capability_ceiling: None,
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(
+            result.is_denied(),
+            "absent capability ceiling must deny fail-closed"
+        );
+        assert!(
+            result
+                .denial_reason()
+                .unwrap()
+                .contains("WithinDelegationCeiling")
+        );
+    }
+
+    #[test]
+    fn missing_requested_capability_denies_within_delegation_ceiling() {
+        let term = ActionTerm {
+            requested_capability: None,
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(result.is_denied());
+        assert!(
+            result
+                .denial_reason()
+                .unwrap()
+                .contains("WithinDelegationCeiling")
+        );
+    }
+
+    #[test]
+    fn requested_above_ceiling_denies_within_delegation_ceiling() {
+        // requested Always > ceiling LowRisk → DENY with ReduceCapabilityRequest.
+        let term = ActionTerm {
+            capability_ceiling: Some(CapabilityLevel::LowRisk),
+            requested_capability: Some(CapabilityLevel::Always),
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(result.is_denied());
+        assert!(matches!(
+            result.repair_hint().unwrap(),
+            RepairHint::ReduceCapabilityRequest {
+                requested: CapabilityLevel::Always,
+                ceiling: CapabilityLevel::LowRisk,
+            }
+        ));
+    }
+
+    #[test]
+    fn never_ceiling_denies_forbidden_operation() {
+        // The meaningful lift: an operation the policy forbids (ceiling == Never)
+        // is denied because requested LowRisk > Never. Not vacuous.
+        let term = ActionTerm {
+            capability_ceiling: Some(CapabilityLevel::Never),
+            requested_capability: Some(CapabilityLevel::LowRisk),
+            ..workspace_write_term()
+        };
+        assert!(preflight_action(&term).is_denied());
+    }
+
+    #[test]
+    fn ceiling_check_precedes_scope_check() {
+        // Both new inputs bad: ceiling fires (check 6) before scope (check 7).
+        let term = ActionTerm {
+            capability_ceiling: None,
+            verified_scope: None,
+            ..workspace_write_term()
+        };
+        let result = preflight_action(&term);
+        assert!(
+            result
+                .denial_reason()
+                .unwrap()
+                .contains("WithinDelegationCeiling"),
+            "ceiling (check 6) should fire before scope (check 7)"
+        );
+    }
+}

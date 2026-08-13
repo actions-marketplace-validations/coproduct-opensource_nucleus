@@ -34,10 +34,13 @@
 //! let yaml = profile.to_yaml().unwrap();
 //! println!("{}", yaml);
 //!
-//! // Exposure analysis is included in the summary
+//! // Exposure analysis is included in the summary. Note (most-paranoid #4):
+//! // EditFiles and GitCommit are now exfiltration legs (a tainted secret
+//! // written/committed locally is an exfil channel), so observing
+//! // read + web + edit + commit reveals the full uninhabitable trifecta.
 //! let summary = session.summary();
-//! assert_eq!(summary.exposure_count, 2); // PrivateData + UntrustedContent
-//! assert!(!summary.state_uninhabitable);
+//! assert_eq!(summary.exposure_count, 3); // PrivateData + UntrustedContent + ExfilVector
+//! assert!(summary.state_uninhabitable);
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -292,6 +295,7 @@ impl ObserveSession {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            spawn_agent: CapabilityLevel::Never,
         };
 
         // For each observed operation, set to LowRisk (minimum to permit)
@@ -310,6 +314,7 @@ impl ObserveSession {
                 Operation::GitPush => caps.git_push = level,
                 Operation::CreatePr => caps.create_pr = level,
                 Operation::ManagePods => caps.manage_pods = level,
+                Operation::SpawnAgent => caps.spawn_agent = level,
             }
         }
 
@@ -498,6 +503,7 @@ fn parse_operation(s: &str) -> Option<Operation> {
         "git_push" => Some(Operation::GitPush),
         "create_pr" => Some(Operation::CreatePr),
         "manage_pods" => Some(Operation::ManagePods),
+        "spawn_agent" => Some(Operation::SpawnAgent),
         // Python SDK names (dotted format from trace.export_jsonl())
         "fs.read" => Some(Operation::ReadFiles),
         "fs.write" => Some(Operation::WriteFiles),

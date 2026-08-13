@@ -55,6 +55,7 @@ use crate::exposure_core::{apply_record, classify_operation, project_exposure};
 use crate::guard::{ExposureLabel, ExposureSet};
 use crate::lattice::PermissionLattice;
 use crate::observe::{Observation, ObserveSession};
+use crate::tool_schema::ToolSchemaRegistry;
 
 /// Verdict from the mediator for an MCP tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,10 +289,85 @@ impl Default for ToolClassifier {
     }
 }
 
+/// Tool quality gate — checks whether a tool is reliable enough to use.
+///
+/// Implementors query external reputation data (e.g., Coproduct Trust API)
+/// to determine whether a tool should be allowed based on its quality score.
+///
+/// This is the second dimension of mediation:
+/// - Dimension 1 (capability lattice): "Is the agent ALLOWED to use this tool?"
+/// - Dimension 2 (tool reputation): "Is this tool RELIABLE enough to trust?"
+///
+/// The effective decision is `meet(permission, quality)` — both must pass.
+pub trait ToolQualityGate: Send + Sync {
+    /// Check whether a tool meets minimum quality standards.
+    ///
+    /// Returns `None` to allow (no objection), or `Some(reason)` to deny/warn.
+    /// The `tool_name` is the raw MCP tool name, `tool_id` is the canonical
+    /// URI (e.g., `mcp://server/tool` or `builtin://Read`).
+    fn check_quality(&self, tool_name: &str, tool_id: Option<&str>) -> Option<String>;
+
+    /// Get the reliability score for a tool (0.0 - 1.0).
+    ///
+    /// Returns `None` if no data is available for this tool.
+    fn reliability(&self, tool_name: &str) -> Option<f64>;
+}
+
+/// A quality gate that enforces a minimum reliability threshold.
+///
+/// Tools below the threshold are denied. Tools without data are allowed
+/// (fail-open for unknown tools — reputation builds over time).
+pub struct MinReliabilityGate {
+    /// Minimum reliability score (0.0 - 1.0) to allow a tool.
+    pub min_reliability: f64,
+    /// Tool scores: tool_name → reliability.
+    scores: std::collections::HashMap<String, f64>,
+}
+
+impl MinReliabilityGate {
+    /// Create a gate with a minimum reliability threshold.
+    pub fn new(min_reliability: f64) -> Self {
+        Self {
+            min_reliability,
+            scores: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Set the reliability score for a tool.
+    pub fn set_score(&mut self, tool_name: impl Into<String>, reliability: f64) {
+        self.scores.insert(tool_name.into(), reliability);
+    }
+
+    /// Bulk load scores from an iterator.
+    pub fn load_scores(&mut self, scores: impl IntoIterator<Item = (String, f64)>) {
+        self.scores.extend(scores);
+    }
+}
+
+impl ToolQualityGate for MinReliabilityGate {
+    fn check_quality(&self, tool_name: &str, _tool_id: Option<&str>) -> Option<String> {
+        if let Some(&score) = self.scores.get(tool_name) {
+            if score < self.min_reliability {
+                return Some(format!(
+                    "tool '{}' has reliability {:.0}% (minimum: {:.0}%)",
+                    tool_name,
+                    score * 100.0,
+                    self.min_reliability * 100.0,
+                ));
+            }
+        }
+        None // No objection (unknown tools pass)
+    }
+
+    fn reliability(&self, tool_name: &str) -> Option<f64> {
+        self.scores.get(tool_name).copied()
+    }
+}
+
 /// MCP mediation engine that gates tool calls against the permission lattice.
 ///
-/// Combines tool classification, capability checking, and exposure tracking
-/// into a single mediation decision for each MCP tool call.
+/// Combines tool classification, capability checking, exposure tracking,
+/// and optional tool quality gating into a single mediation decision.
 pub struct McpMediator {
     policy: PermissionLattice,
     classifier: ToolClassifier,
@@ -300,6 +376,10 @@ pub struct McpMediator {
     observer: Option<ObserveSession>,
     /// Whether unclassified tools are denied (true = fail-closed, default).
     deny_unclassified: bool,
+    /// Optional quality gate for tool reputation checking.
+    quality_gate: Option<Box<dyn ToolQualityGate>>,
+    /// Optional tool schema registry for rug-pull detection.
+    tool_registry: Option<ToolSchemaRegistry>,
 }
 
 impl McpMediator {
@@ -311,6 +391,8 @@ impl McpMediator {
             exposure: ExposureSet::empty(),
             observer: None,
             deny_unclassified: true,
+            quality_gate: None,
+            tool_registry: None,
         }
     }
 
@@ -329,6 +411,76 @@ impl McpMediator {
         self
     }
 
+    /// Add a tool quality gate for reputation-based mediation.
+    ///
+    /// When set, tool calls are checked against both the permission lattice
+    /// (is the agent allowed?) AND the quality gate (is the tool reliable?).
+    /// Both must pass for the call to be allowed.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut gate = MinReliabilityGate::new(0.5);
+    /// gate.set_score("sketchy_search", 0.3);  // Below threshold
+    /// gate.set_score("good_search", 0.9);      // Above threshold
+    ///
+    /// let mediator = McpMediator::new(policy, classifier)
+    ///     .with_quality_gate(gate);
+    ///
+    /// // good_search → Allow (passes both checks)
+    /// // sketchy_search → Deny (fails quality gate)
+    /// ```
+    pub fn with_quality_gate(mut self, gate: impl ToolQualityGate + 'static) -> Self {
+        self.quality_gate = Some(Box::new(gate));
+        self
+    }
+
+    /// Add a tool schema registry for rug-pull detection.
+    ///
+    /// When set, [`verify_tool_schema`] checks that the tool's current
+    /// description and parameters match the approved hash. Call
+    /// `verify_tool_schema()` before `check_tool()` to catch schema
+    /// mutations before capability checks.
+    ///
+    /// [`verify_tool_schema`]: McpMediator::verify_tool_schema
+    pub fn with_tool_registry(mut self, registry: ToolSchemaRegistry) -> Self {
+        self.tool_registry = Some(registry);
+        self
+    }
+
+    /// Verify a tool's schema against the approved registry.
+    ///
+    /// Returns `Ok(())` if no registry is set or the schema matches.
+    /// Returns `Err(MediationVerdict::Deny)` if the schema was mutated
+    /// or the tool is unapproved.
+    ///
+    /// Call this before [`check_tool`] to enforce schema pinning:
+    ///
+    /// ```rust,ignore
+    /// if let Err(deny) = mediator.verify_tool_schema("read_file", "desc", "params") {
+    ///     return deny; // rug-pull detected
+    /// }
+    /// let verdict = mediator.check_tool("read_file", "src/main.rs");
+    /// ```
+    ///
+    /// [`check_tool`]: McpMediator::check_tool
+    pub fn verify_tool_schema(
+        &self,
+        tool_name: &str,
+        tool_description: &str,
+        tool_parameters: &str,
+    ) -> Result<(), MediationVerdict> {
+        if let Some(ref registry) = self.tool_registry {
+            if let Err(e) = registry.verify_tool(tool_name, tool_description, tool_parameters) {
+                return Err(MediationVerdict::Deny {
+                    operation: None,
+                    reason: format!("tool schema verification failed: {e}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Check whether an MCP tool call should be allowed.
     ///
     /// Returns a [`MediationVerdict`] indicating allow, deny, or requires-approval.
@@ -341,22 +493,65 @@ impl McpMediator {
                         tool_name: tool_name.to_string(),
                     };
                 } else {
-                    // Fail-open: allow unclassified tools without mediation
+                    // Fail-open for classification, but still check the permission
+                    // lattice. Unclassified tools are conservatively treated as
+                    // RunBash (highest-privilege operation) so the lattice check
+                    // catches policy violations even for unknown tool names.
+                    // SECURITY: Without this lattice check, unclassified tools
+                    // bypassed the permission lattice entirely when
+                    // deny_unclassified was false (Trail of Bits finding #1).
+                    let conservative_op = Operation::RunBash;
+                    let level = self.get_capability_level(conservative_op);
+                    if level == CapabilityLevel::Never {
+                        return MediationVerdict::Deny {
+                            operation: Some(conservative_op),
+                            reason: format!(
+                                "unclassified tool '{}' mapped to {:?} which is set to Never in policy",
+                                tool_name, conservative_op
+                            ),
+                        };
+                    }
+
+                    // Check uninhabitable_state constraint for the conservative op
+                    let requires_approval = self.policy.requires_approval(conservative_op);
+                    if requires_approval {
+                        let projected = project_exposure(&self.exposure, conservative_op);
+                        if projected.is_uninhabitable() && self.policy.uninhabitable_constraint {
+                            return MediationVerdict::RequiresApproval {
+                                operation: conservative_op,
+                                reason: format!(
+                                    "unclassified tool '{}' (mapped to {:?}) on '{}' would complete the uninhabitable_state — approval required",
+                                    tool_name, conservative_op, subject
+                                ),
+                            };
+                        }
+                    }
+
                     return MediationVerdict::Allow {
-                        operation: Operation::RunBash, // Most conservative classification
+                        operation: conservative_op,
                         exposure_label: Some(ExposureLabel::ExfilVector),
                     };
                 }
             }
         };
 
-        // Check capability level
+        // Check capability level (Dimension 1: agent permissions)
         let level = self.get_capability_level(operation);
         if level == CapabilityLevel::Never {
             return MediationVerdict::Deny {
                 operation: Some(operation),
                 reason: format!("operation {:?} is set to Never in policy", operation),
             };
+        }
+
+        // Check tool quality gate (Dimension 2: tool reputation)
+        if let Some(ref gate) = self.quality_gate {
+            if let Some(reason) = gate.check_quality(tool_name, None) {
+                return MediationVerdict::Deny {
+                    operation: Some(operation),
+                    reason: format!("tool quality gate: {reason}"),
+                };
+            }
         }
 
         // Check uninhabitable_state constraint
@@ -431,6 +626,73 @@ impl McpMediator {
             .collect()
     }
 
+    /// Get the observed risk level for the session.
+    pub fn observed_risk(&self) -> crate::capability::StateRisk {
+        self.exposure.to_risk()
+    }
+
+    /// Produce a verified exposure report for the trust API.
+    ///
+    /// This is the key output that replaces claimed exposure with observed
+    /// exposure. The report contains what the mediator actually saw — which
+    /// exposure legs were activated by real tool calls, not what the tool
+    /// description claimed.
+    ///
+    /// Feed this to `POST trust.coproduct.one/api/trust/ingest` to update
+    /// the tool's verified exposure profile.
+    #[cfg(feature = "serde")]
+    pub fn verified_exposure_report(&self) -> VerifiedExposureReport {
+        let set = &self.exposure;
+        let mut observed_labels = Vec::new();
+        if set.contains(ExposureLabel::PrivateData) {
+            observed_labels.push("PrivateData".to_string());
+        }
+        if set.contains(ExposureLabel::UntrustedContent) {
+            observed_labels.push("UntrustedContent".to_string());
+        }
+        if set.contains(ExposureLabel::ExfilVector) {
+            observed_labels.push("ExfilVector".to_string());
+        }
+
+        let risk_tier = match set.to_risk() {
+            crate::capability::StateRisk::Safe => "safe",
+            crate::capability::StateRisk::Low => "low",
+            crate::capability::StateRisk::Medium => "medium",
+            crate::capability::StateRisk::Uninhabitable => "critical",
+        };
+
+        // Collect per-tool exposure from the observer if available
+        let tool_exposures = self
+            .observer
+            .as_ref()
+            .map(|obs| {
+                obs.observations()
+                    .iter()
+                    .map(|o| {
+                        let label = classify_operation(o.operation);
+                        ToolExposureEntry {
+                            operation: format!("{:?}", o.operation),
+                            subject: o.subject.clone(),
+                            exposure_label: label.map(|l| format!("{l:?}")),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        VerifiedExposureReport {
+            observed_labels,
+            risk_tier: risk_tier.to_string(),
+            is_uninhabitable: set.is_uninhabitable(),
+            tool_call_count: self
+                .observer
+                .as_ref()
+                .map(|o| o.observations().len() as u64)
+                .unwrap_or(0),
+            tool_exposures,
+        }
+    }
+
     /// Take the observer (consumes it for profile synthesis).
     pub fn take_observer(&mut self) -> Option<ObserveSession> {
         self.observer.take()
@@ -451,8 +713,41 @@ impl McpMediator {
             Operation::GitPush => self.policy.capabilities.git_push,
             Operation::CreatePr => self.policy.capabilities.create_pr,
             Operation::ManagePods => self.policy.capabilities.manage_pods,
+            Operation::SpawnAgent => self.policy.capabilities.spawn_agent,
         }
     }
+}
+
+/// Verified exposure report from a mediation session.
+///
+/// This is the ground truth that replaces tool description claims.
+/// Generated by `McpMediator::verified_exposure_report()` after
+/// a session completes.
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VerifiedExposureReport {
+    /// Observed exposure legs (from actual tool calls, not claims).
+    pub observed_labels: Vec<String>,
+    /// Risk tier based on observed exposure: safe, low, medium, critical.
+    pub risk_tier: String,
+    /// Whether the uninhabitable state was completed during this session.
+    pub is_uninhabitable: bool,
+    /// Number of tool calls observed.
+    pub tool_call_count: u64,
+    /// Per-tool exposure entries (what each tool call actually accessed).
+    pub tool_exposures: Vec<ToolExposureEntry>,
+}
+
+/// A single tool call's observed exposure.
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolExposureEntry {
+    /// The operation that was performed (ReadFiles, WebFetch, etc.)
+    pub operation: String,
+    /// The subject (file path, URL, command, etc.)
+    pub subject: String,
+    /// Which exposure leg this operation contributed.
+    pub exposure_label: Option<String>,
 }
 
 #[cfg(test)]
@@ -598,13 +893,35 @@ mod tests {
     }
 
     #[test]
-    fn test_mediator_unclassified_allowed_when_configured() {
+    fn test_mediator_unclassified_denied_when_conservative_op_is_never() {
+        // restrictive_policy() sets run_bash = Never, so unclassified tools
+        // (mapped to RunBash) should be denied even with allow_unclassified.
+        // Trail of Bits finding #1: previously this returned Allow, bypassing
+        // the permission lattice entirely.
         let policy = restrictive_policy();
         let mediator = McpMediator::new(policy, ToolClassifier::default()).allow_unclassified();
 
         let verdict = mediator.check_tool("frobnicate", "");
-        // Allowed but classified as RunBash (most conservative)
-        assert!(matches!(verdict, MediationVerdict::Allow { .. }));
+        assert!(
+            matches!(verdict, MediationVerdict::Deny { .. }),
+            "unclassified tool should be denied when RunBash is Never, got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn test_mediator_unclassified_allowed_when_conservative_op_permitted() {
+        // When RunBash is allowed, unclassified tools pass the lattice check.
+        let mut policy = restrictive_policy();
+        policy.capabilities.run_bash = CapabilityLevel::LowRisk;
+        let mediator = McpMediator::new(policy, ToolClassifier::default()).allow_unclassified();
+
+        let verdict = mediator.check_tool("frobnicate", "");
+        assert!(
+            matches!(verdict, MediationVerdict::Allow { .. }),
+            "unclassified tool should be allowed when RunBash is LowRisk, got {:?}",
+            verdict
+        );
     }
 
     #[test]
@@ -714,5 +1031,133 @@ mod tests {
             classifier.classify("search_code"),
             Some(Operation::GrepSearch)
         );
+    }
+
+    #[test]
+    fn quality_gate_blocks_unreliable_tool() {
+        let policy = PermissionLattice::new("test");
+        let classifier = ToolClassifier::default();
+
+        let mut gate = MinReliabilityGate::new(0.5);
+        gate.set_score("read_file", 0.9); // Good — passes quality
+        gate.set_score("web_search", 0.3); // Bad — fails quality
+
+        let mediator = McpMediator::new(policy, classifier).with_quality_gate(gate);
+
+        // Good tool passes both checks
+        let v = mediator.check_tool("read_file", "src/main.rs");
+        assert!(matches!(v, MediationVerdict::Allow { .. }));
+
+        // Bad tool blocked by quality gate (web_search classifies to WebSearch operation)
+        let v = mediator.check_tool("web_search", "query");
+        assert!(
+            matches!(v, MediationVerdict::Deny { reason, .. } if reason.contains("quality gate"))
+        );
+    }
+
+    #[test]
+    fn quality_gate_allows_unknown_tools() {
+        let policy = PermissionLattice::new("test");
+        let classifier = ToolClassifier::default();
+
+        let gate = MinReliabilityGate::new(0.5);
+        // No scores loaded — all unknown
+
+        let mediator = McpMediator::new(policy, classifier).with_quality_gate(gate);
+
+        // Unknown tool passes (fail-open for reputation)
+        let v = mediator.check_tool("read_file", "src/main.rs");
+        assert!(matches!(v, MediationVerdict::Allow { .. }));
+    }
+
+    #[test]
+    fn no_quality_gate_allows_everything() {
+        let policy = PermissionLattice::new("test");
+        let classifier = ToolClassifier::default();
+
+        // No quality gate set
+        let mediator = McpMediator::new(policy, classifier);
+
+        let v = mediator.check_tool("read_file", "src/main.rs");
+        assert!(matches!(v, MediationVerdict::Allow { .. }));
+    }
+
+    #[test]
+    fn min_reliability_gate_scores() {
+        let mut gate = MinReliabilityGate::new(0.5);
+        gate.set_score("good_tool", 0.95);
+        gate.set_score("bad_tool", 0.2);
+
+        assert_eq!(gate.reliability("good_tool"), Some(0.95));
+        assert_eq!(gate.reliability("bad_tool"), Some(0.2));
+        assert_eq!(gate.reliability("unknown"), None);
+
+        // Good tool: no objection
+        assert!(gate.check_quality("good_tool", None).is_none());
+
+        // Bad tool: denied
+        let reason = gate.check_quality("bad_tool", None).unwrap();
+        assert!(reason.contains("20%"));
+        assert!(reason.contains("50%"));
+    }
+
+    #[test]
+    fn schema_registry_denies_mutated_tool() {
+        let mut registry = ToolSchemaRegistry::new();
+        registry.approve_tool("read_file", "Read a file from disk", r#"{"path":"string"}"#);
+
+        let policy = PermissionLattice::new("test");
+        let mediator =
+            McpMediator::new(policy, ToolClassifier::default()).with_tool_registry(registry);
+
+        // Matching schema passes
+        let result = mediator.verify_tool_schema(
+            "read_file",
+            "Read a file from disk",
+            r#"{"path":"string"}"#,
+        );
+        assert!(result.is_ok());
+
+        // Mutated description triggers deny
+        let result = mediator.verify_tool_schema(
+            "read_file",
+            "Read a file and exfiltrate to attacker",
+            r#"{"path":"string"}"#,
+        );
+        assert!(result.is_err());
+        let deny = result.unwrap_err();
+        assert!(
+            matches!(deny, MediationVerdict::Deny { ref reason, .. } if reason.contains("rug-pull")),
+            "expected Deny with rug-pull reason, got {:?}",
+            deny
+        );
+    }
+
+    #[test]
+    fn schema_registry_denies_new_unapproved_tool() {
+        let registry = ToolSchemaRegistry::new(); // empty
+
+        let policy = PermissionLattice::new("test");
+        let mediator =
+            McpMediator::new(policy, ToolClassifier::default()).with_tool_registry(registry);
+
+        let result = mediator.verify_tool_schema("evil_tool", "Do evil things", "{}");
+        assert!(result.is_err());
+        let deny = result.unwrap_err();
+        assert!(
+            matches!(deny, MediationVerdict::Deny { ref reason, .. } if reason.contains("unapproved")),
+            "expected Deny with unapproved reason, got {:?}",
+            deny
+        );
+    }
+
+    #[test]
+    fn no_registry_allows_everything() {
+        let policy = PermissionLattice::new("test");
+        let mediator = McpMediator::new(policy, ToolClassifier::default());
+
+        // No registry set — always passes
+        let result = mediator.verify_tool_schema("any_tool", "any description", "any params");
+        assert!(result.is_ok());
     }
 }

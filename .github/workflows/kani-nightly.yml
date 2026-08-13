@@ -5,11 +5,13 @@ on:
     branches: ["main"]
     paths:
       - "crates/portcullis/src/**"
+      - "crates/ck-*/src/**"
       - ".kani-minimum-proofs"
       - ".github/workflows/kani-nightly.yml"
   pull_request:
     paths:
       - "crates/portcullis/src/**"
+      - "crates/ck-*/src/**"
       - ".kani-minimum-proofs"
       - ".github/workflows/kani-nightly.yml"
   schedule:
@@ -30,18 +32,26 @@ jobs:
     timeout-minutes: 15
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.9.1
         with:
           cache-on-failure: true
       - name: Cache Kani toolchain
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.kani
-          key: kani-toolchain-${{ runner.os }}-${{ hashFiles('.github/workflows/kani-nightly.yml') }}
+          # Key on the PINNED Kani version, NOT the workflow file: hashing the
+          # whole file re-downloaded the ~1 GB toolchain on every unrelated edit.
+          # Bump this suffix together with the `kani-version` input below when
+          # upgrading Kani.
+          key: kani-toolchain-${{ runner.os }}-kani-0.67.0
       - name: Run Kani (fast harnesses)
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
+          # Pin the verifier version for reproducible proofs (default is
+          # "latest", which silently changes what Kani checks) and to make the
+          # toolchain cache key above stable. Bump both together.
+          kani-version: "0.67.0"
           args: >-
             -p portcullis
             --solver cadical
@@ -52,17 +62,23 @@ jobs:
             --harness proof_clinejection_blocked
       - name: Proof count regression gate
         run: |
-          PROOF_COUNT=$(grep -c '#\[kani::proof\]' crates/portcullis/src/kani.rs)
+          PORTCULLIS=$(grep -c '#\[kani::proof\]' crates/portcullis/src/kani.rs)
+          CK_KERNEL=$(grep -c '#\[kani::proof\]' crates/ck-kernel/src/kani.rs)
+          CORE=$(grep -rc '#\[kani::proof\]' crates/portcullis-core/src/ || echo 0)
+          PROOF_COUNT=$((PORTCULLIS + CK_KERNEL + CORE))
           MINIMUM=$(cat .kani-minimum-proofs | tr -d '[:space:]')
-          echo "Kani proof harnesses: $PROOF_COUNT (minimum: $MINIMUM)"
+          echo "Kani proof harnesses: $PROOF_COUNT (portcullis: $PORTCULLIS, ck-kernel: $CK_KERNEL, minimum: $MINIMUM)"
           if [ "$PROOF_COUNT" -lt "$MINIMUM" ]; then
-            echo "::error::Kani proof count regression: $PROOF_COUNT < $MINIMUM"
+            echo "::error::Kani proof count regression: $PROOF_COUNT < $MINIMUM (portcullis: $PORTCULLIS, ck-kernel: $CK_KERNEL)"
             exit 1
           fi
       - name: Summary
         if: always()
         run: |
-          PROOF_COUNT=$(grep -c '#\[kani::proof\]' crates/portcullis/src/kani.rs)
+          PORTCULLIS=$(grep -c '#\[kani::proof\]' crates/portcullis/src/kani.rs)
+          CK_KERNEL=$(grep -c '#\[kani::proof\]' crates/ck-kernel/src/kani.rs)
+          CORE=$(grep -rc '#\[kani::proof\]' crates/portcullis-core/src/ || echo 0)
+          PROOF_COUNT=$((PORTCULLIS + CK_KERNEL + CORE))
           MINIMUM=$(cat .kani-minimum-proofs | tr -d '[:space:]')
           echo "## Kani BMC Results (fast tier)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -70,6 +86,91 @@ jobs:
           echo "- **Solver:** CaDiCaL" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Minimum required:** $MINIMUM" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Full suite:** nightly + workflow_dispatch" >> "$GITHUB_STEP_SUMMARY"
+
+  # Constitutional Kernel (fast): 4 concrete-policy proofs — no symbolic BTreeSet
+  # These use only concrete BTreeSets + symbolic u64, finishing in <10 min.
+  # The 7 symbolic BTreeSet proofs (capability, governance, I/O axes) run nightly.
+  kani-constitutional:
+    name: Kani (constitutional kernel)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.9.1
+        with:
+          cache-on-failure: true
+      - name: Cache Kani toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.kani
+          # Key on the PINNED Kani version, NOT the workflow file: hashing the
+          # whole file re-downloaded the ~1 GB toolchain on every unrelated edit.
+          # Bump this suffix together with the `kani-version` input below when
+          # upgrading Kani.
+          key: kani-toolchain-${{ runner.os }}-kani-0.67.0
+      - name: Run Kani (constitutional kernel — fast tier)
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          # Pin the verifier version for reproducible proofs (default is
+          # "latest", which silently changes what Kani checks) and to make the
+          # toolchain cache key above stable. Bump both together.
+          kani-version: "0.67.0"
+          args: >-
+            -p ck-kernel
+            --solver cadical
+            --harness proof_budget_escalation_detected
+            --harness proof_capability_escalation_detected_bitmask
+            --harness proof_io_confinement_detected_bitmask
+            --harness proof_combined_monotonicity_complete
+            --harness proof_capability_subset_transitive
+      - name: Summary
+        if: always()
+        run: |
+          TOTAL=$(grep -c '#\[kani::proof\]' crates/ck-kernel/src/kani.rs)
+          echo "## Kani BMC — Constitutional Kernel (fast tier)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Harnesses verified:** 5 / $TOTAL (fast tier — pure bitmask)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Proved:** budget escalation, capability non-escalation, I/O confinement, combined monotonicity, lattice transitivity" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Nightly:** 11 symbolic BTreeSet proofs via admit() pipeline" >> "$GITHUB_STEP_SUMMARY"
+
+  # Constitutional Kernel (full): all 11 harnesses including symbolic BTreeSet proofs
+  # symbolic_set() proofs take 5-15 min each due to BTreeSet node machinery.
+  kani-constitutional-full:
+    name: Kani (constitutional kernel full)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.9.1
+        with:
+          cache-on-failure: true
+      - name: Cache Kani toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.kani
+          # Key on the PINNED Kani version, NOT the workflow file: hashing the
+          # whole file re-downloaded the ~1 GB toolchain on every unrelated edit.
+          # Bump this suffix together with the `kani-version` input below when
+          # upgrading Kani.
+          key: kani-toolchain-${{ runner.os }}-kani-0.67.0
+      - name: Run Kani (constitutional kernel — all harnesses)
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          # Pin the verifier version for reproducible proofs (default is
+          # "latest", which silently changes what Kani checks) and to make the
+          # toolchain cache key above stable. Bump both together.
+          kani-version: "0.67.0"
+          args: "-p ck-kernel --solver cadical"
+      - name: Summary
+        if: always()
+        run: |
+          TOTAL=$(grep -c '#\[kani::proof\]' crates/ck-kernel/src/kani.rs)
+          echo "## Kani BMC — Constitutional Kernel (full)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Harnesses verified:** $TOTAL / $TOTAL (all)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Proved:** ALL constitutional invariants including symbolic BTreeSet proofs" >> "$GITHUB_STEP_SUMMARY"
 
   # Full tier: all harnesses including normalize_* — nightly and on-demand only
   # normalize_* harnesses each take 15+ minutes due to large symbolic state space
@@ -79,32 +180,46 @@ jobs:
     timeout-minutes: 60
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.9.1
         with:
           cache-on-failure: true
       - name: Cache Kani toolchain
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.kani
-          key: kani-toolchain-${{ runner.os }}-${{ hashFiles('.github/workflows/kani-nightly.yml') }}
+          # Key on the PINNED Kani version, NOT the workflow file: hashing the
+          # whole file re-downloaded the ~1 GB toolchain on every unrelated edit.
+          # Bump this suffix together with the `kani-version` input below when
+          # upgrading Kani.
+          key: kani-toolchain-${{ runner.os }}-kani-0.67.0
       - name: Run Kani (all harnesses)
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
+          # Pin the verifier version for reproducible proofs (default is
+          # "latest", which silently changes what Kani checks) and to make the
+          # toolchain cache key above stable. Bump both together.
+          kani-version: "0.67.0"
           args: "-p portcullis --solver cadical"
       - name: Proof count regression gate
         run: |
-          PROOF_COUNT=$(grep -c '#\[kani::proof\]' crates/portcullis/src/kani.rs)
+          PORTCULLIS=$(grep -c '#\[kani::proof\]' crates/portcullis/src/kani.rs)
+          CK_KERNEL=$(grep -c '#\[kani::proof\]' crates/ck-kernel/src/kani.rs)
+          CORE=$(grep -rc '#\[kani::proof\]' crates/portcullis-core/src/ || echo 0)
+          PROOF_COUNT=$((PORTCULLIS + CK_KERNEL + CORE))
           MINIMUM=$(cat .kani-minimum-proofs | tr -d '[:space:]')
-          echo "Kani proof harnesses: $PROOF_COUNT (minimum: $MINIMUM)"
+          echo "Kani proof harnesses: $PROOF_COUNT (portcullis: $PORTCULLIS, ck-kernel: $CK_KERNEL, minimum: $MINIMUM)"
           if [ "$PROOF_COUNT" -lt "$MINIMUM" ]; then
-            echo "::error::Kani proof count regression: $PROOF_COUNT < $MINIMUM"
+            echo "::error::Kani proof count regression: $PROOF_COUNT < $MINIMUM (portcullis: $PORTCULLIS, ck-kernel: $CK_KERNEL)"
             exit 1
           fi
       - name: Summary
         if: always()
         run: |
-          PROOF_COUNT=$(grep -c '#\[kani::proof\]' crates/portcullis/src/kani.rs)
+          PORTCULLIS=$(grep -c '#\[kani::proof\]' crates/portcullis/src/kani.rs)
+          CK_KERNEL=$(grep -c '#\[kani::proof\]' crates/ck-kernel/src/kani.rs)
+          CORE=$(grep -rc '#\[kani::proof\]' crates/portcullis-core/src/ || echo 0)
+          PROOF_COUNT=$((PORTCULLIS + CK_KERNEL + CORE))
           MINIMUM=$(cat .kani-minimum-proofs | tr -d '[:space:]')
           echo "## Kani BMC Results (full suite)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"

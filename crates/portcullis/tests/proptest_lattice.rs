@@ -3,6 +3,8 @@
 //! These tests use proptest to verify that the lattice operations
 //! satisfy the required algebraic properties.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use portcullis::{
     BudgetLattice, CapabilityLattice, CapabilityLevel, CommandLattice, Operation, PathLattice,
     PermissionLattice, TimeLattice,
@@ -22,33 +24,39 @@ fn arb_capability_level() -> impl Strategy<Value = CapabilityLevel> {
 // Strategy for generating arbitrary CapabilityLattice
 fn arb_capability_lattice() -> impl Strategy<Value = CapabilityLattice> {
     (
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
+        (
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+        ),
         arb_capability_level(),
     )
         .prop_map(
             |(
-                read_files,
-                write_files,
-                edit_files,
-                run_bash,
-                glob_search,
-                grep_search,
-                web_search,
-                web_fetch,
-                git_commit,
-                git_push,
-                create_pr,
-                manage_pods,
+                (
+                    read_files,
+                    write_files,
+                    edit_files,
+                    run_bash,
+                    glob_search,
+                    grep_search,
+                    web_search,
+                    web_fetch,
+                    git_commit,
+                    git_push,
+                    create_pr,
+                    manage_pods,
+                ),
+                spawn_agent,
             )| {
                 CapabilityLattice {
                     read_files,
@@ -63,6 +71,7 @@ fn arb_capability_lattice() -> impl Strategy<Value = CapabilityLattice> {
                     git_push,
                     create_pr,
                     manage_pods,
+                    spawn_agent,
                     extensions: std::collections::BTreeMap::new(),
                 }
             },
@@ -310,11 +319,13 @@ proptest! {
         a in arb_capability_lattice(),
         enforce in any::<bool>()
     ) {
-        let perms = PermissionLattice {
-            capabilities: a,
-            obligations: Default::default(),
-            uninhabitable_constraint: enforce,
-            ..PermissionLattice::default()
+        let perms = {
+            let mut p = PermissionLattice::default();
+            p.capabilities = a;
+            p.obligations = Default::default();
+            // uninhabitable_constraint is private — enforce param unused
+            let _ = enforce;
+            p
         };
 
         let once = perms.clone().normalize();
@@ -327,11 +338,11 @@ proptest! {
     fn permission_normalize_is_deflationary_when_enforced(
         a in arb_capability_lattice()
     ) {
-        let perms = PermissionLattice {
-            capabilities: a,
-            obligations: Default::default(),
-            uninhabitable_constraint: true,
-            ..PermissionLattice::default()
+        let perms = {
+            let mut p = PermissionLattice::default();
+            p.capabilities = a;
+            p.obligations = Default::default();
+            p
         };
 
         let normalized = perms.clone().normalize();
@@ -353,17 +364,17 @@ proptest! {
         b in arb_capability_lattice()
     ) {
         // Build two permission lattices with uninhabitable_state constraint enforced
-        let perms_a = PermissionLattice {
-            capabilities: a,
-            obligations: Default::default(),
-            uninhabitable_constraint: true,
-            ..PermissionLattice::default()
+        let perms_a = {
+            let mut p = PermissionLattice::default();
+            p.capabilities = a;
+            p.obligations = Default::default();
+            p
         };
-        let perms_b = PermissionLattice {
-            capabilities: b,
-            obligations: Default::default(),
-            uninhabitable_constraint: true,
-            ..PermissionLattice::default()
+        let perms_b = {
+            let mut p = PermissionLattice::default();
+            p.capabilities = b;
+            p.obligations = Default::default();
+            p
         };
 
         // Nucleus operator property: j(a ∧ b) = j(a) ∧ j(b)
@@ -475,6 +486,7 @@ mod command_tests {
             blocked,
             allowed_rules: Vec::new(),
             blocked_rules: Vec::new(),
+            allow_metacharacters: false,
         })
     }
 

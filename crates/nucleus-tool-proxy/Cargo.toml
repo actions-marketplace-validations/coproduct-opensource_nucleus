@@ -21,13 +21,22 @@ default = []
 spire = ["nucleus-identity/spire"]
 # MCP server mode (stdio transport)
 mcp = ["dep:rmcp", "dep:schemars"]
-# Red-team harness: Claude vs. Portcullis (requires ANTHROPIC_API_KEY)
+# Red-team harness: adversarial LLM vs. Portcullis (requires LLM_API_KEY)
 red-team = []
 # Remote append-only audit sink (S3-compatible: AWS S3, MinIO, R2, Tigris)
 remote-audit = ["dep:aws-sdk-s3", "dep:aws-config"]
+# OpenTelemetry permission telemetry — emits OTLP spans for every verdict
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dependencies]
+# Wire types only. The guest must NOT link nucleus-cred-broker: that crate holds
+# Credential/CredentialStore, and deny.toml refuses it outside the composition
+# root. Attempting it failed `deny (bans)`, which is why this crate exists.
+nucleus-cred-protocol = { path = "../nucleus-cred-protocol" }
 axum = { workspace = true }
+# Panic net: CatchPanicLayer converts a stray panic (e.g. a poisoned lock's
+# `.expect()`) into a fail-closed HTTP 500 instead of dropping the connection.
+tower-http = { version = "0.7", features = ["catch-panic"] }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -39,6 +48,15 @@ tracing-subscriber = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Signature-based approvals: the guest verifies an approver's Ed25519
+# signature against configured PUBLIC keys (verify_strict only — see M-3).
+# Was dev-only; promoted when /v1/approve gained the signature tier.
+ed25519-dalek = { workspace = true }
+# The workload-spawn hardening hook (setgroups/setgid/prctl/setrlimit in a
+# pre_exec closure). Same version the `nucleus` crate uses for `hardening.rs`.
+libc = "0.2"
+dirs = "6.0"
+whoami = "2"
 reqwest = { workspace = true, features = ["rustls-no-provider", "json", "query"] }
 url = "2.5"
 uuid = { workspace = true }
@@ -46,15 +64,34 @@ chrono = { workspace = true, features = ["serde"] }
 
 nucleus = { path = "../nucleus" }
 nucleus-spec = { path = "../nucleus-spec" }
-nucleus-identity = { path = "../nucleus-identity" }
+# tpm-devid: compile the TPM residency verifier into the relying-party binary so
+# the assurance floor (--min-assurance) enforces on the live path (North Star C9).
+nucleus-identity = { path = "../nucleus-identity", features = ["tpm-devid"] }
 nucleus-client = { path = "../nucleus-client", features = ["async-drand"] }
-portcullis = { path = "../portcullis", features = ["serde", "spec"] }
+nucleus-proto = { path = "../nucleus-proto" }
+portcullis = { path = "../portcullis", features = ["serde", "spec", "crypto", "dlc"] }
+# The dependency-free IFC reference monitor. Used directly for the sealed
+# `DischargedBundle` preflight that gates the live RunBash path (#2038). Discharge
+# is already trusted (re-exported through `portcullis-core`); this is an additive
+# path to the same types, adding no new TCB.
+nucleus-ifc-kernel = { path = "../nucleus-ifc-kernel", version = "1.0.0" }
 nucleus-permission-market = { path = "../nucleus-permission-market" }
+nucleus-provenance-memory = { path = "../nucleus-provenance-memory" }
+# Sealed effect home (B5): the agent NET-EGRESS effect (`NetEffect::fetch`, the
+# real reqwest HTTP send) lives here behind the `_proof`-gated, PolicyEnforced
+# API. `net` pulls the reqwest HTTP stack into the sealed home; the tool-proxy
+# hands its configured `web_client` to it and reaches it only past a minted
+# `DischargedBundle`, so no raw agent `…send()` survives on the handler path.
+portcullis-effects = { path = "../portcullis-effects", features = ["net"] }
+
+tonic = { workspace = true }
+tokio-stream = "0.1"
+tokio-util = "0.7"
 
 base64 = { workspace = true }
 ring = { workspace = true }
 rust_decimal = { workspace = true }
-pem = "3"
+pem = "4"
 
 # File search tools
 glob = "0.3"
@@ -63,10 +100,16 @@ regex = { workspace = true }
 x509-parser = { workspace = true }
 
 # MCP server mode (optional)
-rmcp = { version = "1.1", features = ["server", "macros", "transport-io"], optional = true }
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io"], optional = true }
 schemars = { version = "1", optional = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
+
+# OpenTelemetry permission telemetry (optional)
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 # Remote audit sink (optional, S3-compatible)
 aws-sdk-s3 = { workspace = true, optional = true }
@@ -76,7 +119,21 @@ aws-config = { workspace = true, optional = true }
 tokio-vsock = "0.7"
 
 [dev-dependencies]
+# Credential minting for the DLC admission provisioning tests (same rev as
+# portcullis's dlc-d pin).
+dlc-crypto = { git = "https://github.com/coproduct-opensource/delegation_calc.git", rev = "34358234cb46279c4ce8a8729736a4135174f65a" }
+dlc-d = { git = "https://github.com/coproduct-opensource/delegation_calc.git", rev = "34358234cb46279c4ce8a8729736a4135174f65a" }
 tempfile = { workspace = true }
+# In-process router driving for the H-3 panic-net regression test
+# (ServiceExt::oneshot). Dev-only; production graph unchanged.
+tower = { version = "0.5", features = ["util"] }
+# HTTP mock upstream for the H-1 bounded-body-read regression test
+# (read_body_capped). Dev-only; production graph unchanged.
+wiremock = "0.6"
+# Direct access to the IFC gate (flow/flow_algebra/SinkClass) for the attack
+# corpus; already transitive via `portcullis`. Dev-only — production graph
+# unchanged. Used by tests/attack_corpus.rs.
+portcullis-core = { path = "../portcullis-core", features = ["test-helpers"] }
 
 [lints]
 workspace = true

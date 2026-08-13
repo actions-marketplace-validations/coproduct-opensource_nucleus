@@ -26,12 +26,12 @@ fn main() {
     let level = parse_arg(&args, "--level")
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or_else(|| {
-            eprintln!("Error: --level <1-7> is required");
+            eprintln!("Error: --level <1-8> is required");
             std::process::exit(1);
         });
 
-    if !(1..=7).contains(&level) {
-        eprintln!("Error: level must be 1-7");
+    if !(1..=8).contains(&level) {
+        eprintln!("Error: level must be 1-8");
         std::process::exit(1);
     }
 
@@ -45,10 +45,12 @@ fn main() {
     } else {
         // Read from stdin
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
-            eprintln!("Error reading stdin: {e}");
-            std::process::exit(1);
-        });
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .unwrap_or_else(|e| {
+                eprintln!("Error reading stdin: {e}");
+                std::process::exit(1);
+            });
         buf
     };
 
@@ -63,7 +65,14 @@ fn main() {
     let lvl = Level::new(level);
     let meta = lvl.meta();
     eprintln!("Level {}: {} — {}", level, meta.name, meta.tagline);
-    eprintln!("Defenses: {}", meta.defenses.iter().map(|d| d.name).collect::<Vec<_>>().join(", "));
+    eprintln!(
+        "Defenses: {}",
+        meta.defenses
+            .iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     eprintln!("---");
 
     let mut eng = CtfEngine::new(&lvl);
@@ -82,13 +91,13 @@ fn print_usage() {
     eprintln!("Can your AI agent break out of a formally verified sandbox?");
     eprintln!();
     eprintln!("USAGE:");
-    eprintln!("  ctf-cli --level <1-7> --attack-file <path>");
-    eprintln!("  ctf-cli --level <1-7> --attack '<json>'");
-    eprintln!("  echo '<json>' | ctf-cli --level <1-7>");
+    eprintln!("  ctf-cli --level <1-8> --attack-file <path>");
+    eprintln!("  ctf-cli --level <1-8> --attack '<json>'");
+    eprintln!("  echo '<json>' | ctf-cli --level <1-8>");
     eprintln!("  ctf-cli --list-levels");
     eprintln!();
     eprintln!("OPTIONS:");
-    eprintln!("  --level <N>          Level to attack (1-7)");
+    eprintln!("  --level <N>          Level to attack (1-8)");
     eprintln!("  --attack-file <path> JSON file with tool call array");
     eprintln!("  --attack <json>      Inline JSON tool call array");
     eprintln!("  --list-levels        Show all levels and their defenses");
@@ -103,7 +112,7 @@ fn print_usage() {
 }
 
 fn list_levels() {
-    for n in 1..=7u8 {
+    for n in 1..=8u8 {
         let lvl = Level::new(n);
         let meta = lvl.meta();
         eprintln!("Level {}: {}", n, meta.name);
@@ -112,12 +121,22 @@ fn list_levels() {
             eprintln!("  CVE: {}", cve);
         }
         eprintln!("  Tools: {}", meta.available_tools.join(", "));
-        eprintln!("  Defenses: {}", if meta.defenses.is_empty() {
-            "None".to_string()
-        } else {
-            meta.defenses.iter().map(|d| d.name).collect::<Vec<_>>().join(", ")
-        });
-        eprintln!("  Flag capturable: {}", if meta.flag_capturable { "YES" } else { "No" });
+        eprintln!(
+            "  Defenses: {}",
+            if meta.defenses.is_empty() {
+                "None".to_string()
+            } else {
+                meta.defenses
+                    .iter()
+                    .map(|d| d.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+        eprintln!(
+            "  Flag capturable: {}",
+            if meta.flag_capturable { "YES" } else { "No" }
+        );
         eprintln!();
     }
 }
@@ -137,13 +156,21 @@ fn print_result(result: &AttackResult) {
                 let preview: String = output.chars().take(80).collect();
                 eprintln!("         {}", preview);
             }
-            ctf_engine::Verdict::Deny { reason, defense, proof } => {
+            ctf_engine::Verdict::Deny {
+                reason,
+                defense,
+                proof,
+            } => {
                 eprintln!("         {} ({})", reason, defense);
                 if let Some(p) = proof {
                     eprintln!("         Proof: {}", p);
                 }
             }
-            ctf_engine::Verdict::RequiresApproval { reason, defense, proof } => {
+            ctf_engine::Verdict::RequiresApproval {
+                reason,
+                defense,
+                proof,
+            } => {
                 eprintln!("         {} ({})", reason, defense);
                 if let Some(p) = proof {
                     eprintln!("         Proof: {}", p);
@@ -163,7 +190,10 @@ fn print_result(result: &AttackResult) {
     }
 
     if !result.defenses_activated.is_empty() {
-        eprintln!("  Defenses triggered: {}", result.defenses_activated.join(", "));
+        eprintln!(
+            "  Defenses triggered: {}",
+            result.defenses_activated.join(", ")
+        );
     }
     eprintln!("  Score: {}", result.score);
 }

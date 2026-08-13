@@ -74,6 +74,9 @@
 //! assert_eq!(verified.chain_depth, 1);
 //! ```
 
+// chrono is only consumed by the crypto-gated verify path (and unit
+// tests, which exercise it); the token DATA type itself is time-free.
+#[cfg(any(test, feature = "crypto"))]
 use chrono::{DateTime, Utc};
 
 #[cfg(feature = "serde")]
@@ -81,10 +84,13 @@ use base64::Engine;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::certificate::{
-    verify_certificate, CertificateError, LatticeCertificate, VerifiedPermissions,
-    DEFAULT_MAX_CHAIN_DEPTH,
-};
+#[cfg(feature = "crypto")]
+use crate::certificate::verify_certificate;
+use crate::certificate::{CertificateError, LatticeCertificate};
+// Sealed verification output + chain-depth default exist only on the
+// crypto-gated verify path.
+#[cfg(feature = "crypto")]
+use crate::certificate::{VerifiedPermissions, DEFAULT_MAX_CHAIN_DEPTH};
 
 /// A compact, self-contained attenuation token for wire transport.
 ///
@@ -199,6 +205,10 @@ impl AttenuationToken {
     /// 4. Monotone attenuation (permissions only decrease)
     /// 5. Time expiry checks
     /// 6. Proof-of-possession
+    ///
+    /// Ed25519 verification uses `ring`, which can't compile to WASM, so this
+    /// method is `crypto`-gated. The token DATA type itself is always available.
+    #[cfg(feature = "crypto")]
     pub fn verify(
         &self,
         now: DateTime<Utc>,
@@ -214,6 +224,7 @@ impl AttenuationToken {
     }
 
     /// Verify with default max chain depth.
+    #[cfg(feature = "crypto")]
     pub fn verify_default(&self, now: DateTime<Utc>) -> Result<VerifiedPermissions, TokenError> {
         self.verify(now, DEFAULT_MAX_CHAIN_DEPTH)
     }

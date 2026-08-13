@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
-use hmac::{Hmac, Mac};
+use hmac::{digest::KeyInit, Hmac, Mac};
 use nucleus_client::drand::{self, DrandConfig, DrandFailMode};
 use sha2::Sha256;
 
@@ -111,6 +111,20 @@ pub enum AuthMethod {
     HmacDrand,
     /// SPIFFE mTLS certificate (no shared secrets).
     SpiffeMtls,
+    /// The request arrived on a vsock listener that accepts only the host.
+    ///
+    /// No shared secret and no certificate: the guest kernel sets the peer CID
+    /// on an accepted AF_VSOCK connection and a guest process cannot forge it,
+    /// so "this came from the host" is enforced below the application rather
+    /// than asserted by it. See `pod_mgmt::peer_is_host`.
+    HostVsock,
+    /// Ed25519 signature against a configured PUBLIC key, drand-anchored.
+    ///
+    /// The signature-based approval tier: the guest holds only verification
+    /// keys, so — unlike the HMAC tiers — nothing the guest stores lets anyone
+    /// FORGE an approval. This is what lets `nucleus.approval_secret` leave
+    /// the world-readable kernel command line.
+    Ed25519Drand,
 }
 
 /// How the request's identity was bound to its permissions.
@@ -322,6 +336,205 @@ pub fn verify_http_with_drand(
     })
 }
 
+/// The approval verifier's key set plus the freshness policy it inherits.
+///
+/// # Why public keys instead of the approval HMAC secret
+///
+/// The HMAC design put the VERIFICATION key in the guest — and an HMAC
+/// verification key is also the signing key, so any guest process that read it
+/// (it rode the world-readable `/proc/cmdline`) could forge approvals for its
+/// own operations. An Ed25519 verifying key grants no signing power: the guest
+/// can check an approver's signature and can do nothing else with the key.
+/// Secrets and signing keys stay host-side; the guest gets public keys and
+/// host-origin verdicts.
+#[derive(Clone)]
+pub struct ApprovalVerifier {
+    keys: Vec<ed25519_dalek::VerifyingKey>,
+    max_skew: Duration,
+    drand_config: Option<DrandConfig>,
+}
+
+impl ApprovalVerifier {
+    /// Build from a comma-separated list of 64-char-hex Ed25519 verifying
+    /// keys. Malformed entries are REJECTED (`Err`), not skipped: a typo'd
+    /// key silently dropped would leave approvals verifying against fewer
+    /// keys than the operator configured, and the failure would surface as an
+    /// unexplained refusal far from the cause. Startup is the right place to
+    /// stop.
+    pub fn from_hex_list(
+        raw: &str,
+        max_skew: Duration,
+        drand_config: Option<DrandConfig>,
+    ) -> Result<Self, String> {
+        let mut keys = Vec::new();
+        for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let bytes = hex::decode(entry)
+                .map_err(|_| format!("approval pubkey is not valid hex: {entry:.16}…"))?;
+            let arr = <[u8; 32]>::try_from(bytes.as_slice())
+                .map_err(|_| format!("approval pubkey is not 32 bytes: {entry:.16}…"))?;
+            let key = ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(|_| {
+                format!("approval pubkey is not a valid Ed25519 point: {entry:.16}…")
+            })?;
+            keys.push(key);
+        }
+        if keys.is_empty() {
+            return Err("approval pubkey list is empty".to_string());
+        }
+        Ok(Self {
+            keys,
+            max_skew,
+            drand_config,
+        })
+    }
+
+    /// How many keys are configured (for startup logging — never the keys).
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+/// Verify an approval request signed with an approver's Ed25519 key.
+///
+/// Same message formats and drand semantics as [`verify_http_with_drand`] —
+/// with drand: `"{round}.{timestamp}.{actor}.{body}"`, without:
+/// `"{timestamp}.{actor}.{body}"` (the latter only in `Cached` fail mode or
+/// with drand disabled; `Strict` requires the round). The signature header
+/// carries 128 hex chars (64 bytes), verified with `verify_strict` (M-3:
+/// cofactored verification accepts small-order points — key-substitution)
+/// against EVERY configured key until one matches.
+pub fn verify_http_with_ed25519_drand(
+    headers: &HeaderMap,
+    body: &[u8],
+    verifier: &ApprovalVerifier,
+) -> Result<AuthContext, AuthError> {
+    let ts = header_value(headers, HEADER_TIMESTAMP)?;
+    let sig = header_value(headers, HEADER_SIGNATURE)?;
+    let actor = headers
+        .get(HEADER_ACTOR)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let actor_value = actor.clone().unwrap_or_default();
+
+    let timestamp = parse_timestamp(ts)?;
+    ensure_skew(timestamp, verifier.max_skew)?;
+
+    let drand_round = headers
+        .get(HEADER_DRAND_ROUND)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    if let Some(ref drand_config) = verifier.drand_config {
+        if drand_config.enabled {
+            match drand_round {
+                Some(round) => {
+                    let expected = drand::current_expected_round();
+                    if !drand::validate_round(round, drand_config.round_tolerance) {
+                        return Err(AuthError::DrandRoundExpired {
+                            provided: round,
+                            expected,
+                            tolerance: drand_config.round_tolerance,
+                        });
+                    }
+                    let message = signed_message(format!("{round}.{ts}.{actor_value}."), body);
+                    verify_ed25519_any(&verifier.keys, &message, sig)?;
+                    return Ok(AuthContext {
+                        actor,
+                        timestamp,
+                        drand_round: Some(round),
+                        spiffe_id: None,
+                        auth_method: AuthMethod::Ed25519Drand,
+                        identity_binding: IdentityBinding::PolicyOnly,
+                    });
+                }
+                None => match drand_config.fail_mode {
+                    DrandFailMode::Strict => return Err(AuthError::DrandRequired),
+                    DrandFailMode::Cached => {
+                        tracing::warn!(
+                            "drand anchoring enabled but no round provided, accepting \
+                             signature without anchoring (cached mode)"
+                        );
+                    }
+                },
+            }
+        }
+    }
+
+    let message = signed_message(format!("{ts}.{actor_value}."), body);
+    verify_ed25519_any(&verifier.keys, &message, sig)?;
+    Ok(AuthContext {
+        actor,
+        timestamp,
+        drand_round: None,
+        spiffe_id: None,
+        auth_method: AuthMethod::Ed25519Drand,
+        identity_binding: IdentityBinding::PolicyOnly,
+    })
+}
+
+/// The signed message: a text prefix (`"round.ts.actor."` or `"ts.actor."`)
+/// followed by the raw body bytes — byte-identical to what the HMAC tiers
+/// sign, so the host-side signer changes only its primitive, not its framing.
+fn signed_message(prefix: String, body: &[u8]) -> Vec<u8> {
+    let mut message = prefix.into_bytes();
+    message.extend_from_slice(body);
+    message
+}
+
+/// `verify_strict` against every configured key. Multiple approver keys are a
+/// roster, not a quorum: any single configured approver may approve, exactly
+/// as any holder of the old shared secret could.
+fn verify_ed25519_any(
+    keys: &[ed25519_dalek::VerifyingKey],
+    message: &[u8],
+    signature_hex: &str,
+) -> Result<(), AuthError> {
+    let bytes = hex::decode(signature_hex).map_err(|_| AuthError::InvalidSignature)?;
+    let arr = <[u8; 64]>::try_from(bytes.as_slice()).map_err(|_| AuthError::InvalidSignature)?;
+    let signature = ed25519_dalek::Signature::from_bytes(&arr);
+    if keys
+        .iter()
+        .any(|key| key.verify_strict(message, &signature).is_ok())
+    {
+        Ok(())
+    } else {
+        Err(AuthError::InvalidSignature)
+    }
+}
+
+/// Authenticate a request purely from the transport it arrived on.
+///
+/// # Why this needs no secret
+///
+/// `pod_mgmt::VsockAxumListener` drops every peer whose CID is not
+/// `VMADDR_CID_HOST`, and the guest kernel — not the caller — sets that CID.
+/// So a request that reaches the router over that listener has already been
+/// proven to come from the host, by a mechanism no guest process can influence.
+///
+/// This replaces `verify_http`'s HMAC on the vsock path. The HMAC key travelled
+/// on the kernel command line, where the agent could read it out of
+/// `/proc/cmdline` and sign its own requests — a trust boundary drawn inside a
+/// single trust domain, which cannot hold. Verified empirically on a real
+/// kernel: an in-guest loopback peer arrives as CID 1, never CID 2.
+///
+/// Deliberately NOT a fallback. It is selected only when the server was started
+/// on a host-verified vsock listener; every other transport keeps its existing
+/// mechanism.
+pub fn verify_host_vsock() -> AuthContext {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    AuthContext {
+        actor: Some("host".to_string()),
+        timestamp: now,
+        drand_round: None,
+        spiffe_id: None,
+        auth_method: AuthMethod::HostVsock,
+        identity_binding: IdentityBinding::PolicyOnly,
+    }
+}
+
 /// Verify a request using SPIFFE mTLS identity.
 ///
 /// This function validates that a SPIFFE identity was extracted from the
@@ -355,6 +568,57 @@ pub fn verify_spiffe_mtls(spiffe_id: &str) -> AuthContext {
         spiffe_id: Some(spiffe_id.to_string()),
         auth_method: AuthMethod::SpiffeMtls,
         identity_binding: IdentityBinding::PolicyOnly,
+    }
+}
+
+/// Which authentication mechanism a request should be judged by.
+///
+/// Extracted from the request handler so the PRECEDENCE is unit-testable. The
+/// order is security-critical and easy to get wrong invisibly: if
+/// [`AuthTier::HostVsock`] were consulted after the HMAC fallback it would be
+/// dead code, and every request would still need a key the agent can read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthTier {
+    /// A client certificate was presented — strongest, and independent of how
+    /// the server was bound.
+    SpiffeMtls,
+    /// The approval endpoint with approver PUBLIC keys configured: Ed25519 +
+    /// drand. Takes precedence over the HMAC approval tier — when the guest
+    /// holds verifying keys, a shared-secret signature must not be an
+    /// alternative way in, or the readable-key forgery the keys exist to
+    /// remove is silently reinstated.
+    ApprovalEd25519Drand,
+    /// The approval endpoint, which has its own drand-anchored HMAC. The
+    /// legacy tier, for pods provisioned with a secret instead of keys (the
+    /// env-delivered container path).
+    ApprovalHmacDrand,
+    /// The transport already proved the peer is the host.
+    HostVsock,
+    /// Shared-secret HMAC. The residual path, for transports that prove nothing.
+    Hmac,
+}
+
+/// Choose the tier from facts about the request and the binding.
+///
+/// `host_verified_transport` is a property of how the server was STARTED, never
+/// of the request — see `AppState::host_verified_transport`. Likewise
+/// `has_approval_pubkeys` is startup configuration, not request content.
+pub fn select_auth_tier(
+    has_spiffe_identity: bool,
+    is_approval_path: bool,
+    has_approval_pubkeys: bool,
+    host_verified_transport: bool,
+) -> AuthTier {
+    if has_spiffe_identity {
+        AuthTier::SpiffeMtls
+    } else if is_approval_path && has_approval_pubkeys {
+        AuthTier::ApprovalEd25519Drand
+    } else if is_approval_path {
+        AuthTier::ApprovalHmacDrand
+    } else if host_verified_transport {
+        AuthTier::HostVsock
+    } else {
+        AuthTier::Hmac
     }
 }
 
@@ -670,5 +934,326 @@ mod tests {
         let ctx = verify_http_with_drand(&headers, body, &auth).unwrap();
         assert_eq!(ctx.auth_method, AuthMethod::HmacDrand);
         assert!(ctx.spiffe_id.is_none());
+    }
+}
+
+#[cfg(test)]
+mod host_vsock_auth_tests {
+    use super::*;
+
+    /// Transport-derived auth carries no secret and no certificate — the
+    /// transport itself is the evidence.
+    #[test]
+    fn host_vsock_context_names_its_method_and_holds_no_credential() {
+        let ctx = verify_host_vsock();
+        assert_eq!(ctx.auth_method, AuthMethod::HostVsock);
+        assert_eq!(ctx.actor.as_deref(), Some("host"));
+        assert!(ctx.spiffe_id.is_none(), "no certificate is involved");
+        assert!(ctx.drand_round.is_none(), "no drand anchoring is involved");
+    }
+
+    /// `HostVsock` must be a DISTINCT method, not an alias of the HMAC path.
+    /// Collapsing them would make an audit record unable to say whether a
+    /// request was proven by the kernel or by a key the agent could read.
+    #[test]
+    fn host_vsock_is_distinguishable_from_the_secret_based_methods() {
+        let ctx = verify_host_vsock();
+        assert_ne!(ctx.auth_method, AuthMethod::Hmac);
+        assert_ne!(ctx.auth_method, AuthMethod::HmacDrand);
+        assert_ne!(ctx.auth_method, AuthMethod::SpiffeMtls);
+    }
+
+    /// It takes NO arguments. That is the security property in the signature:
+    /// there is no header, token or field a request could supply to select this
+    /// method — it is chosen from how the server was bound, never from input.
+    /// If this ever grows a parameter derived from the request, the guarantee
+    /// is gone.
+    #[test]
+    fn host_vsock_cannot_be_influenced_by_request_data() {
+        let a = verify_host_vsock();
+        let b = verify_host_vsock();
+        assert_eq!(a.auth_method, b.auth_method);
+        assert_eq!(a.actor, b.actor);
+    }
+}
+
+#[cfg(test)]
+mod auth_tier_precedence_tests {
+    use super::*;
+
+    /// THE ORDERING PROPERTY. On a host-verified transport, a plain request
+    /// must reach `HostVsock` and NOT fall through to the shared-secret HMAC.
+    /// If the tiers were reordered, this is what fails.
+    #[test]
+    fn a_host_verified_transport_skips_the_shared_secret_hmac() {
+        assert_eq!(
+            select_auth_tier(false, false, false, true),
+            AuthTier::HostVsock,
+            "a request on a host-only vsock listener must not need the HMAC key"
+        );
+    }
+
+    /// Without a host-verified transport the HMAC remains — this change removes
+    /// a secret where the transport replaces it, it does not remove auth.
+    #[test]
+    fn other_transports_still_require_the_hmac() {
+        assert_eq!(select_auth_tier(false, false, false, false), AuthTier::Hmac);
+    }
+
+    /// A certificate outranks the transport: mTLS identifies WHO, the transport
+    /// only identifies WHERE FROM. Losing the SPIFFE identity would discard the
+    /// stronger claim.
+    #[test]
+    fn mtls_outranks_the_transport() {
+        assert_eq!(
+            select_auth_tier(true, false, false, true),
+            AuthTier::SpiffeMtls
+        );
+        assert_eq!(
+            select_auth_tier(true, true, true, true),
+            AuthTier::SpiffeMtls
+        );
+    }
+
+    /// The approval path keeps its drand anchoring even on a host-verified
+    /// transport. Being from the host proves origin, not freshness — drand is
+    /// what stops pre-computation, and the transport says nothing about that.
+    #[test]
+    fn the_approval_path_keeps_drand_even_on_a_host_verified_transport() {
+        assert_eq!(
+            select_auth_tier(false, true, false, true),
+            AuthTier::ApprovalHmacDrand,
+            "origin is not freshness — approvals must stay drand-anchored"
+        );
+    }
+
+    /// **When approver public keys are configured, the shared-secret approval
+    /// tier must be UNREACHABLE.** If HMAC stayed accepted alongside, any
+    /// residual copy of the old secret would still forge approvals and the
+    /// keys would have removed nothing.
+    #[test]
+    fn configured_pubkeys_make_the_hmac_approval_tier_unreachable() {
+        assert_eq!(
+            select_auth_tier(false, true, true, false),
+            AuthTier::ApprovalEd25519Drand
+        );
+        assert_eq!(
+            select_auth_tier(false, true, true, true),
+            AuthTier::ApprovalEd25519Drand,
+            "the signature tier must win even on a host-verified transport"
+        );
+    }
+
+    /// Pubkeys configured but the request is NOT for the approval path: the
+    /// keys authorize approvals, nothing else — other paths keep their tiers.
+    #[test]
+    fn approval_pubkeys_do_not_leak_into_other_paths() {
+        assert_eq!(
+            select_auth_tier(false, false, true, true),
+            AuthTier::HostVsock
+        );
+        assert_eq!(select_auth_tier(false, false, true, false), AuthTier::Hmac);
+    }
+
+    /// Exhaustive over all sixteen inputs, so no combination is unconsidered.
+    #[test]
+    fn every_combination_is_pinned() {
+        let cases = [
+            ((false, false, false, false), AuthTier::Hmac),
+            ((false, false, false, true), AuthTier::HostVsock),
+            ((false, false, true, false), AuthTier::Hmac),
+            ((false, false, true, true), AuthTier::HostVsock),
+            ((false, true, false, false), AuthTier::ApprovalHmacDrand),
+            ((false, true, false, true), AuthTier::ApprovalHmacDrand),
+            ((false, true, true, false), AuthTier::ApprovalEd25519Drand),
+            ((false, true, true, true), AuthTier::ApprovalEd25519Drand),
+            ((true, false, false, false), AuthTier::SpiffeMtls),
+            ((true, false, false, true), AuthTier::SpiffeMtls),
+            ((true, false, true, false), AuthTier::SpiffeMtls),
+            ((true, false, true, true), AuthTier::SpiffeMtls),
+            ((true, true, false, false), AuthTier::SpiffeMtls),
+            ((true, true, false, true), AuthTier::SpiffeMtls),
+            ((true, true, true, false), AuthTier::SpiffeMtls),
+            ((true, true, true, true), AuthTier::SpiffeMtls),
+        ];
+        for ((spiffe, approval, pubkeys, host), expected) in cases {
+            assert_eq!(
+                select_auth_tier(spiffe, approval, pubkeys, host),
+                expected,
+                "spiffe={spiffe} approval={approval} pubkeys={pubkeys} host_verified={host}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ed25519_approval_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn verifier_for(keys: &[&SigningKey], drand: bool) -> ApprovalVerifier {
+        let hex_list = keys
+            .iter()
+            .map(|k| hex::encode(k.verifying_key().to_bytes()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let drand_config = drand.then(DrandConfig::default);
+        ApprovalVerifier::from_hex_list(&hex_list, Duration::from_secs(60), drand_config).unwrap()
+    }
+
+    fn now() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn signed_headers(key: &SigningKey, round: Option<u64>, ts: i64, body: &[u8]) -> HeaderMap {
+        let prefix = match round {
+            Some(r) => format!("{r}.{ts}.approver."),
+            None => format!("{ts}.approver."),
+        };
+        let message = signed_message(prefix, body);
+        let sig = hex::encode(key.sign(&message).to_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_TIMESTAMP,
+            HeaderValue::from_str(&ts.to_string()).unwrap(),
+        );
+        headers.insert(HEADER_SIGNATURE, HeaderValue::from_str(&sig).unwrap());
+        headers.insert(HEADER_ACTOR, HeaderValue::from_static("approver"));
+        if let Some(r) = round {
+            headers.insert(
+                HEADER_DRAND_ROUND,
+                HeaderValue::from_str(&r.to_string()).unwrap(),
+            );
+        }
+        headers
+    }
+
+    /// The happy path: a drand-anchored signature from a configured approver
+    /// key verifies, and the context records the signature method and round.
+    #[test]
+    fn a_configured_approvers_signature_verifies() {
+        let key = signing_key(1);
+        let round = drand::current_expected_round();
+        let body = b"{\"operation\":\"bash rm\"}";
+        let headers = signed_headers(&key, Some(round), now(), body);
+        let ctx =
+            verify_http_with_ed25519_drand(&headers, body, &verifier_for(&[&key], true)).unwrap();
+        assert_eq!(ctx.auth_method, AuthMethod::Ed25519Drand);
+        assert_eq!(ctx.drand_round, Some(round));
+        assert_eq!(ctx.actor, Some("approver".to_string()));
+    }
+
+    /// **The forgery this tier exists to prevent.** A signature from a key the
+    /// operator never configured — e.g. one a workload minted for itself —
+    /// must be refused. Under the HMAC design the workload could read the
+    /// verification key and pass this check.
+    #[test]
+    fn an_unconfigured_key_cannot_approve() {
+        let approver = signing_key(1);
+        let workload = signing_key(2);
+        let round = drand::current_expected_round();
+        let body = b"body";
+        let headers = signed_headers(&workload, Some(round), now(), body);
+        let result =
+            verify_http_with_ed25519_drand(&headers, body, &verifier_for(&[&approver], true));
+        assert!(matches!(result, Err(AuthError::InvalidSignature)));
+    }
+
+    /// Any configured approver may approve (a roster, not a quorum) — the
+    /// second key in the list is as good as the first.
+    #[test]
+    fn any_key_in_the_roster_may_approve() {
+        let first = signing_key(1);
+        let second = signing_key(2);
+        let round = drand::current_expected_round();
+        let body = b"body";
+        let headers = signed_headers(&second, Some(round), now(), body);
+        let result =
+            verify_http_with_ed25519_drand(&headers, body, &verifier_for(&[&first, &second], true));
+        assert!(result.is_ok(), "got {result:?}");
+    }
+
+    /// Freshness survives the primitive swap: strict drand mode still refuses
+    /// a request with no round — a signature is origin, not freshness.
+    #[test]
+    fn strict_drand_still_requires_a_round() {
+        let key = signing_key(1);
+        let body = b"body";
+        let headers = signed_headers(&key, None, now(), body);
+        let result = verify_http_with_ed25519_drand(&headers, body, &verifier_for(&[&key], true));
+        assert!(matches!(result, Err(AuthError::DrandRequired)));
+    }
+
+    /// And a stale round is refused even with a valid signature over it.
+    #[test]
+    fn a_stale_round_is_refused() {
+        let key = signing_key(1);
+        let round = drand::current_expected_round().saturating_sub(10_000);
+        let body = b"body";
+        let headers = signed_headers(&key, Some(round), now(), body);
+        let result = verify_http_with_ed25519_drand(&headers, body, &verifier_for(&[&key], true));
+        assert!(matches!(result, Err(AuthError::DrandRoundExpired { .. })));
+    }
+
+    /// A signature over one body must not authorize another: the approval's
+    /// operation is IN the body, so accepting a swapped body would let one
+    /// approval authorize a different operation.
+    #[test]
+    fn a_signature_does_not_transfer_to_a_different_body() {
+        let key = signing_key(1);
+        let round = drand::current_expected_round();
+        let headers = signed_headers(&key, Some(round), now(), b"approve ls");
+        let result = verify_http_with_ed25519_drand(
+            &headers,
+            b"approve rm -rf",
+            &verifier_for(&[&key], true),
+        );
+        assert!(matches!(result, Err(AuthError::InvalidSignature)));
+    }
+
+    /// An HMAC-shaped signature (32 bytes, the old primitive) is refused by
+    /// length before any curve math — the legacy secret cannot approve here.
+    #[test]
+    fn an_hmac_signature_is_not_a_valid_ed25519_signature() {
+        let key = signing_key(1);
+        let round = drand::current_expected_round();
+        let ts = now();
+        let body = b"body";
+        let mut headers = signed_headers(&key, Some(round), ts, body);
+        let hmac_sig = sign_message(b"the-old-approval-secret", b"whatever");
+        headers.insert(HEADER_SIGNATURE, HeaderValue::from_str(&hmac_sig).unwrap());
+        let result = verify_http_with_ed25519_drand(&headers, body, &verifier_for(&[&key], true));
+        assert!(matches!(result, Err(AuthError::InvalidSignature)));
+    }
+
+    /// **Malformed keys stop startup, they are not skipped.** A typo'd entry
+    /// silently dropped would verify against fewer keys than the operator
+    /// configured, surfacing as unexplained refusals far from the cause.
+    #[test]
+    fn a_malformed_key_is_an_error_not_a_skip() {
+        let good = hex::encode(signing_key(1).verifying_key().to_bytes());
+        for bad in ["nothex", "aabb", ""] {
+            let raw = format!("{good},{bad}");
+            let result = ApprovalVerifier::from_hex_list(&raw, Duration::from_secs(60), None);
+            if bad.is_empty() {
+                // A trailing comma is tolerated (empty entries are filtered);
+                // the list still has the good key.
+                assert_eq!(result.unwrap().key_count(), 1);
+            } else {
+                assert!(result.is_err(), "{bad:?} must be rejected");
+            }
+        }
+        assert!(
+            ApprovalVerifier::from_hex_list("  ", Duration::from_secs(60), None).is_err(),
+            "an empty list is not a verifier"
+        );
     }
 }

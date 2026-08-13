@@ -23,7 +23,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Nucleus CLI
         shell: bash
@@ -153,7 +153,7 @@ jobs:
       pull-requests: write
       issues: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check API key
         id: gate
@@ -179,12 +179,15 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue-number }}
+          PROFILE: ${{ inputs.profile }}
         run: |
           echo "## Action E2E Test — Live" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ steps.gate.outputs.has_key }}" = "true" ]; then
-            echo "- **Issue:** #${{ inputs.issue-number }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Profile:** ${{ inputs.profile }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Issue:** #${ISSUE_NUMBER}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Profile:** ${PROFILE}" >> "$GITHUB_STEP_SUMMARY"
             echo "- **Status:** Completed" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- **Status:** Skipped (no ANTHROPIC_API_KEY secret)" >> "$GITHUB_STEP_SUMMARY"

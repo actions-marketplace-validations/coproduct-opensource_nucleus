@@ -2,21 +2,26 @@
 name = "portcullis"
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 description = "A quotient lattice for AI agent permissions that prevents the 'uninhabitable state'"
 repository = "https://github.com/coproduct-opensource/nucleus"
 documentation = "https://docs.rs/portcullis"
 readme = "README.md"
-keywords = ["ai", "security", "permissions", "agents", "lattice", "quotient"]
+keywords = ["ai", "security", "permissions", "agents", "lattice"]
 categories = ["authentication", "development-tools"]
 
 [features]
-default = ["serde", "crypto"]
+# `cedar` is default-on (#1634): the kernel consults Cedar in
+# `decide_term_with_flow` when a policy is loaded. With no policy loaded the
+# evaluator is `None` and Cedar is inert, so default-on changes no behavior for
+# sessions that don't opt in. WASM consumers build with `default-features =
+# false` (cedar-policy can't target wasm), so they are unaffected.
+default = ["serde", "crypto", "cedar"]
 serde = ["dep:serde", "dep:serde_json", "rust_decimal/serde", "chrono/serde", "uuid/serde"]
 
 # Ed25519 signing (ring) — disable for WASM targets where ring can't compile
-crypto = ["dep:ring"]
+crypto = ["dep:ring", "dep:ed25519-dalek"]
 
 # CEL-based policy constraints
 cel = ["dep:cel-interpreter"]
@@ -30,12 +35,29 @@ webhook = ["dep:reqwest", "dep:tokio", "serde"]
 # Remote append-only audit sink (S3-compatible: AWS S3, MinIO, R2, Tigris)
 remote-audit = ["dep:aws-sdk-s3", "dep:aws-config", "dep:tokio", "serde"]
 
+# Cedar policy language integration (CNCF Sandbox project)
+cedar = ["dep:cedar-policy", "serde"]
+
+# DLC-D verified admission (#says-admission): a cryptographic, proof-carrying
+# admission conjunct — the kernel consults an issuer-signed says-credential per
+# operation, checked by a PEP whose positive verdict is backed by the
+# machine-checked `admit_joint` theorem (no false admits on the admission
+# fragment). Inert unless `Kernel::set_dlc_admission` provisions credentials,
+# mirroring the `cedar` pattern. Rev-pinned git dep, same pattern as
+# nucleus-policy-cert's `dlc` feature.
+dlc = ["dep:dlc-d", "dep:dlc-core", "crypto"]
+
 # SECURITY: Enable this feature ONLY for testing. It exposes methods that
 # bypass security constraints (e.g., disabling uninhabitable state enforcement).
 # DO NOT enable in production builds.
 testing = []
 
 [dependencies]
+portcullis-core = { path = "../portcullis-core", features = ["serde", "envelope"] }
+# DLC-D admission (feature `dlc`) — rev-pinned to delegation_calc main. The pin
+# is the U3 state: gated mint + one-atom binding (see says_admission module docs).
+dlc-d = { git = "https://github.com/coproduct-opensource/delegation_calc.git", rev = "34358234cb46279c4ce8a8729736a4135174f65a", optional = true }
+dlc-core = { git = "https://github.com/coproduct-opensource/delegation_calc.git", rev = "34358234cb46279c4ce8a8729736a4135174f65a", optional = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
@@ -49,6 +71,10 @@ serde_json = { workspace = true, optional = true }
 
 # Ed25519 signatures for attested delegation certificates (optional for WASM)
 ring = { workspace = true, optional = true }
+# Ed25519 VERIFY on the cert chain uses verify_strict (rejects small-order keys /
+# non-canonical S) — unifies the trust path with the rest of the attest stack and
+# is WASM-capable (ring is not). Signing stays on ring. (#16)
+ed25519-dalek = { workspace = true, optional = true }
 
 # Base64 encoding for compact token transport
 base64 = { workspace = true }
@@ -65,6 +91,9 @@ regex = { workspace = true }
 # CEL expression evaluation (optional, for user-defined nuclei)
 cel-interpreter = { version = "0.10", optional = true }
 
+# Cedar policy language (CNCF Sandbox — human-readable, analyzable policies)
+cedar-policy = { version = "4", optional = true }
+
 # Policy specification parsing (optional)
 serde_yaml = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
@@ -79,10 +108,37 @@ aws-config = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# SessionCleanseToken parity (Phase 2 precondition) needs a `DischargedBundle`,
+# mintable in tests only via portcullis-core's `test-helpers` feature. Dev/test
+# builds only — the normal lib build (line ~56) does NOT enable it, so no
+# test-only construction path leaks into shipped code.
+portcullis-core = { path = "../portcullis-core", features = ["serde", "envelope", "test-helpers"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 kani = "0.0.1"
+# Credential minting for the `dlc` admission tests (signing side of dlc-d's PEP).
+dlc-crypto = { git = "https://github.com/coproduct-opensource/delegation_calc.git", rev = "34358234cb46279c4ce8a8729736a4135174f65a" }
 
 [[test]]
 name = "example_policies"
 required-features = ["spec"]
+
+[[test]]
+name = "kernel_egress"
+required-features = ["spec"]
+
+[[test]]
+name = "kernel_policy"
+required-features = ["spec"]
+
+[[test]]
+name = "kernel_token"
+required-features = ["crypto"]
+
+[[test]]
+name = "declassify_rehome_egress"
+required-features = ["crypto"]
+
+[[test]]
+name = "kernel_dlc_admission"
+required-features = ["dlc"]

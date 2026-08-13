@@ -31,13 +31,13 @@ use proptest::prelude::*;
 /// EditFiles, WebSearch, etc. as baseline safety. The Verus model only models
 /// uninhabitable_state-derived obligations. This helper starts clean so conformance tests
 /// verify the uninhabitable_state model in isolation.
+#[allow(clippy::field_reassign_with_default)]
 fn perms_with_empty_obligations(caps: CapabilityLattice) -> PermissionLattice {
-    PermissionLattice {
-        capabilities: caps,
-        obligations: Obligations::default(), // empty
-        paths: PathLattice::default(),
-        ..Default::default()
-    }
+    let mut perms = PermissionLattice::default();
+    perms.capabilities = caps;
+    perms.obligations = Obligations::default(); // empty
+    perms.paths = PathLattice::default();
+    perms
 }
 
 // ============================================================================
@@ -143,21 +143,24 @@ fn arb_capability_level() -> impl Strategy<Value = CapabilityLevel> {
 
 fn arb_capability_lattice() -> impl Strategy<Value = CapabilityLattice> {
     (
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
+        (
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+        ),
         arb_capability_level(),
     )
-        .prop_map(
-            |(rf, wf, ef, rb, gs, grs, ws, wfe, gc, gp, cp, mp)| CapabilityLattice {
+        .prop_map(|((rf, wf, ef, rb, gs, grs, ws, wfe, gc, gp, cp, mp), sa)| {
+            CapabilityLattice {
                 read_files: rf,
                 write_files: wf,
                 edit_files: ef,
@@ -170,9 +173,10 @@ fn arb_capability_lattice() -> impl Strategy<Value = CapabilityLattice> {
                 git_push: gp,
                 create_pr: cp,
                 manage_pods: mp,
+                spawn_agent: sa,
                 extensions: std::collections::BTreeMap::new(),
-            },
-        )
+            }
+        })
 }
 
 fn arb_exfil_operation() -> impl Strategy<Value = Operation> {
@@ -796,13 +800,13 @@ proptest! {
         requested_caps in arb_capability_lattice(),
     ) {
         let parent = perms_with_empty_obligations(parent_caps);
-        prop_assert!(parent.uninhabitable_constraint, "default should have uninhabitable_state on");
+        prop_assert!(parent.is_uninhabitable_enforced(), "default should have uninhabitable_state on");
 
         let requested = perms_with_empty_obligations(requested_caps);
         let result = parent.meet(&requested);
 
         prop_assert!(
-            result.uninhabitable_constraint,
+            result.is_uninhabitable_enforced(),
             "uninhabitable_state constraint must propagate through meet"
         );
     }
@@ -1067,6 +1071,7 @@ fn conformance_untrusted_profile_prevents_uninhabitable() {
         git_push: CapabilityLevel::Never,
         create_pr: CapabilityLevel::Never,
         manage_pods: CapabilityLevel::Never,
+        spawn_agent: CapabilityLevel::Never,
         extensions: std::collections::BTreeMap::new(),
     };
 
@@ -1201,19 +1206,20 @@ proptest! {
         prop_assert!(after.count() >= before.count(), "count decreased");
     }
 
-    /// CONFORMANCE J4: Neutral operations produce no exposure label.
+    /// CONFORMANCE J4: Local-sink operations are exfil legs (most-paranoid #4).
     ///
-    /// Mirrors Verus proof_neutral_ops_no_exposure.
+    /// Mirrors Verus proof_local_sinks_are_exfil. (Formerly asserted these were
+    /// neutral; they now contribute the ExfilVector leg.)
     #[test]
-    fn conformance_neutral_ops_no_exposure(op in prop_oneof![
+    fn conformance_local_sinks_are_exfil(op in prop_oneof![
         Just(Operation::WriteFiles),
         Just(Operation::EditFiles),
         Just(Operation::GitCommit),
         Just(Operation::ManagePods),
     ]) {
         prop_assert_eq!(
-            operation_exposure(op), None,
-            "neutral op {:?} should produce no exposure", op
+            operation_exposure(op), Some(ExposureLabel::ExfilVector),
+            "local-sink op {:?} should be an exfil vector", op
         );
     }
 
@@ -1347,11 +1353,12 @@ proptest! {
         prop_assert_eq!(after, before, "failed event changed exposure for {:?}", op);
     }
 
-    /// CONFORMANCE M5: Neutral ops don't change exposure.
+    /// CONFORMANCE M5: Local-sink ops add the ExfilVector leg (most-paranoid #4).
     ///
-    /// Mirrors Verus proof_neutral_op_preserves_exposure.
+    /// Mirrors Verus proof_local_sink_adds_exfil. (Formerly asserted these ops
+    /// preserved exposure; they now contribute ExfilVector on success.)
     #[test]
-    fn conformance_neutral_op_preserves(
+    fn conformance_local_sink_adds_exfil(
         before in arb_exposure_set(),
         op in prop_oneof![
             Just(Operation::WriteFiles),
@@ -1360,9 +1367,10 @@ proptest! {
             Just(Operation::ManagePods),
         ],
     ) {
-        // Even if succeeded, neutral ops don't add exposure
         let after = apply_event(&before, op, true);
-        prop_assert_eq!(after, before, "neutral op {:?} changed exposure", op);
+        // Monotone: exposure never shrinks, and now includes ExfilVector.
+        prop_assert!(after.contains(ExposureLabel::ExfilVector),
+            "local-sink op {:?} should add ExfilVector", op);
     }
 
     /// CONFORMANCE M6:  UninhabitableState irreversibility — once latched, always latched.
@@ -1780,10 +1788,12 @@ mod structural_bisimulation {
             0 // PrivateData
         } else if op == 6 || op == 7 {
             1 // UntrustedContent
-        } else if op == 3 || op == 9 || op == 10 {
-            2 // ExfilVector
+        } else if op == 3 || op == 9 || op == 10 || op == 1 || op == 2 || op == 8 || op == 11 {
+            // ExfilVector — local sinks (WriteFiles=1, EditFiles=2, GitCommit=8,
+            // ManagePods=11) are exfil legs too now (most-paranoid #4).
+            2
         } else {
-            3 // Neutral
+            3 // Neutral (no op in ALL_OPS maps here after #4)
         }
     }
 
@@ -1802,6 +1812,7 @@ mod structural_bisimulation {
             Operation::GitPush => 9,
             Operation::CreatePr => 10,
             Operation::ManagePods => 11,
+            Operation::SpawnAgent => 12,
         }
     }
 
@@ -2152,7 +2163,6 @@ mod protocol_conformance {
         perms.capabilities.read_files = CapabilityLevel::Always;
         perms.capabilities.web_fetch = CapabilityLevel::LowRisk;
         perms.capabilities.run_bash = CapabilityLevel::LowRisk;
-        perms.uninhabitable_constraint = true;
         perms.normalize()
     }
 
@@ -2622,7 +2632,6 @@ mod enforcement_monotonicity {
         perms.capabilities.web_search = CapabilityLevel::LowRisk;
         perms.capabilities.git_push = CapabilityLevel::LowRisk;
         perms.capabilities.create_pr = CapabilityLevel::LowRisk;
-        perms.uninhabitable_constraint = true;
         perms.normalize()
     }
 
@@ -2758,16 +2767,32 @@ mod enforcement_monotonicity {
             "RunBash should be denied with ReadFiles + WebFetch exposure"
         );
 
-        // Record more neutral operations
+        // Grow exposure further with NON-exfil ops (more private-data / untrusted
+        // reads). Local sinks (Write/Edit/Commit) are now exfil legs themselves
+        // and would be DENIED here (they'd complete the trifecta), so we can no
+        // longer use them to "grow exposure" — they're asserted denied below.
         for &op in &[
-            Operation::WriteFiles,
-            Operation::EditFiles,
-            Operation::GitCommit,
+            Operation::GlobSearch,
+            Operation::GrepSearch,
+            Operation::WebSearch,
         ] {
             let proof = guard.check(op).unwrap();
             guard
                 .execute_and_record(proof, || Ok::<_, String>(()))
                 .unwrap();
+        }
+
+        // The local-sink exfil ops are denied now (most-paranoid #4).
+        for &op in &[
+            Operation::WriteFiles,
+            Operation::EditFiles,
+            Operation::GitCommit,
+        ] {
+            assert!(
+                guard.check(op).is_err(),
+                "local-sink exfil op {:?} should be denied at uninhabitable exposure",
+                op
+            );
         }
 
         // RunBash should STILL be denied (exposure only grew)
@@ -3119,6 +3144,7 @@ mod capability_coverage {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            spawn_agent: CapabilityLevel::Never,
             extensions: std::collections::BTreeMap::new(),
         }
     }
@@ -3138,6 +3164,7 @@ mod capability_coverage {
             git_push: CapabilityLevel::Always,
             create_pr: CapabilityLevel::Always,
             manage_pods: CapabilityLevel::Always,
+            spawn_agent: CapabilityLevel::Always,
             extensions: std::collections::BTreeMap::new(),
         }
     }
@@ -3239,6 +3266,7 @@ mod capability_coverage {
             git_push: CapabilityLevel::Always,     // 9: odd
             create_pr: CapabilityLevel::LowRisk,   // 10: even
             manage_pods: CapabilityLevel::Always,  // 11: odd
+            spawn_agent: CapabilityLevel::LowRisk, // 12: even
             extensions: std::collections::BTreeMap::new(),
         };
 
@@ -3362,6 +3390,7 @@ mod capability_coverage {
                 git_push: to_level(levels_a[9]),
                 create_pr: to_level(levels_a[10]),
                 manage_pods: to_level(levels_a[11]),
+                spawn_agent: CapabilityLevel::Never,
                 extensions: std::collections::BTreeMap::new(),
             };
 
@@ -3378,6 +3407,7 @@ mod capability_coverage {
                 git_push: to_level(levels_a[9].max(delta[9])),
                 create_pr: to_level(levels_a[10].max(delta[10])),
                 manage_pods: to_level(levels_a[11].max(delta[11])),
+                spawn_agent: CapabilityLevel::Never,
                 extensions: std::collections::BTreeMap::new(),
             };
 
@@ -3633,7 +3663,6 @@ fn production_chain_ceiling(chain: &[PermissionLattice]) -> PermissionLattice {
 /// This matches the Verus `valid_perm(p)` requirement.
 fn perm_from_caps_enforcing(caps: CapabilityLattice) -> PermissionLattice {
     let mut p = perms_with_empty_obligations(caps);
-    p.uninhabitable_constraint = true;
     // Apply nucleus normalization: add uninhabitable_state obligations if needed
     let constraint = IncompatibilityConstraint::enforcing();
     let uninhabitable_state_obs = constraint.obligations_for(&p.capabilities);

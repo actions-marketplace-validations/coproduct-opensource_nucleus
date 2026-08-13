@@ -9,6 +9,9 @@ on:
       - "slides/**"
       - "blog/**"
       - "book.toml"
+      - "sdks/verifier-js/**"
+      - "crates/nucleus-envelope/**"
+      - "crates/ctf-engine/**"
       - ".github/workflows/docs.yml"
 
 permissions:
@@ -19,14 +22,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: stable
           cache: true
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: "24"
       - name: Install mdBook
         run: cargo install mdbook --locked
       - name: Build docs
@@ -42,8 +45,40 @@ jobs:
         run: |
           mkdir -p book/blog
           cp blog/*.md book/blog/
+      # --- In-browser verifier demo, published at /verify/ ---
+      # Real fixtures (generated + self-verified by the example) + the Rust
+      # verifier compiled to WASM. No fake data; reproducible from source.
+      - name: Build verifier WASM + real fixtures
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-pack --locked --version 0.13.1
+          cargo run -p nucleus-envelope --example emit_demo_bundle -- sdks/verifier-js/demo-fixtures
+          wasm-pack build sdks/verifier-js --target web --release
+      - name: Assemble /verify into the docs site
+        run: |
+          mkdir -p book/verify/pkg book/verify/demo-fixtures
+          cp sdks/verifier-js/demo.html book/verify/index.html
+          cp sdks/verifier-js/demo.js   book/verify/demo.js
+          cp sdks/verifier-js/pkg/nucleus_verifier_wasm.js \
+             sdks/verifier-js/pkg/nucleus_verifier_wasm_bg.wasm \
+             sdks/verifier-js/pkg/*.d.ts \
+             book/verify/pkg/
+          cp sdks/verifier-js/demo-fixtures/*.json book/verify/demo-fixtures/
+          touch book/.nojekyll
+      # --- "The Vault" CTF, published at /vault/ ---
+      # Browser/WASM CTF: try to exfiltrate past a formally-verified permission
+      # lattice. Built with Trunk (wasm_bindgen pinned in Trunk.toml); public-url
+      # must match the deploy subpath so assets resolve.
+      - name: Build The Vault (WASM) + assemble into /vault
+        run: |
+          cargo install trunk --locked
+          cd crates/ctf-engine
+          trunk build --release --public-url /nucleus/vault/
+          cd ../..
+          mkdir -p book/vault
+          cp -r crates/ctf-engine/dist/. book/vault/
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: ./book
 
@@ -61,4 +96,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

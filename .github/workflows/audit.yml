@@ -8,6 +8,7 @@ on:
       - Cargo.toml
       - crates/**/Cargo.toml
   pull_request:
+  merge_group:
   schedule:
     - cron: "0 6 * * 1"
 
@@ -18,7 +19,8 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.9.1
       - uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1
         with:
           denyWarnings: true

@@ -38,7 +38,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
+use hmac::{digest::KeyInit, Hmac, Mac};
 use sha2::Sha256;
 
 pub mod drand;
@@ -73,6 +73,52 @@ pub struct DrandSignedHeaders {
 /// Sign an HTTP request body.
 ///
 /// The server expects: `signature = HMAC_SHA256(secret, "{ts}.{actor}.{body}")`.
+/// The bytes an Article 12 record's signature must cover: the DESTINATION as
+/// well as the payload.
+///
+/// # The defect this closes
+///
+/// `art12_append` verified the signature over the request BODY alone, while the
+/// `session_id` that decides which chain the record lands in came from the URL
+/// path and was only sanitised against traversal. So a validly-signed record
+/// could be replayed into ANY session's chain by changing the path — and every
+/// pod configured with the node-wide receipt secret can sign. On the evidence
+/// path (EU AI Act Article 12 record-keeping), that is one tenant able to write
+/// into another tenant's audit chain.
+///
+/// A signature that authenticates a payload but not its destination is not
+/// authenticating the thing that matters.
+///
+/// # Framing
+///
+/// Length-prefixed, not concatenated. `session_id || body` is ambiguous: a
+/// session id ending in digits and a body starting with them can be re-split,
+/// so two different (session, body) pairs could share one signature. The
+/// domain tag makes these bytes unusable as any other signature in the system.
+#[must_use]
+pub fn art12_signed_bytes(session_id: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(session_id.len() + body.len() + 32);
+    out.extend_from_slice(b"nucleus-art12-v2\0");
+    out.extend_from_slice(&(session_id.len() as u64).to_be_bytes());
+    out.extend_from_slice(session_id.as_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// The header a pod uses to state which pod it is.
+///
+/// Defined here, in the crate BOTH the node and the tool-proxy already depend on,
+/// rather than as a literal on each side. The failure this prevents is quiet: if
+/// the two spellings drifted, every caller would present nothing the node
+/// recognises and be treated as unidentified -- the fail-OPEN direction, with no
+/// error raised anywhere. One definition makes that drift a compile error instead
+/// of a behaviour change nobody would notice.
+pub const HEADER_POD_ID: &str = "x-nucleus-pod-id";
+
+/// The header carrying the token that PROVES the claim in [`HEADER_POD_ID`].
+/// The id alone is not a credential -- anyone can name a pod.
+pub const HEADER_POD_TOKEN: &str = "x-nucleus-pod-token";
+
 pub fn sign_http_headers(secret: &[u8], actor: Option<&str>, body: &[u8]) -> SignedHeaders {
     let timestamp = now_unix();
     let actor_value = actor.unwrap_or("");
@@ -224,6 +270,10 @@ pub fn verify_drand_signature(
     body: &[u8],
     signature: &str,
 ) -> bool {
+    // Fail-closed: never authenticate against a world-known (empty) key.
+    if !auth_secret_is_usable(secret) {
+        return false;
+    }
     let actor_value = actor.unwrap_or("");
     let message = build_drand_message(drand_round, timestamp, actor_value, body);
     let expected = sign_message(secret, &message);
@@ -240,6 +290,10 @@ pub fn verify_signature(
     body: &[u8],
     signature: &str,
 ) -> bool {
+    // Fail-closed: never authenticate against a world-known (empty) key.
+    if !auth_secret_is_usable(secret) {
+        return false;
+    }
     let actor_value = actor.unwrap_or("");
     let message = build_message(timestamp, actor_value, body);
     let expected = sign_message(secret, &message);
@@ -283,6 +337,24 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+/// Minimum recommended HMAC auth-secret length, in bytes. Shorter-but-nonempty
+/// secrets are weak (warned about at startup) but not world-known; an EMPTY
+/// secret is world-known and is rejected outright (see [`auth_secret_is_usable`]).
+pub const MIN_AUTH_SECRET_LEN: usize = 16;
+
+/// Fail-closed usability check for an HMAC auth secret.
+///
+/// `Hmac::<Sha256>::new_from_slice` accepts a key of ANY length, including the
+/// empty key — so an empty `auth_secret` is a *world-known* key: an attacker can
+/// compute `HMAC(∅, msg)` themselves and forge any signature or sandbox token.
+/// Every verifier consults this first and refuses to authenticate against an
+/// empty key, so a mis-provisioned (empty) secret fails closed instead of
+/// silently accepting forgeries.
+#[must_use]
+pub fn auth_secret_is_usable(secret: &[u8]) -> bool {
+    !secret.is_empty()
+}
+
 /// Maximum age of a sandbox token before it's considered expired.
 const MAX_TOKEN_AGE_SECS: u64 = 300;
 
@@ -313,6 +385,13 @@ pub fn generate_sandbox_token(secret: &[u8], pod_id: &str, spec_hash: &str) -> S
 /// Returns the verified payload (pod_id, spec_hash) on success,
 /// or an error string on failure.
 pub fn verify_sandbox_token(secret: &[u8], token: &str) -> Result<SandboxTokenPayload, String> {
+    // Fail-closed: an empty secret is a world-known key, so an attacker could
+    // forge a token by signing with the empty key. Refuse verification outright.
+    if !auth_secret_is_usable(secret) {
+        return Err("empty auth secret: refusing HMAC verification against a \
+                    world-known key (fail-closed)"
+            .to_string());
+    }
     if token.is_empty() {
         return Err("empty token".to_string());
     }
@@ -387,6 +466,58 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_secret_never_verifies_sandbox_token() {
+        // World-known empty key: an attacker forges a token by signing with b"".
+        let forged = generate_sandbox_token(b"", "pod1", "hashX");
+        // RED on main: empty secret verifies the empty-key-forged token.
+        assert!(
+            verify_sandbox_token(b"", &forged).is_err(),
+            "empty auth secret must never verify a token (world-known key, fail-closed)"
+        );
+        // No regression: a real secret still round-trips.
+        let real: &[u8] = b"a-real-16byte-secret!!";
+        let good = generate_sandbox_token(real, "pod1", "hashX");
+        assert!(verify_sandbox_token(real, &good).is_ok());
+    }
+
+    #[test]
+    fn empty_secret_never_verifies_request_signature() {
+        let ts = now_unix();
+        let body = b"payload";
+        // World-known empty-key signature over the exact message the verifier builds.
+        let forged = sign_message(b"", &build_message(ts, "", body));
+        assert!(
+            !verify_signature(b"", ts, None, body, &forged),
+            "empty auth secret must never verify a request signature (fail-closed)"
+        );
+        // No regression: a real secret verifies.
+        let real: &[u8] = b"a-real-16byte-secret!!";
+        let sig = sign_message(real, &build_message(ts, "", body));
+        assert!(verify_signature(real, ts, None, body, &sig));
+    }
+
+    #[test]
+    fn empty_secret_never_verifies_drand_signature() {
+        let ts = now_unix();
+        let body = b"payload";
+        let forged = sign_message(b"", &build_drand_message(7, ts, "", body));
+        assert!(
+            !verify_drand_signature(b"", 7, ts, None, body, &forged),
+            "empty auth secret must never verify a drand signature (fail-closed)"
+        );
+        let real: &[u8] = b"a-real-16byte-secret!!";
+        let sig = sign_message(real, &build_drand_message(7, ts, "", body));
+        assert!(verify_drand_signature(real, 7, ts, None, body, &sig));
+    }
+
+    #[test]
+    fn auth_secret_usable_rejects_only_empty() {
+        assert!(!auth_secret_is_usable(b""));
+        assert!(auth_secret_is_usable(b"x"));
+        assert!(auth_secret_is_usable(&[0u8; MIN_AUTH_SECRET_LEN]));
+    }
 
     #[test]
     fn test_sign_http_headers() {
@@ -565,5 +696,40 @@ mod tests {
         assert!(!constant_time_eq(b"hello", b"hell"));
         assert!(!constant_time_eq(b"", b"a"));
         assert!(constant_time_eq(b"", b""));
+    }
+}
+
+#[cfg(test)]
+mod art12_binding_tests {
+    use super::art12_signed_bytes;
+
+    /// The whole point: the same body aimed at a different session must produce
+    /// different signed bytes, or the signature does not bind the destination.
+    #[test]
+    fn the_destination_changes_the_signed_bytes() {
+        let body = br#"{"event":"x"}"#;
+        assert_ne!(
+            art12_signed_bytes("session-a", body),
+            art12_signed_bytes("session-b", body)
+        );
+    }
+
+    /// Length-prefixing, demonstrated rather than asserted in a comment: without
+    /// it, ("ab", "cd") and ("abc", "d") would frame identically.
+    #[test]
+    fn framing_is_unambiguous_across_the_boundary() {
+        assert_ne!(
+            art12_signed_bytes("ab", b"cd"),
+            art12_signed_bytes("abc", b"d")
+        );
+    }
+
+    /// Same inputs, same bytes — the signature has to be reproducible.
+    #[test]
+    fn framing_is_deterministic() {
+        assert_eq!(
+            art12_signed_bytes("s", b"body"),
+            art12_signed_bytes("s", b"body")
+        );
     }
 }

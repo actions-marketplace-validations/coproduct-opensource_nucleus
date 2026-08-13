@@ -1,16 +1,73 @@
-// CTF app logic. WASM bindings are passed in via window.__initCtf(ctf).
-// This file is loaded as a regular script (not a module) so it works
-// with trunk's hashed WASM filenames without import path issues.
+// CTF app logic. Initialises from window.wasmBindings (set by trunk's
+// module script) or falls back to the legacy window.__initCtf(ctf) path.
 
 (function() {
   'use strict';
 
-  window.__initCtf = function(ctf) {
+  function boot(ctf) {
+    // Mobile responsive fixes — injected via JS to survive Depot caching
+    var mobileCSS = document.createElement('style');
+    mobileCSS.textContent = [
+      '.step-reason { overflow-wrap: anywhere; word-break: break-all; }',
+      '.step-item { overflow-wrap: anywhere; word-break: break-word; min-width: 0; }',
+      // Explainer tabs
+      '.explainer { margin-top: 12px; }',
+      '.explainer-tabs { display: flex; gap: 0; border-bottom: 1px solid #30363d; }',
+      '.explainer-tab {',
+      '  background: none; border: 1px solid transparent; border-bottom: none;',
+      '  color: #8b949e; padding: 6px 14px; font-family: inherit; font-size: 12px;',
+      '  cursor: pointer; border-radius: 4px 4px 0 0; transition: all 0.15s;',
+      '}',
+      '.explainer-tab:hover { color: #e6edf3; }',
+      '.explainer-tab.active {',
+      '  background: #161b22; border-color: #30363d; color: #e6edf3;',
+      '  margin-bottom: -1px; padding-bottom: 7px;',
+      '}',
+      '.explainer-tab.active[data-level="beginner"] { color: #3fb950; }',
+      '.explainer-tab.active[data-level="intermediate"] { color: #58a6ff; }',
+      '.explainer-tab.active[data-level="advanced"] { color: #bc8cff; }',
+      '.explainer-body {',
+      '  background: #161b22; border: 1px solid #30363d; border-top: none;',
+      '  border-radius: 0 0 6px 6px; padding: 12px; font-size: 13px;',
+      '  color: #8b949e; line-height: 1.5;',
+      '}',
+      '@media (max-width: 768px) {',
+      '  #app { height: auto; min-height: 100vh; overflow-x: hidden; max-width: 100vw; }',
+      '  .panel { padding: 12px; }',
+      '  textarea#attack-input { min-height: 120px; }',
+      '  .exposure-leg .leg-label { font-size: 10px; }',
+      '  .exposure-leg { padding: 6px 4px; }',
+      '  .defense-chip { display: block; margin: 4px 0; width: 100%; }',
+      '  .step-item { padding: 8px 10px; max-width: calc(100vw - 24px); }',
+      '  .explainer-tab { padding: 5px 10px; font-size: 11px; }',
+      '  .explainer-body { font-size: 12px; padding: 10px; }',
+      '}'
+    ].join('\n');
+    document.head.appendChild(mobileCSS);
+
     var currentLevel = 1;
     var totalScore = 0;
     var allDefenses = new Set();
 
     var levels = JSON.parse(JSON.stringify(ctf.get_levels()));
+    var LEVEL_COUNT = levels.length;
+
+    // Plain-language glossary for the tool chips (hover tooltips). Keep in sync
+    // with the tools surfaced by the engine; unknown tools fall back to a generic hint.
+    var TOOL_GLOSSARY = {
+      read_file: 'Read the contents of a file (e.g. the secret in /vault/).',
+      write_file: 'Write or overwrite a file on disk.',
+      run_bash: 'Run a shell command — the broadest tool; watched for exfil patterns.',
+      web_fetch: 'Fetch a URL. Counts as ingesting untrusted external content.',
+      web_search: 'Search the web. Also treated as untrusted content.',
+      glob: 'List files matching a pattern (read-only discovery).',
+      grep: 'Search file contents for a pattern (read-only).',
+      git_push: 'Push commits to a remote — a network exfiltration vector.',
+      create_pr: 'Open a pull request — another way to send data outward.',
+      approve: 'Approve a pending escalation request (tests self-approval defenses).',
+      delegate: 'Hand a capability to a sub-agent (tests delegation ceilings).',
+      release: 'Release a held capability back (tests ambient-authority removal).'
+    };
 
     // ── Landing page ──────────────────────────────────────────────────
 
@@ -18,16 +75,37 @@
     var landing = document.getElementById('landing');
     var app = document.getElementById('app');
 
-    startBtn.addEventListener('click', function() {
+    function enterApp(n) {
       landing.style.display = 'none';
       app.style.display = 'grid';
-      selectLevel(1);
-    });
+      selectLevel(n || 1);
+    }
+
+    startBtn.addEventListener('click', function() { enterApp(1); });
+
+    // Keep landing/header counts honest by deriving them from the real level data.
+    var statLevels = document.getElementById('stat-levels');
+    if (statLevels) statLevels.textContent = LEVEL_COUNT;
+    var statExploits = document.getElementById('stat-exploits');
+    if (statExploits) {
+      var exploitCount = levels.filter(function(l) { return l.cve; }).length;
+      statExploits.textContent = exploitCount;
+    }
+    var levelTotal = document.getElementById('level-total');
+    if (levelTotal) levelTotal.textContent = LEVEL_COUNT;
+
+    // "Point your own agent at the API" — send people to the integration docs.
+    var apiLink = document.getElementById('api-link');
+    if (apiLink) {
+      apiLink.setAttribute('href', 'https://github.com/coproduct-opensource/nucleus/blob/main/crates/ctf-engine/README.md');
+      apiLink.setAttribute('target', '_blank');
+      apiLink.setAttribute('rel', 'noopener');
+    }
 
     // ── Level selector ────────────────────────────────────────────────
 
     var levelSelector = document.getElementById('level-selector');
-    for (var i = 1; i <= 7; i++) {
+    for (var i = 1; i <= LEVEL_COUNT; i++) {
       var btn = document.createElement('button');
       btn.className = 'level-btn' + (i === 1 ? ' active' : '');
       btn.textContent = i;
@@ -48,12 +126,50 @@
         '<div class="cve-desc">' + meta.tagline + '</div>' +
         (meta.cve ? '<div class="cve-id">' + meta.cve + '</div>' : '') +
         (meta.cve_description ? '<div class="cve-desc">' + meta.cve_description + '</div>' : '');
+      renderExplainer(meta.explainer);
       var toolsDiv = document.getElementById('tools-available');
       toolsDiv.innerHTML = meta.available_tools.map(function(t) {
-        return '<span class="tool-chip">' + t + '</span>';
+        var hint = TOOL_GLOSSARY[t] || 'A tool the agent can call at this level.';
+        return '<span class="tool-chip" title="' + hint.replace(/"/g, '&quot;') + '">' + t + '</span>';
       }).join('');
       clearResults();
       loadExample(n);
+    }
+
+    function renderExplainer(explainer) {
+      var container = document.getElementById('explainer-container');
+      if (!container) {
+        container = document.createElement('div');
+        container.id = 'explainer-container';
+        container.className = 'explainer';
+        var card = document.getElementById('cve-card');
+        card.parentNode.insertBefore(container, card.nextSibling);
+      }
+      var tabs = [
+        { key: 'beginner', label: 'Beginner' },
+        { key: 'intermediate', label: 'Intermediate' },
+        { key: 'advanced', label: 'Advanced' }
+      ];
+      var activeTab = container.getAttribute('data-active') || 'beginner';
+      container.innerHTML =
+        '<div class="explainer-tabs">' +
+          tabs.map(function(t) {
+            return '<button class="explainer-tab' +
+              (t.key === activeTab ? ' active' : '') +
+              '" data-level="' + t.key + '">' + t.label + '</button>';
+          }).join('') +
+        '</div>' +
+        '<div class="explainer-body">' + explainer[activeTab] + '</div>';
+      container.setAttribute('data-active', activeTab);
+      container.querySelectorAll('.explainer-tab').forEach(function(tab) {
+        tab.addEventListener('click', function() {
+          container.setAttribute('data-active', tab.dataset.level);
+          container.querySelector('.explainer-body').textContent = explainer[tab.dataset.level];
+          container.querySelectorAll('.explainer-tab').forEach(function(t) {
+            t.classList.toggle('active', t.dataset.level === tab.dataset.level);
+          });
+        });
+      });
     }
 
     function loadExample(n) {
@@ -230,15 +346,18 @@
     var params = new URLSearchParams(window.location.search);
     if (params.has('level')) {
       var lvl = parseInt(params.get('level'), 10);
-      if (lvl >= 1 && lvl <= 7) {
-        landing.style.display = 'none';
-        app.style.display = 'grid';
-        selectLevel(lvl);
+      if (lvl >= 1 && lvl <= LEVEL_COUNT) {
+        enterApp(lvl);
         return;
       }
     }
 
     // Default: show landing
     selectLevel(1);
-  };
+  }
+
+  // ctf.js loads in <head> before the WASM module script.
+  // WASM start() calls window.__initCtf(ctf) after init.
+  // Module scripts are deferred, so DOM is ready when boot() runs.
+  window.__initCtf = boot;
 })();

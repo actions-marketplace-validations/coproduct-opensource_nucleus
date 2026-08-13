@@ -17,6 +17,9 @@ ROOTFS_PACKAGES=(
     "nucleus-guest-init"
     "nucleus-tool-proxy"
     "nucleus-net-probe"
+    "nucleus-workload-probe"
+    "nucleus-egress-probe"
+    "nucleus-podlist-probe"
 )
 
 # Targets

@@ -1,0 +1,60 @@
+[package]
+name = "nucleus-recompute"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "verify_receipt — re-derive every cleared number (settlement / commons / VCG) from a receipt's DECLARED inputs using the proven nucleus-econ-kernels, and compare to the claimed outputs. The money-path-runs-the-proven-function check, runnable by anyone."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+nucleus-econ-kernels = { path = "../nucleus-econ-kernels", version = "1.0.0" }
+# Base (default) dep for the IFC egress-gate verdict recompute: `verify_ifc_flow`
+# re-derives the gate verdict via the SINGLE-sourced `egress_blocked_by_integrity`
+# predicate. nucleus-ifc (base, no `decision` feature) is wasm-pure (verified:
+# builds clean to wasm32), so it stays in the wasm-pure default closure.
+nucleus-ifc = { path = "../nucleus-ifc", version = "1.0.0" }
+# Aeneas-EXTRACTED integrity primitives (`irank`/`imeet`/`iflows_to`/`irun_step`)
+# — the exact 3-point functions the multi-hop non-interference (D1) theorem is
+# proven over. `verify_ifc_trace` recomputes its trust-monotonicity (anti-
+# laundering) check via the extracted `imeet` fold, so the runtime witness binds
+# to the PROVEN core rather than ad-hoc string-rank logic. `default-features =
+# false` keeps it dependency-free (the Aeneas translation target), so the
+# wasm-pure default closure is unchanged.
+portcullis-core = { path = "../portcullis-core", version = "1.0.0", default-features = false }
+# `envelope` feature only: lift a ClearingReceipt into nucleus-receipt's signed
+# colimit envelope (`Projection::Economic`) and narrow it back out. Optional so
+# the default build — the one the wasm-pure-crates gate compiles — keeps the
+# dependency closure exactly as before (no dalek/blake3/base64 in the default
+# wasm closure). nucleus-receipt itself is wasm-capable (the verifier-js WASM
+# SDK depends on it), so turning the feature on does not break wasm consumers.
+nucleus-receipt = { path = "../nucleus-receipt", version = "1.0.0", optional = true }
+
+[features]
+# Travel as a signed receipt: `to_economic_projection` / `clearing_from_projection`
+# bridge ClearingReceipt <-> nucleus-receipt's `Projection::Economic`, so one
+# envelope carries BOTH guarantees — Ed25519 signature (who emitted it) and
+# recompute (the numbers re-derive). OFF by default: pure recompute consumers
+# (and the wasm-pure default build) pay nothing for it.
+envelope = ["dep:nucleus-receipt"]
+
+# Travel an IFC decision as a signed receipt: lift a `ConformanceCertificate`
+# (nucleus-ifc's proof-carrying IFC-down-flow decision) into nucleus-receipt's
+# `Projection::Flow`, sign it, and recompute it offline via the cert's `recheck()`
+# (re-runs `decide()` from the declared inputs — a forged verdict is caught). Pulls
+# nucleus-ifc's `decision` module (wasm-pure: serde + portcullis-core only) +
+# nucleus-receipt. OFF by default so the wasm-pure recompute core pays nothing.
+ifc-envelope = ["dep:nucleus-receipt", "nucleus-ifc/decision"]
+
+[dev-dependencies]
+# Fixed-key signing in the envelope end-to-end + tamper tests.
+ed25519-dalek = { workspace = true }
+
+[lints]
+workspace = true

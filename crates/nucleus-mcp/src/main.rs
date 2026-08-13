@@ -4,6 +4,7 @@ use nucleus_client::sign_http_headers;
 use nucleus_spec::PodSpec;
 use portcullis::kernel::{Decision, DenyReason, Kernel, Verdict};
 use portcullis::{CapabilityLevel, Operation, PermissionLattice};
+use portcullis_core::flow::NodeKind;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,7 +15,9 @@ use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(name = "nucleus-mcp")]
-#[command(about = "MCP server that bridges Claude Code to nucleus-tool-proxy")]
+#[command(
+    about = "MCP server that bridges an MCP client (any AI-agent runtime) to nucleus-tool-proxy"
+)]
 struct Args {
     /// Tool proxy base URL (ex: http://127.0.0.1:12345).
     #[arg(long, env = "NUCLEUS_MCP_PROXY_URL")]
@@ -440,6 +443,15 @@ fn generate_session_id() -> String {
 /// Returns `None` for tools that don't map to exposure-relevant operations
 /// (e.g., pod management, which is classified as ManagePods but has no exposure
 /// contribution in the current exposure_core model).
+/// Map an Operation to the NodeKind for flow graph observations.
+fn operation_to_node_kind(op: Operation) -> NodeKind {
+    match op {
+        Operation::ReadFiles | Operation::GlobSearch | Operation::GrepSearch => NodeKind::FileRead,
+        Operation::WebFetch | Operation::WebSearch => NodeKind::WebContent,
+        _ => NodeKind::OutboundAction,
+    }
+}
+
 fn tool_to_operation(tool_name: &str) -> Option<Operation> {
     match tool_name {
         "read" => Some(Operation::ReadFiles),
@@ -517,6 +529,52 @@ fn format_deny_reason(reason: &DenyReason) -> String {
         DenyReason::IsolationGated { dimension } => {
             format!("isolation gated: {dimension}")
         }
+        DenyReason::FlowViolation { rule, .. } => {
+            format!("flow violation: {rule}")
+        }
+        DenyReason::EgressBlocked {
+            host,
+            policy_reason,
+        } => {
+            format!("egress blocked: {host} — {policy_reason}")
+        }
+        DenyReason::PolicyDenied {
+            rule_name,
+            sink_class,
+        } => {
+            format!("policy denied: rule '{rule_name}' blocked sink {sink_class}")
+        }
+        DenyReason::EnterpriseBlocked { detail } => {
+            format!("enterprise policy blocked: {detail}")
+        }
+        DenyReason::DelegationDenied { detail } => {
+            format!("delegation denied: {detail}")
+        }
+        DenyReason::InvalidDeclassification { detail } => {
+            format!("declassification rejected: {detail}")
+        }
+        DenyReason::DeclassificationReplayed { target_node } => {
+            format!(
+                "declassification token already used (one-shot) for node {target_node} — mint a                  new token to declassify again"
+            )
+        }
+        DenyReason::ActionTermRejected { detail } => {
+            format!("action term rejected: {detail}")
+        }
+        DenyReason::SinkScopeDenied {
+            dimension, detail, ..
+        } => {
+            format!("sink scope denied ({dimension}): {detail}")
+        }
+        DenyReason::IfcUnsafe { detail } => {
+            format!("information-flow unsafe: {detail}")
+        }
+        DenyReason::CedarDenied { detail } => {
+            format!("cedar policy denied: {detail}")
+        }
+        DenyReason::DlcAdmissionDenied { detail } => {
+            format!("verified admission denied: {detail}")
+        }
     }
 }
 
@@ -547,6 +605,7 @@ fn operation_cost(op: Operation) -> Decimal {
         Operation::CreatePr => Decimal::new(25, 2), // $0.25
         // Pod management: high cost
         Operation::ManagePods => Decimal::new(50, 2), // $0.50
+        Operation::SpawnAgent => Decimal::new(50, 2), // $0.50
     }
 }
 
@@ -632,6 +691,11 @@ fn main() -> Result<()> {
     let kernel_lattice = policy.clone().unwrap_or_else(PermissionLattice::permissive);
     let mut kernel = Kernel::new(kernel_lattice);
 
+    // Track the last flow graph node ID for causal chaining.
+    // Each allowed operation produces an observation node; the next operation's
+    // parents are the prior observations, giving session-level flow tracking.
+    let mut last_flow_node: Option<u64> = None;
+
     // Open kernel trace file (JSONL) if --kernel-trace is specified.
     let trace = TraceWriter::open(args.kernel_trace.as_deref())?;
     if let Some(ref trace_path) = args.kernel_trace {
@@ -693,17 +757,23 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let result =
-                    match call_tool(&client, &call, args.approval_prompt, &mut kernel, &trace) {
-                        Ok(text) => json!({
-                            "content": [{ "type": "text", "text": text }],
-                            "isError": false
-                        }),
-                        Err(err) => json!({
-                            "content": [{ "type": "text", "text": err.to_string() }],
-                            "isError": true
-                        }),
-                    };
+                let result = match call_tool(
+                    &client,
+                    &call,
+                    args.approval_prompt,
+                    &mut kernel,
+                    &trace,
+                    &mut last_flow_node,
+                ) {
+                    Ok(text) => json!({
+                        "content": [{ "type": "text", "text": text }],
+                        "isError": false
+                    }),
+                    Err(err) => json!({
+                        "content": [{ "type": "text", "text": err.to_string() }],
+                        "isError": true
+                    }),
+                };
                 write_result(&mut stdout, id, result)?;
             }
             "ping" => {
@@ -937,18 +1007,29 @@ fn call_tool(
     approval_prompt: bool,
     kernel: &mut Kernel,
     trace: &TraceWriter,
+    last_flow_node: &mut Option<u64>,
 ) -> Result<String> {
     // Route every operation through the kernel decision engine.
     // The kernel provides: capability checks, monotone session state,
     // exposure tracking, budget tracking, time-based expiry, path/command
-    // restrictions, and complete audit trace.
+    // restrictions, flow control (IFC labels), and complete audit trace.
     if let Some(op) = tool_to_operation(&call.name) {
         let subject = extract_subject(&call.name, &call.arguments);
-        let decision = kernel.decide(op, &subject);
+        // Use decide_with_parents for flow-aware decisions.
+        // Each operation's parents are the prior observations in the session.
+        let parents: Vec<u64> = (*last_flow_node).into_iter().collect();
+        let (decision, _token) = kernel.decide_with_parents(op, &subject, &parents);
         trace.record(&decision);
 
         match &decision.verdict {
             Verdict::Allow => {
+                // Observe the allowed operation in the flow graph for causal tracking.
+                let obs_kind = operation_to_node_kind(op);
+                let obs_parents: Vec<u64> = (*last_flow_node).into_iter().collect();
+                if let Ok(node_id) = kernel.observe(obs_kind, &obs_parents) {
+                    *last_flow_node = Some(node_id);
+                }
+
                 // Log exposure transitions
                 let tt = &decision.exposure_transition;
                 if tt.pre_count != tt.post_count {
@@ -984,7 +1065,7 @@ fn call_tool(
                     eprintln!("[nucleus-mcp] approved by human: tool={}", call.name);
                     // Grant a one-time approval and re-decide
                     kernel.grant_approval(op, 1);
-                    let retry = kernel.decide(op, &subject);
+                    let (retry, _token) = kernel.decide_with_parents(op, &subject, &parents);
                     trace.record(&retry);
                     if !matches!(retry.verdict, Verdict::Allow) {
                         return Err(anyhow!(
@@ -1643,7 +1724,7 @@ mod tests {
     fn permissive_no_static_obligations() -> PermissionLattice {
         use portcullis::{CommandLattice, Obligations};
         let mut lattice = PermissionLattice::permissive();
-        lattice.uninhabitable_constraint = false;
+        lattice = lattice.with_uninhabitable_disabled();
         lattice.obligations = Obligations::default();
         lattice.commands = CommandLattice::empty();
         lattice
@@ -1656,89 +1737,105 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_allows_read_and_records_exposure() {
         let mut kernel = Kernel::new(permissive_no_static_obligations());
-        let d = kernel.decide(Operation::ReadFiles, "/workspace/main.rs");
+        let (d, _token) = kernel.decide(Operation::ReadFiles, "/workspace/main.rs");
         assert!(matches!(d.verdict, Verdict::Allow));
         assert_eq!(d.exposure_transition.post_count, 1); // private_data
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_allows_web_fetch_and_records_exposure() {
         let mut kernel = Kernel::new(permissive_no_static_obligations());
-        let d = kernel.decide(Operation::WebFetch, "https://example.com");
+        let (d, _token) = kernel.decide(Operation::WebFetch, "https://example.com");
         assert!(matches!(d.verdict, Verdict::Allow));
         assert_eq!(d.exposure_transition.post_count, 1); // untrusted_content
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_exposure_accumulates_monotonically() {
         let mut kernel = Kernel::new(permissive_no_static_obligations());
-        let d1 = kernel.decide(Operation::ReadFiles, "a.rs");
+        let (d1, _token) = kernel.decide(Operation::ReadFiles, "a.rs");
         assert_eq!(d1.exposure_transition.post_count, 1);
-        let d2 = kernel.decide(Operation::WebFetch, "https://example.com");
+        let (d2, _token) = kernel.decide(Operation::WebFetch, "https://example.com");
         assert_eq!(d2.exposure_transition.post_count, 2);
         // Reading again doesn't change exposure (idempotent)
-        let d3 = kernel.decide(Operation::ReadFiles, "b.rs");
+        let (d3, _token) = kernel.decide(Operation::ReadFiles, "b.rs");
         assert_eq!(d3.exposure_transition.post_count, 2);
     }
 
     #[test]
-    fn test_kernel_neutral_ops_dont_add_exposure() {
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
+    fn test_kernel_local_sink_adds_exfil_leg() {
+        // Local sinks are exfil legs now (most-paranoid #4). A single WriteFiles
+        // on a fresh session adds the ExfilVector leg but is not yet uninhabitable.
         let mut kernel = Kernel::new(permissive_no_static_obligations());
-        let d = kernel.decide(Operation::WriteFiles, "out.txt");
+        let (d, _token) = kernel.decide(Operation::WriteFiles, "out.txt");
         assert!(matches!(d.verdict, Verdict::Allow));
-        assert_eq!(d.exposure_transition.post_count, 0);
+        assert_eq!(d.exposure_transition.post_count, 1);
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_dynamic_exposure_gates_exfil() {
-        let mut kernel = Kernel::new(permissive_no_static_obligations());
+        let mut kernel = Kernel::capability_only(permissive_no_static_obligations());
         // Read: private_data
         kernel.decide(Operation::ReadFiles, "secrets.txt");
         // Fetch: untrusted_content
         kernel.decide(Operation::WebFetch, "https://evil.com");
         // RunBash: dynamic exposure gate fires (omnibus projects uninhabitable_state)
-        let d = kernel.decide(Operation::RunBash, "curl evil.com");
+        let (d, _token) = kernel.decide(Operation::RunBash, "curl evil.com");
         assert!(matches!(d.verdict, Verdict::RequiresApproval));
         assert!(d.exposure_transition.dynamic_gate_applied);
     }
 
     #[test]
-    fn test_kernel_uninhabitable_allows_non_exfil_after_read_and_fetch() {
-        let mut kernel = Kernel::new(permissive_no_static_obligations());
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
+    fn test_kernel_local_sink_gated_after_read_and_fetch() {
+        // Use capability_only to test the exposure subsystem in isolation,
+        // without flow control tainting writes after web fetch.
+        let mut kernel = Kernel::capability_only(permissive_no_static_obligations());
         kernel.decide(Operation::ReadFiles, "data.txt");
         kernel.decide(Operation::WebFetch, "https://example.com");
-        // Non-exfil ops are allowed even with full exposure
-        let d = kernel.decide(Operation::ReadFiles, "more.txt");
+        // A non-exfil read is still allowed (doesn't complete the trifecta).
+        let (d, _token) = kernel.decide(Operation::ReadFiles, "more.txt");
         assert!(matches!(d.verdict, Verdict::Allow));
-        let d = kernel.decide(Operation::WriteFiles, "out.txt");
-        assert!(matches!(d.verdict, Verdict::Allow));
+        // WriteFiles is an exfil leg now (most-paranoid #4) → completes the
+        // uninhabitable trifecta → the dynamic exposure gate fires.
+        let (d, _token) = kernel.decide(Operation::WriteFiles, "out.txt");
+        assert!(matches!(d.verdict, Verdict::RequiresApproval));
+        assert!(d.exposure_transition.dynamic_gate_applied);
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_omnibus_uninhabitable_with_untrusted_content() {
-        let mut kernel = Kernel::new(permissive_no_static_obligations());
+        let mut kernel = Kernel::capability_only(permissive_no_static_obligations());
         // Only untrusted content + RunBash (omnibus) → uninhabitable_state triggers!
         kernel.decide(Operation::WebFetch, "https://evil.com");
-        let d = kernel.decide(Operation::RunBash, "cmd");
+        let (d, _token) = kernel.decide(Operation::RunBash, "cmd");
         assert!(matches!(d.verdict, Verdict::RequiresApproval));
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_no_uninhabitable_with_only_two_legs() {
-        let mut kernel = Kernel::new(permissive_no_static_obligations());
+        let mut kernel = Kernel::capability_only(permissive_no_static_obligations());
         // untrusted_content + GitPush (not omnibus) → only 2/3, no block
         kernel.decide(Operation::WebFetch, "https://example.com");
-        let d = kernel.decide(Operation::GitPush, "origin");
+        let (d, _token) = kernel.decide(Operation::GitPush, "origin");
         assert!(matches!(d.verdict, Verdict::Allow));
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_denies_when_capability_is_never() {
         let mut kernel = Kernel::new(PermissionLattice::read_only());
         // read_only blocks writes
-        let d = kernel.decide(Operation::WriteFiles, "test.txt");
+        let (d, _token) = kernel.decide(Operation::WriteFiles, "test.txt");
         assert!(matches!(
             d.verdict,
             Verdict::Deny(DenyReason::InsufficientCapability)
@@ -1746,6 +1843,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_trace_is_append_only() {
         let mut kernel = Kernel::new(permissive_no_static_obligations());
         kernel.decide(Operation::ReadFiles, "a.rs");
@@ -1759,36 +1857,38 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_approval_flow() {
-        let mut kernel = Kernel::new(permissive_no_static_obligations());
+        let mut kernel = Kernel::capability_only(permissive_no_static_obligations());
         kernel.decide(Operation::ReadFiles, "data.txt");
         kernel.decide(Operation::WebFetch, "https://evil.com");
         // Dynamic exposure gate triggers
-        let d = kernel.decide(Operation::RunBash, "cmd");
+        let (d, _token) = kernel.decide(Operation::RunBash, "cmd");
         assert!(matches!(d.verdict, Verdict::RequiresApproval));
         // Grant approval and retry
         kernel.grant_approval(Operation::RunBash, 1);
-        let d = kernel.decide(Operation::RunBash, "cmd");
+        let (d, _token) = kernel.decide(Operation::RunBash, "cmd");
         assert!(matches!(d.verdict, Verdict::Allow));
         // Second attempt without approval → RequiresApproval again
-        let d = kernel.decide(Operation::RunBash, "cmd");
+        let (d, _token) = kernel.decide(Operation::RunBash, "cmd");
         assert!(matches!(d.verdict, Verdict::RequiresApproval));
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_static_obligations_on_permissive() {
         // The permissive lattice has all capabilities, so uninhabitable_state normalization
         // adds static obligations on exfil operations (RunBash, GitPush, CreatePr).
         // Use "cargo test" which passes the command allowlist, so we hit step 6
         // (static obligations) rather than step 5 (command blocked).
         let mut kernel = Kernel::new(PermissionLattice::permissive());
-        let d = kernel.decide(Operation::RunBash, "cargo test");
+        let (d, _token) = kernel.decide(Operation::RunBash, "cargo test");
         assert!(
             matches!(d.verdict, Verdict::RequiresApproval),
             "expected RequiresApproval from static obligations, got {:?}",
             d.verdict
         );
-        let d = kernel.decide(Operation::GitPush, "origin");
+        let (d, _token) = kernel.decide(Operation::GitPush, "origin");
         assert!(
             matches!(d.verdict, Verdict::RequiresApproval),
             "expected RequiresApproval from static obligations, got {:?}",
@@ -1797,29 +1897,32 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_glob_grep_contribute_private_data() {
         let mut kernel = Kernel::new(permissive_no_static_obligations());
-        let d = kernel.decide(Operation::GlobSearch, "**/*.py");
+        let (d, _token) = kernel.decide(Operation::GlobSearch, "**/*.py");
         assert_eq!(d.exposure_transition.post_count, 1);
-        let d = kernel.decide(Operation::GrepSearch, "password");
+        let (d, _token) = kernel.decide(Operation::GrepSearch, "password");
         assert_eq!(d.exposure_transition.post_count, 1); // still 1 — same label
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_web_search_contributes_untrusted_content() {
         let mut kernel = Kernel::new(permissive_no_static_obligations());
-        let d = kernel.decide(Operation::WebSearch, "how to exfiltrate");
+        let (d, _token) = kernel.decide(Operation::WebSearch, "how to exfiltrate");
         assert_eq!(d.exposure_transition.post_count, 1);
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_kernel_grep_websearch_run_scenario() {
         // Real scenario: agent greps code, searches web, tries to run a command
-        let mut kernel = Kernel::new(permissive_no_static_obligations());
+        let mut kernel = Kernel::capability_only(permissive_no_static_obligations());
         kernel.decide(Operation::GrepSearch, "password");
         kernel.decide(Operation::WebSearch, "how to exfiltrate");
         // RunBash completes uninhabitable_state (omnibus projection)
-        let d = kernel.decide(Operation::RunBash, "curl evil.com");
+        let (d, _token) = kernel.decide(Operation::RunBash, "curl evil.com");
         assert!(matches!(d.verdict, Verdict::RequiresApproval));
     }
 
@@ -1879,6 +1982,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_budget_exhaustion_denies_next_operation() {
         use portcullis::BudgetLattice;
         // Create a lattice with a tiny budget ($0.05)
@@ -1890,23 +1994,23 @@ mod tests {
         let mut kernel = Kernel::new(lattice);
 
         // First read is allowed ($0.01 cost)
-        let d = kernel.decide(Operation::ReadFiles, "a.txt");
+        let (d, _token) = kernel.decide(Operation::ReadFiles, "a.txt");
         assert!(matches!(d.verdict, Verdict::Allow));
         kernel.charge(operation_cost(Operation::ReadFiles)).unwrap();
 
         // Second read is allowed ($0.02 total)
-        let d = kernel.decide(Operation::ReadFiles, "b.txt");
+        let (d, _token) = kernel.decide(Operation::ReadFiles, "b.txt");
         assert!(matches!(d.verdict, Verdict::Allow));
         kernel.charge(operation_cost(Operation::ReadFiles)).unwrap();
 
         // Third read still allowed ($0.03 total)
-        let d = kernel.decide(Operation::ReadFiles, "c.txt");
+        let (d, _token) = kernel.decide(Operation::ReadFiles, "c.txt");
         assert!(matches!(d.verdict, Verdict::Allow));
         kernel.charge(operation_cost(Operation::ReadFiles)).unwrap();
 
         // RunBash costs $0.05, which would bring total to $0.08 > $0.05 budget
         // But decide() checks consumed_usd ($0.03) < max ($0.05), so it allows
-        let d = kernel.decide(Operation::RunBash, "cargo test");
+        let (d, _token) = kernel.decide(Operation::RunBash, "cargo test");
         assert!(matches!(d.verdict, Verdict::Allow));
         // Charge fails because $0.03 + $0.05 = $0.08 > $0.05
         assert!(kernel.charge(operation_cost(Operation::RunBash)).is_err());
@@ -1917,7 +2021,7 @@ mod tests {
         kernel.charge(operation_cost(Operation::ReadFiles)).unwrap(); // $0.05
 
         // Now decide() should deny (consumed $0.05 >= max $0.05)
-        let d = kernel.decide(Operation::ReadFiles, "d.txt");
+        let (d, _token) = kernel.decide(Operation::ReadFiles, "d.txt");
         assert!(
             matches!(d.verdict, Verdict::Deny(DenyReason::BudgetExhausted { .. })),
             "expected BudgetExhausted, got {:?}",
@@ -1962,25 +2066,27 @@ mod tests {
     // ── Trace writer tests ──────────────────────────────────────────────
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_trace_writer_none_is_noop() {
         let trace = TraceWriter::open(None).unwrap();
         assert!(trace.file.is_none());
         // record/finish should not panic when no file is configured
         let mut kernel = Kernel::new(permissive_no_static_obligations());
-        let decision = kernel.decide(Operation::ReadFiles, "/tmp/test");
+        let (decision, _token) = kernel.decide(Operation::ReadFiles, "/tmp/test");
         trace.record(&decision);
         trace.finish(&kernel);
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_trace_writer_records_decisions_as_jsonl() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trace.jsonl");
         let trace = TraceWriter::open(Some(&path)).unwrap();
 
         let mut kernel = Kernel::new(permissive_no_static_obligations());
-        let d1 = kernel.decide(Operation::ReadFiles, "/tmp/a");
-        let d2 = kernel.decide(Operation::WriteFiles, "/tmp/b");
+        let (d1, _token) = kernel.decide(Operation::ReadFiles, "/tmp/a");
+        let (d2, _token) = kernel.decide(Operation::WriteFiles, "/tmp/b");
         trace.record(&d1);
         trace.record(&d2);
 
@@ -2001,13 +2107,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_trace_writer_finish_writes_summary() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trace.jsonl");
         let trace = TraceWriter::open(Some(&path)).unwrap();
 
         let mut kernel = Kernel::new(permissive_no_static_obligations());
-        let d = kernel.decide(Operation::ReadFiles, "/tmp/test");
+        let (d, _token) = kernel.decide(Operation::ReadFiles, "/tmp/test");
         trace.record(&d);
         kernel.charge(Decimal::new(5, 2)).unwrap(); // $0.05
         trace.finish(&kernel);
@@ -2023,6 +2130,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_trace_writer_denied_operations_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trace.jsonl");
@@ -2030,7 +2138,7 @@ mod tests {
 
         // Use restrictive lattice where write is denied
         let mut kernel = Kernel::new(PermissionLattice::restrictive());
-        let d = kernel.decide(Operation::WriteFiles, "/tmp/test");
+        let (d, _token) = kernel.decide(Operation::WriteFiles, "/tmp/test");
         trace.record(&d);
 
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -2039,6 +2147,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_trace_writer_appends_to_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trace.jsonl");
@@ -2047,7 +2156,7 @@ mod tests {
         {
             let trace = TraceWriter::open(Some(&path)).unwrap();
             let mut kernel = Kernel::new(permissive_no_static_obligations());
-            let d = kernel.decide(Operation::ReadFiles, "/tmp/first");
+            let (d, _token) = kernel.decide(Operation::ReadFiles, "/tmp/first");
             trace.record(&d);
             trace.finish(&kernel);
         }
@@ -2056,7 +2165,7 @@ mod tests {
         {
             let trace = TraceWriter::open(Some(&path)).unwrap();
             let mut kernel = Kernel::new(permissive_no_static_obligations());
-            let d = kernel.decide(Operation::ReadFiles, "/tmp/second");
+            let (d, _token) = kernel.decide(Operation::ReadFiles, "/tmp/second");
             trace.record(&d);
             trace.finish(&kernel);
         }

@@ -13,14 +13,14 @@
 
 use nucleus_identity::{
     CaClient, Identity, LaunchAttestation, SecretManager, SelfSignedCa, VmRegistry,
-    WorkloadApiClient, WorkloadApiServer,
+    WorkloadApiClient,
 };
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Identity manager for the node daemon.
@@ -30,9 +30,11 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct IdentityManager {
     /// The secret manager for certificate operations.
-    secret_manager: Arc<SecretManager<SelfSignedCa>>,
-    /// The CA client (needed for trust bundle access).
-    ca: Arc<SelfSignedCa>,
+    secret_manager: Arc<SecretManager<Arc<dyn CaClient>>>,
+    /// The CA client (needed for trust bundle access). Held as `dyn` so the node is
+    /// not monomorphized to one CA type — a future hardware-rooted or SPIRE-issued
+    /// root can be injected via [`IdentityManager::with_ca`].
+    ca: Arc<dyn CaClient>,
     /// Registry mapping pod IDs to their SPIFFE identities.
     vm_registry: Arc<VmRegistry>,
     /// Trust domain for this node.
@@ -49,21 +51,38 @@ impl IdentityManager {
     /// For production, this should be replaced with a SPIRE CA client.
     pub fn new(trust_domain: impl Into<String>, cert_ttl: Duration) -> Result<Self, String> {
         let trust_domain = trust_domain.into();
-        let ca = Arc::new(
+        let ca: Arc<dyn CaClient> = Arc::new(
             SelfSignedCa::new(&trust_domain)
                 .map_err(|e| format!("failed to create self-signed CA: {e}"))?,
         );
-        let secret_manager = SecretManager::new(ca.clone(), cert_ttl);
+        Ok(Self::with_ca(trust_domain, cert_ttl, ca))
+    }
+
+    /// Creates an identity manager backed by an arbitrary attestation root.
+    ///
+    /// [`Self::new`] uses a self-signed CA; this constructor lets a host inject any
+    /// [`CaClient`] — a future hardware-rooted backend (TPM DevID, cloud KMS), a
+    /// SPIRE-issued root, etc. — without the node being monomorphized to one CA type.
+    /// The injected CA must override `sign_attested_csr` for attested SVIDs to carry
+    /// a measurement; a CA that only signs plainly yields plain SVIDs (which an
+    /// attesting relying party then refuses, fail-closed).
+    pub fn with_ca(
+        trust_domain: impl Into<String>,
+        cert_ttl: Duration,
+        ca: Arc<dyn CaClient>,
+    ) -> Self {
+        let trust_domain = trust_domain.into();
+        let secret_manager = SecretManager::new(Arc::new(ca.clone()), cert_ttl);
         let vm_registry = Arc::new(RwLock::new(HashMap::new()));
 
-        Ok(Self {
+        Self {
             secret_manager,
             ca,
             vm_registry,
             trust_domain,
             attestation_registry: Arc::new(RwLock::new(HashMap::new())),
             cert_ttl,
-        })
+        }
     }
 
     /// Returns the trust domain.
@@ -102,35 +121,53 @@ impl IdentityManager {
     }
 
     /// Unregisters a pod from the VM registry.
-    #[allow(dead_code)]
-    pub async fn unregister_pod(&self, connection_id: &str) {
-        let mut registry = self.vm_registry.write().await;
-        registry.remove(connection_id);
-    }
-
-    /// Starts the Workload API server on a Unix socket.
     ///
-    /// This should be called once at startup and the server runs in the background.
+    /// Returns whether an entry was actually removed. `HashMap::remove` reports
+    /// this and the result used to be discarded, which is precisely how the
+    /// registry came to never drain: teardown removed by the pod's SPIFFE URI
+    /// while registration inserted under the pod's UUID, the two never matched,
+    /// and the no-op was invisible at every call site.
+    ///
+    /// `#[must_use]` so a caller cannot reintroduce that silence without saying
+    /// so in the code. A wrong key is a bug either way; the difference is whether
+    /// anyone finds out.
+    #[must_use = "a false return means NOTHING was removed -- usually a wrong key"]
     #[allow(dead_code)]
-    pub async fn start_workload_api_server(&self, socket_path: &Path) -> Result<(), String> {
-        let server = WorkloadApiServer::new(
-            self.secret_manager.clone(),
-            self.ca.clone(),
-            self.vm_registry.clone(),
-        );
-
-        let socket_path_for_spawn = socket_path.to_path_buf();
-        let socket_path_display = socket_path.display().to_string();
-        tokio::spawn(async move {
-            #[allow(deprecated)]
-            if let Err(e) = server.serve(&socket_path_for_spawn).await {
-                error!("workload API server error: {}", e);
-            }
-        });
-
-        info!("workload API server started on {}", socket_path_display);
-        Ok(())
+    pub async fn unregister_pod(&self, connection_id: &str) -> bool {
+        let mut registry = self.vm_registry.write().await;
+        registry.remove(connection_id).is_some()
     }
+
+    /// Release everything this pod held in the identity subsystem.
+    ///
+    /// Takes the key registration actually USED rather than re-deriving one, and
+    /// keeps the "did anything get removed?" check beside the registry it
+    /// concerns. Both call sites of that check now live in this module, so a
+    /// future key change has one place to be wrong instead of two.
+    pub async fn release_pod(&self, registry_key: Option<&str>, identity: &Identity) {
+        if let Some(key) = registry_key {
+            if !self.unregister_pod(key).await {
+                // Reachable only if the key drifted again. Worth a warning
+                // rather than a silent no-op: a registry that does not drain is
+                // what makes the Workload API's "exactly one identity is
+                // registered" precondition permanently false.
+                tracing::warn!(
+                    registry_key = %key,
+                    "pod teardown removed no identity registry entry -- the \
+                     registration and removal keys have drifted apart"
+                );
+            }
+        }
+        self.forget_certificate(identity).await;
+    }
+
+    // `start_workload_api_server` was removed here, not merely left uncalled.
+    //
+    // It was the only thing that invoked `WorkloadApiServer::serve`, the
+    // deprecated registry-lookup path that handed an arbitrary pod's SVID to any
+    // local connector (#2197). Deleting it means the node cannot open that socket
+    // by anyone re-adding a call site, which a commented-out invocation or an
+    // unused function would still allow.
 
     /// Starts the certificate refresh loop in the background.
     #[allow(dead_code)]
@@ -197,6 +234,7 @@ impl IdentityManager {
     ///
     /// The computed attestation, or an error if hashing fails.
     #[allow(dead_code)]
+    #[tracing::instrument(skip_all, fields(boot.stage = "attestation.hash"))]
     pub async fn compute_attestation(
         &self,
         pod_id: &str,
@@ -246,9 +284,11 @@ impl IdentityManager {
 
     /// Fetches an attested certificate for the given identity and pod.
     ///
-    /// If attestation exists for the pod, it will be embedded in the certificate
-    /// as an X.509 extension.
-    #[allow(dead_code)]
+    /// If attestation exists for the pod, it will be embedded in the certificate as
+    /// an X.509 extension, and the result is written into the shared certificate
+    /// cache so the served `FETCH_SVID` path returns the *attested* cert rather than
+    /// a plain one. If no attestation is registered, falls back to a standard cert.
+    #[tracing::instrument(skip_all, fields(boot.stage = "cert.issue"))]
     pub async fn fetch_attested_certificate(
         &self,
         identity: &Identity,
@@ -286,7 +326,13 @@ impl IdentityManager {
                     .await
                     .map_err(|e| format!("attested signing failed: {e}"))?;
 
-                Ok(Arc::new(cert))
+                // Warm the cache so the served FETCH_SVID fast-path returns THIS
+                // attested cert (carrying the measurement), not the plain one.
+                let cert = std::sync::Arc::new(cert);
+                self.secret_manager
+                    .cache_certificate(identity, cert.clone())
+                    .await;
+                Ok(cert)
             }
             None => {
                 warn!(
@@ -321,6 +367,147 @@ mod tests {
     async fn test_identity_manager_creation() {
         let manager = IdentityManager::new("test.local", Duration::from_secs(3600)).unwrap();
         assert_eq!(manager.trust_domain(), "test.local");
+    }
+
+    /// C9 Phase 0: a CA injected via `with_ca` (as `Arc<dyn CaClient>`) flows through
+    /// the `dyn` seam AND still embeds launch attestation — proving the blanket
+    /// `impl CaClient for Arc<dyn CaClient>` forwards `sign_attested_csr` to the
+    /// concrete override rather than the extension-dropping trait default.
+    #[tokio::test]
+    async fn with_ca_injects_a_root_that_still_attests_through_the_dyn_seam() {
+        use nucleus_identity::{verify_attested_svid, AttestationRequirements, SelfSignedCa};
+        use std::io::Write;
+
+        let injected: Arc<dyn CaClient> = Arc::new(SelfSignedCa::new("injected.local").unwrap());
+        let manager =
+            IdentityManager::with_ca("injected.local", Duration::from_secs(3600), injected);
+        assert_eq!(manager.trust_domain(), "injected.local");
+
+        let mut kernel = tempfile::NamedTempFile::new().unwrap();
+        kernel.write_all(b"k").unwrap();
+        let mut rootfs = tempfile::NamedTempFile::new().unwrap();
+        rootfs.write_all(b"r").unwrap();
+
+        let pod = Uuid::new_v4();
+        let id = manager.identity_for_pod(pod, "default", "svc");
+        let att = manager
+            .compute_attestation(&pod.to_string(), kernel.path(), rootfs.path(), b"cfg")
+            .await
+            .expect("attest");
+        manager
+            .fetch_attested_certificate(&id, &pod.to_string())
+            .await
+            .expect("issue attested cert via injected dyn CA");
+
+        // The served cert (from the cache the injected CA wrote through) must carry
+        // the measurement — i.e. the dyn seam did NOT drop the attestation.
+        let chain = manager
+            .fetch_certificate(&id)
+            .await
+            .expect("served")
+            .chain_pem();
+        let req = AttestationRequirements::exact(
+            *att.kernel_hash(),
+            *att.rootfs_hash(),
+            *att.config_hash(),
+        );
+        assert!(
+            verify_attested_svid(&chain, &req, true)
+                .expect("verify ok")
+                .is_some(),
+            "injected dyn CA must still embed the launch attestation"
+        );
+    }
+
+    /// North Star C9 (Inc 1): an attested SVID is served over the real cache path a
+    /// pod's `FETCH_SVID` reads, and a shipped relying-party verifier reds on
+    /// measurement drift and on an absent extension (fail-closed) — while passing
+    /// the correct measurement (non-vacuous). KVM-free: exercises the same
+    /// `fetch_certificate` fast-path the workload API serves, minus the UDS
+    /// transport and a real Firecracker rootfs (named gaps in the ledger).
+    #[tokio::test]
+    async fn attested_svid_is_served_and_verifier_reds_on_drift_and_absent() {
+        use nucleus_identity::{verify_attested_svid, AttestationRequirements};
+        use std::io::Write;
+
+        let manager = IdentityManager::new("test.local", Duration::from_secs(3600)).unwrap();
+
+        // Two temp "images" the node measures, plus a config blob.
+        let mut kernel = tempfile::NamedTempFile::new().unwrap();
+        kernel.write_all(b"kernel-image-bytes").unwrap();
+        let mut rootfs = tempfile::NamedTempFile::new().unwrap();
+        rootfs.write_all(b"rootfs-image-bytes").unwrap();
+        let config = b"pod-config-blob";
+
+        // Attested pod: measure, then issue+cache the attested cert.
+        let attested_pod = Uuid::new_v4();
+        let attested_id = manager.identity_for_pod(attested_pod, "default", "attested");
+        let att = manager
+            .compute_attestation(
+                &attested_pod.to_string(),
+                kernel.path(),
+                rootfs.path(),
+                config,
+            )
+            .await
+            .expect("attestation computes");
+        manager
+            .fetch_attested_certificate(&attested_id, &attested_pod.to_string())
+            .await
+            .expect("attested cert issues");
+
+        // The SERVED path: fetch_certificate is exactly what FETCH_SVID calls. After
+        // caching it must return the ATTESTED cert (carrying the measurement).
+        let chain = manager
+            .fetch_certificate(&attested_id)
+            .await
+            .expect("served cert")
+            .chain_pem();
+
+        let expected = AttestationRequirements::exact(
+            *att.kernel_hash(),
+            *att.rootfs_hash(),
+            *att.config_hash(),
+        );
+
+        // (i) POSITIVE CONTROL — correct expectation verifies (proves it is not
+        //     always-red: teeth (ii)/(iii) below then mean something).
+        assert!(
+            verify_attested_svid(&chain, &expected, true)
+                .expect("correct measurement verifies")
+                .is_some(),
+            "served SVID must carry the launch attestation"
+        );
+
+        // (ii) TEETH — one byte of drift in the expected artifact reds the verifier.
+        let mut wrong_kernel = *att.kernel_hash();
+        wrong_kernel[0] ^= 0x01;
+        let drifted =
+            AttestationRequirements::exact(wrong_kernel, *att.rootfs_hash(), *att.config_hash());
+        assert!(
+            verify_attested_svid(&chain, &drifted, true).is_err(),
+            "one byte of measurement drift must red the verifier"
+        );
+
+        // (iii) TEETH — a plain (unattested) pod's SVID fails closed when required,
+        //       and yields no attestation (not a spurious one) when not required.
+        let plain_pod = Uuid::new_v4();
+        let plain_id = manager.identity_for_pod(plain_pod, "default", "plain");
+        let plain_chain = manager
+            .fetch_certificate(&plain_id)
+            .await
+            .expect("plain cert")
+            .chain_pem();
+        assert!(
+            verify_attested_svid(&plain_chain, &AttestationRequirements::any(), true).is_err(),
+            "absent extension + require_attestation must fail closed"
+        );
+        assert!(
+            verify_attested_svid(&plain_chain, &AttestationRequirements::any(), false)
+                .expect("absent-not-required is ok")
+                .is_none(),
+            "absent extension without requirement yields no attestation"
+        );
     }
 
     #[tokio::test]
@@ -360,7 +547,10 @@ mod tests {
         drop(registry);
 
         // Unregister
-        manager.unregister_pod(&pod_id.to_string()).await;
+        assert!(
+            manager.unregister_pod(&pod_id.to_string()).await,
+            "the pod was registered under this key, so removal must report a hit"
+        );
         let registry = manager.vm_registry.read().await;
         assert!(!registry.contains_key(&pod_id.to_string()));
     }
@@ -480,5 +670,95 @@ mod tests {
             .unwrap();
 
         assert_eq!(cert.identity(), &identity);
+    }
+}
+
+#[cfg(test)]
+mod registry_key_tests {
+    use super::*;
+
+    fn manager() -> IdentityManager {
+        IdentityManager::new("example.org", std::time::Duration::from_secs(3600))
+            .expect("identity manager should construct")
+    }
+
+    /// The regression. A pod registered under its UUID is NOT removed by its
+    /// SPIFFE URI: the two key spaces are disjoint, so the mismatched teardown
+    /// silently removed nothing and the registry grew without bound.
+    ///
+    /// This matters beyond the leak. The Workload API's registry-lookup path
+    /// serves `registry.values().next()` -- an arbitrary entry -- and warns that
+    /// this is only safe while exactly one identity is registered. A registry
+    /// that never drains guarantees that precondition is false forever after the
+    /// second pod.
+    #[tokio::test]
+    async fn a_spiffe_uri_does_not_remove_a_uuid_keyed_entry() {
+        let m = manager();
+        let pod_id = uuid::Uuid::new_v4();
+        let identity = m.identity_for_pod(pod_id, "default", "agent");
+
+        m.register_pod(pod_id.to_string(), identity.clone()).await;
+
+        // The old teardown key.
+        assert!(
+            !m.unregister_pod(&identity.to_spiffe_uri()).await,
+            "a SPIFFE URI must not match a UUID-keyed entry -- if this ever \
+             passes, the two key spaces have merged and this test is no longer \
+             pinning anything"
+        );
+        assert_eq!(
+            m.vm_registry.read().await.len(),
+            1,
+            "the entry must still be there: that is the defect being pinned"
+        );
+
+        // The key registration actually used.
+        assert!(
+            m.unregister_pod(&pod_id.to_string()).await,
+            "removing by the registered key must actually remove"
+        );
+        assert!(
+            m.vm_registry.read().await.is_empty(),
+            "the registry must drain"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retired_surface_tests {
+    /// **The retirement is structural, and this keeps it that way.**
+    ///
+    /// `WorkloadApiServer::serve` returns an arbitrary registry entry — including
+    /// the private key — to any local connector (#2197). The node no longer calls
+    /// it, and this reads the source to make sure a future change does not
+    /// quietly restore the call. A comment saying "do not call this" is not a
+    /// gate; a test that fails when someone does is.
+    ///
+    /// Deliberately a source check rather than a behavioural one: the defect is
+    /// the *existence* of a call site, and there is no runtime observation that
+    /// distinguishes "never opened the socket" from "opened it and nobody
+    /// connected".
+    #[test]
+    fn the_node_does_not_start_the_unix_workload_api_server() {
+        // Match CODE forms -- a definition or a call -- not any mention. The
+        // first draft of this test matched the bare name and went red on the
+        // comment above explaining the removal, which is a gate failing for the
+        // wrong reason: prose about a retired function is exactly what should
+        // survive, and only a live call site is the defect.
+        let src = include_str!("identity.rs");
+        let body = src.split("mod retired_surface_tests").next().unwrap();
+        assert!(
+            !body.contains("fn start_workload_api_server")
+                && !body.contains(".start_workload_api_server("),
+            "identity.rs defines or calls start_workload_api_server again -- that \
+             function was the only route to WorkloadApiServer::serve, the \
+             deprecated registry-lookup path that hands an arbitrary pod's SVID \
+             to any local connector (#2197)"
+        );
+        let main_src = include_str!("main.rs");
+        assert!(
+            !main_src.contains(".start_workload_api_server("),
+            "main.rs calls start_workload_api_server again -- see #2197"
+        );
     }
 }

@@ -50,6 +50,9 @@ GUEST_INIT_BIN="${GUEST_INIT_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-guest
 INIT_SRC="${INIT_SRC:-$SCRIPT_DIR/guest-init.sh}"
 PROXY_BIN="${PROXY_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-tool-proxy}"
 NET_PROBE_BIN="${NET_PROBE_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-net-probe}"
+WORKLOAD_PROBE_BIN="${WORKLOAD_PROBE_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-workload-probe}"
+EGRESS_PROBE_BIN="${EGRESS_PROBE_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-egress-probe}"
+PODLIST_PROBE_BIN="${PODLIST_PROBE_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-podlist-probe}"
 NET_ALLOW="${NET_ALLOW:-}"
 NET_DENY="${NET_DENY:-}"
 # NOTE: Secrets are now injected at runtime via kernel command line (nucleus.auth_secret, nucleus.approval_secret)
@@ -75,6 +78,13 @@ Options:
     --net-deny PATH         Network deny list file
     --audit-path PATH       Audit log path inside VM
     --size MB               Rootfs image size in MB (default: 256)
+
+Environment:
+  OVERLAY_DIR             Directory copied over the rootfs after the nucleus
+                          binaries, for a workload runtime or agent CLI. Opaque
+                          to nucleus. Paths that would shadow the mediating
+                          runtime (/init, nucleus-tool-proxy, nucleus-net-probe,
+                          guest-net.sh) are restored and the attempt reported.
     --verify                Verify required binaries exist without building
     -h, --help              Show this help message
 
@@ -141,6 +151,9 @@ while [[ $# -gt 0 ]]; do
             GUEST_INIT_BIN="${GUEST_INIT_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-guest-init}"
             PROXY_BIN="${PROXY_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-tool-proxy}"
             NET_PROBE_BIN="${NET_PROBE_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-net-probe}"
+WORKLOAD_PROBE_BIN="${WORKLOAD_PROBE_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-workload-probe}"
+EGRESS_PROBE_BIN="${EGRESS_PROBE_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-egress-probe}"
+PODLIST_PROBE_BIN="${PODLIST_PROBE_BIN:-$ROOT_DIR/target/$TARGET/release/nucleus-podlist-probe}"
             shift 2
             ;;
         --output)
@@ -188,7 +201,7 @@ done
 if [ "$VERIFY_ONLY" = true ]; then
     echo "Verifying binaries for $ARCH ($TARGET)..."
     missing=0
-    for bin in "$PROXY_BIN" "$NET_PROBE_BIN"; do
+    for bin in "$PROXY_BIN" "$NET_PROBE_BIN" "$WORKLOAD_PROBE_BIN" "$EGRESS_PROBE_BIN"; do
         if [ ! -f "$bin" ]; then
             echo "  MISSING: $bin"
             missing=1
@@ -218,6 +231,15 @@ fi
 
 if [ ! -f "$NET_PROBE_BIN" ]; then
     echo "Missing $NET_PROBE_BIN" >&2
+    exit 1
+fi
+if [ ! -f "$WORKLOAD_PROBE_BIN" ]; then
+    echo "Missing $WORKLOAD_PROBE_BIN" >&2
+    echo "Build with: scripts/cross-build.sh --arch $ARCH" >&2
+    exit 1
+fi
+if [ ! -f "$EGRESS_PROBE_BIN" ]; then
+    echo "Missing $EGRESS_PROBE_BIN" >&2
     echo "Build with: scripts/cross-build.sh --arch $ARCH" >&2
     exit 1
 fi
@@ -296,6 +318,26 @@ mkdir -p "$ROOTFS_DIR/etc/nucleus" "$ROOTFS_DIR/usr/local/bin" "$ROOTFS_DIR/work
 # Copy pod spec
 cp "$POD_SPEC" "$ROOTFS_DIR/etc/nucleus/pod.yaml"
 
+# CA certificates. The tool-proxy builds an HTTPS client at startup when drand is
+# enabled (the default), and a Debian slim base ships NO system CA store — so
+# without this the proxy cannot construct that client. It is PID 1 in the guest,
+# so the failure took down the whole microVM.
+#
+# Found by booting a pod built from this script on real KVM, not by review: every
+# unit test passes on a host that happens to have a CA store.
+#
+# Copied from the build host rather than apt-installed, so the rootfs build stays
+# offline and needs no package manager inside the target tree.
+if [ -d /etc/ssl/certs ] && [ -s /etc/ssl/certs/ca-certificates.crt ]; then
+    mkdir -p "$ROOTFS_DIR/etc/ssl/certs"
+    cp /etc/ssl/certs/ca-certificates.crt "$ROOTFS_DIR/etc/ssl/certs/ca-certificates.crt"
+    echo "Installed CA bundle from build host"
+else
+    echo "WARNING: no CA bundle at /etc/ssl/certs/ca-certificates.crt on the build host." >&2
+    echo "         The guest tool-proxy will refuse to start with drand enabled." >&2
+    echo "         Install ca-certificates on the build host, or build with drand off." >&2
+fi
+
 # Copy network policy files if provided
 if [ -n "$NET_ALLOW" ] && [ -f "$NET_ALLOW" ]; then
     cp "$NET_ALLOW" "$ROOTFS_DIR/etc/nucleus/net.allow"
@@ -322,6 +364,11 @@ fi
 # Copy binaries
 cp "$PROXY_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-tool-proxy"
 cp "$NET_PROBE_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-net-probe"
+cp "$WORKLOAD_PROBE_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-workload-probe"
+cp "$EGRESS_PROBE_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-egress-probe"
+# Only the C2 podlist boot lane builds this probe; the default probe-pod boot
+# does not, so bake it only when it was built (an absent binary is not an error).
+[ -f "$PODLIST_PROBE_BIN" ] && cp "$PODLIST_PROBE_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-podlist-probe"
 
 # Copy init binary (prefer Rust binary, fall back to shell script)
 if [ -f "$GUEST_INIT_BIN" ]; then
@@ -335,10 +382,62 @@ fi
 # Copy network setup script
 cp "$SCRIPT_DIR/guest-net.sh" "$ROOTFS_DIR/usr/local/bin/guest-net.sh"
 
+# Overlay: an operator-supplied directory copied over the rootfs.
+#
+# This is how a workload gets into the image — a language runtime, an agent CLI,
+# whatever the pod is meant to run. Nucleus deliberately does not know what that
+# is: the overlay is opaque, and nothing vendor-specific belongs in this script
+# or anywhere else in the repo.
+#
+# Copied AFTER the nucleus binaries on purpose. An overlay that shadowed
+# `nucleus-tool-proxy` or `/init` would replace the mediating runtime with
+# whatever the operator shipped, so those paths are restored below and the
+# attempt is reported rather than silently honoured.
+if [ -n "${OVERLAY_DIR:-}" ]; then
+    if [ ! -d "$OVERLAY_DIR" ]; then
+        echo "ERROR: OVERLAY_DIR=$OVERLAY_DIR is not a directory" >&2
+        exit 1
+    fi
+    echo "Applying overlay from $OVERLAY_DIR"
+    cp -a "$OVERLAY_DIR/." "$ROOTFS_DIR/"
+
+    # Restore anything the overlay shadowed. Checked by re-copying rather than
+    # by scanning the overlay for names: a scan has to enumerate every path that
+    # matters and will miss the one added next year.
+    for guarded in \
+        "usr/local/bin/nucleus-tool-proxy" \
+        "usr/local/bin/nucleus-net-probe" \
+        "usr/local/bin/nucleus-workload-probe" \
+        "usr/local/bin/nucleus-egress-probe" \
+        "usr/local/bin/guest-net.sh"; do
+        if [ -e "$OVERLAY_DIR/$guarded" ]; then
+            echo "WARNING: overlay shadowed $guarded; restoring the nucleus binary" >&2
+        fi
+    done
+    cp "$PROXY_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-tool-proxy"
+    cp "$NET_PROBE_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-net-probe"
+    cp "$WORKLOAD_PROBE_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-workload-probe"
+    cp "$EGRESS_PROBE_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-egress-probe"
+    # Conditional for the same reason as the primary copy above (podlist probe is
+    # built only by the C2 boot lane).
+    [ -f "$PODLIST_PROBE_BIN" ] && cp "$PODLIST_PROBE_BIN" "$ROOTFS_DIR/usr/local/bin/nucleus-podlist-probe"
+    cp "$SCRIPT_DIR/guest-net.sh" "$ROOTFS_DIR/usr/local/bin/guest-net.sh"
+    if [ -e "$OVERLAY_DIR/init" ]; then
+        echo "WARNING: overlay shadowed /init; restoring the nucleus init" >&2
+    fi
+    if [ -f "$GUEST_INIT_BIN" ]; then
+        cp "$GUEST_INIT_BIN" "$ROOTFS_DIR/init"
+    else
+        cp "$INIT_SRC" "$ROOTFS_DIR/init"
+    fi
+fi
+
 # Set executable permissions
 chmod +x "$ROOTFS_DIR/init"
 chmod +x "$ROOTFS_DIR/usr/local/bin/nucleus-tool-proxy"
 chmod +x "$ROOTFS_DIR/usr/local/bin/nucleus-net-probe"
+chmod +x "$ROOTFS_DIR/usr/local/bin/nucleus-workload-probe"
+chmod +x "$ROOTFS_DIR/usr/local/bin/nucleus-egress-probe"
 chmod +x "$ROOTFS_DIR/usr/local/bin/guest-net.sh"
 
 # Build ext4 image from directory
@@ -354,7 +453,7 @@ echo "Architecture: $ARCH"
 # Print binary info
 echo ""
 echo "Included binaries:"
-for bin in init usr/local/bin/nucleus-tool-proxy usr/local/bin/nucleus-net-probe; do
+for bin in init usr/local/bin/nucleus-tool-proxy usr/local/bin/nucleus-net-probe usr/local/bin/nucleus-workload-probe usr/local/bin/nucleus-egress-probe; do
     if [ -f "$ROOTFS_DIR/$bin" ]; then
         size=$(du -h "$ROOTFS_DIR/$bin" | cut -f1)
         echo "  /$bin ($size)"

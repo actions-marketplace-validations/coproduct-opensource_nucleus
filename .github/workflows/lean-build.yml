@@ -1,0 +1,47 @@
+name: Lean 4 Kernel Proof
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "crates/portcullis-core/lean/**"
+      - ".github/workflows/lean-build.yml"
+  pull_request:
+    paths:
+      - "crates/portcullis-core/lean/**"
+      - ".github/workflows/lean-build.yml"
+  merge_group:
+    paths:
+      - "crates/portcullis-core/lean/**"
+      - ".github/workflows/lean-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lean-build-core:
+    name: lake build PortcullisCoreBridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Sets up elan, layers the canonical Lake/Mathlib cache, hydrates
+      # prebuilt Mathlib oleans, and runs `lake build PortcullisCoreBridge`.
+      # Replaces ~30 lines of hand-rolled boilerplate; same semantics.
+      - uses: coproduct-opensource/lean-mathlib-cache@9f69375ab6b89d215afa6938964e0200f15cd9ed # v1.0.1
+        with:
+          lean-project-dir: crates/portcullis-core/lean
+          build-target: PortcullisCoreBridge
+          cache-key-prefix: lean-core
+
+      - name: Reject sorry (proof holes)
+        working-directory: crates/portcullis-core/lean
+        run: |
+          if grep -rn 'sorry' PortcullisCoreBridge.lean DerivationProofs.lean generated/PortcullisCore/ --include='*.lean'; then
+            echo "ERROR: Lean proofs contain 'sorry' — proof has holes."
+            exit 1
+          fi
+          echo "No sorry found — all proofs are complete."

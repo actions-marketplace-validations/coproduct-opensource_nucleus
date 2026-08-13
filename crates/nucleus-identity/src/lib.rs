@@ -25,9 +25,11 @@
 //! - [`approval_bundle`] - Signed preflight approval bundles (JWS ES256)
 
 pub mod approval_bundle;
+pub mod assurance;
 pub mod attestation;
 pub mod ca;
 pub mod certificate;
+pub mod cross_agent;
 pub mod csr;
 pub mod did;
 pub mod did_binding;
@@ -36,10 +38,13 @@ pub mod did_crypto;
 pub mod did_resolver;
 pub mod dpop;
 pub mod identity;
+pub mod ifc_extension;
 pub mod manager;
 pub mod oid;
 pub mod session;
 pub mod tls;
+#[cfg(feature = "tpm-devid")]
+pub mod tpm_devid;
 pub mod verifier;
 pub mod wallet;
 pub mod webfinger;
@@ -48,11 +53,18 @@ pub mod workload_api;
 pub use approval_bundle::{
     ApprovalBundleBuilder, ApprovalBundleClaims, ApprovalBundleHeader, ApprovalBundleVerifier,
 };
-pub use attestation::{AttestationRequirements, LaunchAttestation};
+pub use assurance::{
+    AssuranceLevel, AttestedSubject, Claim, SelfMeasuredBackend, SvidAttestationBackend,
+    VerifiedAttestation,
+};
+pub use attestation::{
+    extract_launch_attestation, verify_attested_svid, AttestationRequirements, LaunchAttestation,
+};
 #[cfg(feature = "spire")]
 pub use ca::{auto_detect_ca, SpireCaClient, DEFAULT_SPIRE_SOCKET, SPIFFE_ENDPOINT_ENV};
 pub use ca::{CaClient, SelfSignedCa};
 pub use certificate::{TrustBundle, WorkloadCertificate};
+pub use cross_agent::{join_cross_agent, CrossAgentExchange, CrossAgentReceipt};
 pub use csr::{CertSign, CsrOptions};
 pub use did::{did_web_to_url, DidDocument, JsonWebKey, ServiceEndpoint, VerificationMethod};
 pub use did_binding::{BindingProof, BindingVerification, SpiffeDidBinding};
@@ -68,6 +80,10 @@ pub use did_resolver::HttpDidResolver;
 pub use did_resolver::{CachingDidResolver, DidResolver, InMemoryDidResolver};
 pub use dpop::{DpopClaims, DpopHeader, DpopProofBuilder, DpopVerifier};
 pub use identity::Identity;
+pub use ifc_extension::{
+    decode_ifc_extension, default_peer_label, encode_ifc_extension, extract_peer_ifc,
+    ExtensionError, NUCLEUS_IFC_OID, OID_NUCLEUS_IFC_BYTES, OID_NUCLEUS_IFC_TUPLE,
+};
 pub use manager::SecretManager;
 pub use session::{SessionId, SessionIdentity};
 pub use tls::{TlsClientConfig, TlsServerConfig};

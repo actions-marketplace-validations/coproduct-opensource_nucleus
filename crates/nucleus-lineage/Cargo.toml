@@ -1,0 +1,93 @@
+[package]
+name = "nucleus-lineage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Per-call SPIFFE-derived data lineage for nucleus tool calls"
+repository = "https://github.com/coproduct-opensource/nucleus"
+keywords = ["spiffe", "lineage", "provenance", "ifc", "agents"]
+categories = ["development-tools", "cryptography"]
+
+[features]
+default = ["sink-io"]
+# **wasm-compatibility gate**: `sink-io` ships the file-backed `JsonlSink`
+# which depends on `std::fs::{File, OpenOptions}` (unavailable on
+# `wasm32-unknown-unknown`). Default-on so native consumers see no change;
+# disable via `default-features = false` for wasm targets. The `InMemorySink`
+# + `LineageSink` trait + `SinkError` (minus the `Io` variant) remain
+# available unconditionally.
+sink-io = []
+# Demo-only in-process Ed25519 JWT-SVID issuer + edge signer. NOT FOR
+# PRODUCTION USE. Production callers should write a SPIFFE-Workload-API-
+# backed `IdentityFetcher` impl and never enable this feature in release
+# builds. Verification (always-on) does NOT need this feature.
+#
+# Named `insecure-local-issuer` so the footgun is visible at every consumer's
+# `[dependencies]` line (the old ergonomic name `dev` invited "just for tests"
+# enablement that could ship). `dev` is kept as a transitional alias for one
+# release — see CHANGELOG; remove after downstreams migrate.
+insecure-local-issuer = ["dep:jsonwebtoken", "dep:rand", "ed25519-dalek/rand_core"]
+# DEPRECATED alias for `insecure-local-issuer`. Remove next release.
+dev = ["insecure-local-issuer"]
+# HTTP-backed WitnessClient (nucleus-native cosign protocol + C2SP
+# tlog-witness adapter for federation with the external ecosystem).
+# Off by default to keep the lib's dep tree lean.
+http = ["dep:reqwest"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+tracing = { workspace = true }
+# base64 is used by the always-on `proof` module to wire-encode signature
+# bytes; not gated. Version inherited from the workspace pin.
+base64 = { workspace = true }
+# ed25519-dalek is default-on for VERIFICATION (the walker validates `Proof`
+# signatures) and for the production `Pkcs8FileSigner` (decode-only: `pkcs8` +
+# `alloc` + `pem`, no CSPRNG). The `insecure-local-issuer` feature additionally
+# enables `rand_core` for the in-process key-GENERATING LocalIssuer. Version
+# (`=3.0.0`) inherited from the workspace pin; only features are local.
+ed25519-dalek = { workspace = true, features = ["pkcs8", "alloc", "pem"] }
+# RFC 6962 / RFC 9162-style Merkle tree for the `MerkleSink` checkpointing
+# layer (transparency-log style append-only integrity). serde feature lets
+# us snapshot the tree if a sink ever needs to persist its state.
+ct-merkle = { version = "0.3", features = ["serde"] }
+# JWT signing/encoding crate — only needed by the dev LocalIssuer. Version +
+# feature set (default-features off, use_pem + aws_lc_rs) inherited from the
+# workspace so the whole tree converges on one jsonwebtoken build.
+jsonwebtoken = { workspace = true, optional = true }
+rand = { version = "0.10", optional = true }
+# Blocking HTTP client for the optional HttpWitnessClient + C2SP
+# witness adapter. Default-off; only pulled in via `http` feature. Version +
+# `default-features = false` inherited from the workspace; only the local
+# feature set (blocking/json/rustls) is declared here.
+reqwest = { workspace = true, features = ["blocking", "json", "rustls"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+ureq = { workspace = true, features = ["json"] }
+# HTTP mocking for HttpWitnessClient integration tests. `wiremock`'s
+# async runtime requires tokio; we already use it elsewhere.
+wiremock = "0.6"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "three_step_demo"
+required-features = ["insecure-local-issuer"]
+
+[lints]
+workspace = true
+
+# wasm32 needs an explicit randomness source for Uuid::new_v4 (the
+# v4 feature alone does not compile on wasm32-unknown-unknown). The
+# `js` feature routes through wasm-bindgen/getrandom for wasm builds
+# ONLY — native builds are unchanged. This keeps the downstream
+# wasm-pure-crates gate green now that nucleus-externality (and via it
+# nucleus-econ-kernels) consume this crate.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, features = ["js"] }

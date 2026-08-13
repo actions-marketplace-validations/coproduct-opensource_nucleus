@@ -542,7 +542,11 @@ impl RuntimeStateGuard {
         let hash = {
             let mut hasher = Sha256::new();
             hasher.update(tool_schemas.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         };
         Self {
             perms,
@@ -571,7 +575,20 @@ impl ToolCallGuard for RuntimeStateGuard {
         // Delegates to exposure_core::should_deny — the pure decision function
         // whose logic is structurally bisimilar to the Verus exec fn
         // `exec_guard_check`.
-        let current = self.exposure.read().expect("exposure lock poisoned");
+        // DECISION LOCK — fail CLOSED on poison. A poisoned exposure lock means
+        // the taint/exposure state is unprovable; recovering the torn guard via
+        // into_inner() could UNDER-COUNT taint (exposure is monotone-union) and
+        // ALLOW an action that must DENY — a fail-open. So we deny instead.
+        let current = match self.exposure.read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(GuardError::Denied {
+                    reason: "exposure lock poisoned: session taint/exposure state is \
+                             unprovable; failing closed to prevent untracked exposure"
+                        .to_string(),
+                });
+            }
+        };
         if crate::exposure_core::should_deny(
             &current,
             operation,
@@ -608,9 +625,34 @@ impl ToolCallGuard for RuntimeStateGuard {
             Err(e) => return Err(ExecuteError::OperationFailed(e)),
         };
 
-        // Acquire write locks for atomic TOCTOU check + record
-        let mut exposure = self.exposure.write().expect("exposure lock poisoned");
-        let mut ops = self.executed_ops.write().expect("ops lock poisoned");
+        // Acquire write locks for atomic TOCTOU check + record.
+        //
+        // DECISION LOCK — fail CLOSED on poison. The closure already executed, so
+        // the side effect happened, but we cannot prove the resulting exposure is
+        // recorded/consistent. Recovering the torn guard via into_inner() risks
+        // under-counting taint on a subsequent decision, so we surface a
+        // fail-closed denial (TocTouDenied): the operation ran but the caller MUST
+        // treat it as denied.
+        let mut exposure = match self.exposure.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(ExecuteError::TocTouDenied {
+                    reason: "exposure lock poisoned: cannot record/verify exposure; \
+                             failing closed (operation executed but treated as denied)"
+                        .to_string(),
+                });
+            }
+        };
+        let mut ops = match self.executed_ops.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(ExecuteError::TocTouDenied {
+                    reason: "executed_ops lock poisoned: cannot record operation; \
+                             failing closed (operation executed but treated as denied)"
+                        .to_string(),
+                });
+            }
+        };
 
         // TOCTOU detection: check if exposure grew since check()
         if *exposure != proof.exposure_snapshot && self.perms.uninhabitable_constraint {
@@ -639,10 +681,13 @@ impl ToolCallGuard for RuntimeStateGuard {
     }
 
     fn accumulated_risk(&self) -> StateRisk {
-        self.exposure
-            .read()
-            .expect("exposure lock poisoned")
-            .to_risk()
+        // DECISION LOCK — fail CLOSED on poison. This value gates downstream
+        // oversight; a poisoned lock makes true risk unprovable, so report the
+        // MAXIMUM risk rather than into_inner() (which could under-report).
+        match self.exposure.read() {
+            Ok(guard) => guard.to_risk(),
+            Err(_) => StateRisk::Uninhabitable,
+        }
     }
 
     fn verify_schema(&self, current_hash: &str) -> Result<(), GuardError> {
@@ -675,7 +720,7 @@ impl ToolCallGuard for RuntimeStateGuard {
 /// carries as its grade. When the join reaches `{PrivateData, UntrustedContent,
 /// ExfilVector}`, the uninhabitable_state is complete.
 ///
-/// These 3 core labels are FROZEN — they have Verus proofs covering
+/// These 3 core labels are FROZEN — they have Kani + Lean proofs covering
 /// monotonicity, session safety, and irreversibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -928,7 +973,11 @@ impl GradedExposureGuard {
         let hash = {
             let mut hasher = Sha256::new();
             hasher.update(tool_schemas.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         };
         Self {
             perms,
@@ -938,11 +987,17 @@ impl GradedExposureGuard {
     }
 
     /// Get the current exposure set.
+    ///
+    /// DECISION LOCK — fail CLOSED on poison. Rather than recover a torn guard
+    /// (which could under-report exposure), return the maximal exposure set
+    /// (all three legs) so no caller ever under-accounts taint.
     pub fn exposure(&self) -> ExposureSet {
-        self.exposure
-            .read()
-            .expect("exposure lock poisoned")
-            .clone()
+        match self.exposure.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => ExposureSet::singleton(ExposureLabel::PrivateData)
+                .union(&ExposureSet::singleton(ExposureLabel::UntrustedContent))
+                .union(&ExposureSet::singleton(ExposureLabel::ExfilVector)),
+        }
     }
 
     /// Get the underlying permission lattice.
@@ -973,7 +1028,19 @@ impl ToolCallGuard for GradedExposureGuard {
         // Delegates to exposure_core::should_deny — the pure decision function
         // whose logic is structurally bisimilar to the Verus exec fn
         // `exec_guard_check`.
-        let current = self.exposure.read().expect("exposure lock poisoned");
+        // DECISION LOCK — fail CLOSED on poison (see RuntimeStateGuard::check).
+        // into_inner() on a torn exposure guard could under-count taint and turn
+        // a required DENY into an ALLOW; deny instead.
+        let current = match self.exposure.read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(GuardError::Denied {
+                    reason: "exposure lock poisoned: session taint/exposure state is \
+                             unprovable; failing closed to prevent untracked exposure"
+                        .to_string(),
+                });
+            }
+        };
         if crate::exposure_core::should_deny(
             &current,
             operation,
@@ -989,12 +1056,17 @@ impl ToolCallGuard for GradedExposureGuard {
             });
         }
 
-        // Snapshot exposure for TOCTOU detection
-        let exposure_snapshot = self
-            .exposure
-            .read()
-            .expect("exposure lock poisoned")
-            .clone();
+        // Snapshot exposure for TOCTOU detection — same fail-closed rule.
+        let exposure_snapshot = match self.exposure.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                return Err(GuardError::Denied {
+                    reason: "exposure lock poisoned: session taint/exposure state is \
+                             unprovable; failing closed to prevent untracked exposure"
+                        .to_string(),
+                });
+            }
+        };
 
         Ok(CheckProof {
             operation,
@@ -1014,8 +1086,22 @@ impl ToolCallGuard for GradedExposureGuard {
             Err(e) => return Err(ExecuteError::OperationFailed(e)),
         };
 
-        // Acquire write lock for atomic TOCTOU check + record
-        let mut exposure = self.exposure.write().expect("exposure lock poisoned");
+        // Acquire write lock for atomic TOCTOU check + record.
+        //
+        // DECISION LOCK — fail CLOSED on poison (see RuntimeStateGuard::
+        // execute_and_record). The closure already ran, but we cannot prove the
+        // exposure is recorded/consistent; surface a fail-closed TocTouDenied
+        // rather than recover a torn guard and risk under-counting taint.
+        let mut exposure = match self.exposure.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(ExecuteError::TocTouDenied {
+                    reason: "exposure lock poisoned: cannot record/verify exposure; \
+                             failing closed (operation executed but treated as denied)"
+                        .to_string(),
+                });
+            }
+        };
 
         // TOCTOU detection: check if exposure grew since check()
         if *exposure != proof.exposure_snapshot && self.perms.uninhabitable_constraint {
@@ -1055,10 +1141,12 @@ impl ToolCallGuard for GradedExposureGuard {
     }
 
     fn accumulated_risk(&self) -> StateRisk {
-        self.exposure
-            .read()
-            .expect("exposure lock poisoned")
-            .to_risk()
+        // DECISION LOCK — fail CLOSED on poison: report MAXIMUM risk rather than
+        // into_inner() (which could under-report).
+        match self.exposure.read() {
+            Ok(guard) => guard.to_risk(),
+            Err(_) => StateRisk::Uninhabitable,
+        }
     }
 
     fn verify_schema(&self, current_hash: &str) -> Result<(), GuardError> {
@@ -1419,13 +1507,21 @@ mod tests {
         // Same schema: OK
         let mut hasher = Sha256::new();
         hasher.update(r#"[{"name":"read"}]"#.as_bytes());
-        let same_hash = format!("{:x}", hasher.finalize());
+        let same_hash = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         assert!(guard.verify_schema(&same_hash).is_ok());
 
         // Different schema: rug-pull detected
         let mut hasher = Sha256::new();
         hasher.update(r#"[{"name":"read"},{"name":"evil"}]"#.as_bytes());
-        let different_hash = format!("{:x}", hasher.finalize());
+        let different_hash = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         assert!(guard.verify_schema(&different_hash).is_err());
     }
 
@@ -1587,11 +1683,23 @@ mod tests {
             Some(ExposureLabel::ExfilVector)
         );
 
-        // Neutral operations
-        assert_eq!(operation_exposure(Operation::WriteFiles), None);
-        assert_eq!(operation_exposure(Operation::EditFiles), None);
-        assert_eq!(operation_exposure(Operation::GitCommit), None);
-        assert_eq!(operation_exposure(Operation::ManagePods), None);
+        // Local sinks are exfil legs too (most-paranoid #4).
+        assert_eq!(
+            operation_exposure(Operation::WriteFiles),
+            Some(ExposureLabel::ExfilVector)
+        );
+        assert_eq!(
+            operation_exposure(Operation::EditFiles),
+            Some(ExposureLabel::ExfilVector)
+        );
+        assert_eq!(
+            operation_exposure(Operation::GitCommit),
+            Some(ExposureLabel::ExfilVector)
+        );
+        assert_eq!(
+            operation_exposure(Operation::ManagePods),
+            Some(ExposureLabel::ExfilVector)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1640,16 +1748,16 @@ mod tests {
     }
 
     #[test]
-    fn test_graded_exposure_guard_neutral_ops_no_exposure() {
+    fn test_graded_exposure_guard_local_sinks_are_exfil() {
         let guard = GradedExposureGuard::new(uninhabitable_perms(), "[]");
 
+        // Local sinks now contribute the ExfilVector leg (most-paranoid #4):
+        // writing/editing/committing is an exfiltration channel.
         check_and_record(&guard, Operation::WriteFiles);
+        assert!(guard.exposure().contains(ExposureLabel::ExfilVector));
         check_and_record(&guard, Operation::EditFiles);
         check_and_record(&guard, Operation::GitCommit);
-
-        // Neutral ops don't contribute to exposure
-        assert_eq!(guard.exposure(), ExposureSet::empty());
-        assert_eq!(guard.accumulated_risk(), StateRisk::Safe);
+        assert!(guard.exposure().contains(ExposureLabel::ExfilVector));
     }
 
     #[test]
@@ -1660,7 +1768,10 @@ mod tests {
         let same_hash = {
             let mut h = Sha256::new();
             h.update(r#"[{"name":"read"}]"#.as_bytes());
-            format!("{:x}", h.finalize())
+            h.finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         };
         assert!(guard.verify_schema(&same_hash).is_ok());
 
@@ -1668,7 +1779,10 @@ mod tests {
         let evil_hash = {
             let mut h = Sha256::new();
             h.update(r#"[{"name":"read"},{"name":"evil_tool"}]"#.as_bytes());
-            format!("{:x}", h.finalize())
+            h.finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         };
         let result = guard.verify_schema(&evil_hash);
         assert!(result.is_err());
@@ -1820,6 +1934,121 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Audit H-3 — decision-lock poison ⇒ fail CLOSED (adversarial corpus)
+    //
+    // A stray panic while a thread holds the exposure write guard durably
+    // poisons the RwLock. The exposure accumulator is monotone-union (taint is
+    // only ever added), so recovering the torn guard via into_inner() could
+    // UNDER-COUNT taint and turn a required DENY into an ALLOW — a fail-open
+    // strictly worse than the original crash. These tests pin the fail-CLOSED
+    // contract: a poisoned DECISION lock ⇒ deny, never allow, never panic.
+    //
+    // NOTE: this fault-injection scenario cannot be expressed in the IFC-flow
+    // JSON attack corpus (tests/attack_corpus.json is source→sink flows only),
+    // so it lives here as the H-3 adversarial regression.
+    // -----------------------------------------------------------------------
+
+    /// Poison a lock by panicking while holding its write guard, in a way that
+    /// does not abort the test process. Returns once the lock is poisoned.
+    fn poison_write_lock<T>(lock: &RwLock<T>) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.write().expect("first write should not be poisoned");
+            panic!("intentional panic while holding write lock (H-3 fault injection)");
+        }));
+        assert!(result.is_err(), "the fault-injection closure must panic");
+        assert!(lock.is_poisoned(), "the lock must now be poisoned");
+    }
+
+    #[test]
+    fn test_decision_lock_poison_denies_graded_check() {
+        let guard = GradedExposureGuard::new(uninhabitable_perms(), "[]");
+
+        // Adversary: poison the exposure DECISION lock.
+        poison_write_lock(&guard.exposure);
+
+        // check() MUST fail CLOSED: a Denied error — NOT a panic, NOT an allow,
+        // NOT a torn-state allow. This assertion FAILS if someone swaps in
+        // `into_inner()` on the decision lock (which would return Ok).
+        match guard.check(Operation::ReadFiles) {
+            Err(GuardError::Denied { reason }) => {
+                assert!(
+                    reason.contains("poisoned"),
+                    "denial must cite the poisoned lock, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected a fail-closed Denied, got {other:?}"),
+            Ok(_) => panic!(
+                "FAIL-OPEN REGRESSION: check() returned an ALLOW on a poisoned \
+                 decision lock — someone likely swapped in into_inner()"
+            ),
+        }
+
+        // accumulated_risk() must also fail closed → MAXIMUM risk.
+        assert_eq!(
+            guard.accumulated_risk(),
+            StateRisk::Uninhabitable,
+            "poisoned decision lock must report maximum risk, never under-report"
+        );
+
+        // exposure() must fail closed → maximal (fully uninhabitable) set.
+        assert!(
+            guard.exposure().is_uninhabitable(),
+            "poisoned exposure accessor must report maximal exposure"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_decision_lock_poison_denies_runtime_check() {
+        let guard = RuntimeStateGuard::new(uninhabitable_perms(), "[]");
+
+        poison_write_lock(&guard.exposure);
+
+        match guard.check(Operation::ReadFiles) {
+            Err(GuardError::Denied { reason }) => {
+                assert!(reason.contains("poisoned"), "got: {reason}");
+            }
+            Err(other) => panic!("expected fail-closed Denied, got {other:?}"),
+            Ok(_) => panic!(
+                "FAIL-OPEN REGRESSION: RuntimeStateGuard::check() allowed on a \
+                 poisoned decision lock (into_inner() must NOT be used here)"
+            ),
+        }
+
+        assert_eq!(guard.accumulated_risk(), StateRisk::Uninhabitable);
+    }
+
+    #[test]
+    fn test_decision_lock_poison_execute_and_record_fails_closed() {
+        let guard = GradedExposureGuard::new(uninhabitable_perms(), "[]");
+
+        // Obtain a valid proof BEFORE poisoning (check reads the lock).
+        let proof = guard
+            .check(Operation::ReadFiles)
+            .expect("check should pass");
+
+        // Now poison the exposure decision lock.
+        poison_write_lock(&guard.exposure);
+
+        // The closure runs, but recording cannot be proven consistent, so
+        // execute_and_record must fail CLOSED with TocTouDenied — the caller
+        // must treat the executed op as denied, never Ok.
+        let result = guard.execute_and_record(proof, || Ok::<_, String>(()));
+        match result {
+            Err(ExecuteError::TocTouDenied { reason }) => {
+                assert!(reason.contains("poisoned"), "got: {reason}");
+            }
+            Err(ExecuteError::OperationFailed(_)) => {
+                panic!("closure succeeded; must not report OperationFailed")
+            }
+            Ok(_) => panic!(
+                "FAIL-OPEN REGRESSION: execute_and_record returned Ok on a \
+                 poisoned decision lock (into_inner() must NOT be used here)"
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Exhaustive equivalence: RuntimeStateGuard ≡ GradedExposureGuard
     //
     // Now that RuntimeStateGuard delegates to exposure_core, both guards
@@ -1828,7 +2057,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// All Operation variants for exhaustive testing.
-    const ALL_OPS: [Operation; 12] = [
+    const ALL_OPS: [Operation; 13] = [
         Operation::ReadFiles,
         Operation::WriteFiles,
         Operation::EditFiles,
@@ -1841,6 +2070,7 @@ mod tests {
         Operation::GitPush,
         Operation::CreatePr,
         Operation::ManagePods,
+        Operation::SpawnAgent,
     ];
 
     /// Exhaustive equivalence test: for every possible operation sequence

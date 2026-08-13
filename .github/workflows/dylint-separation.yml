@@ -1,0 +1,255 @@
+name: Dylint (mediation + CB4A separation + identity isolation)
+
+# Runs the two custom rustc passes that discharge premises the Lean theorems
+# assume but cannot check:
+#
+#   `mediated`         — every path to a raw I/O primitive passes through a
+#                        function demanding an `Authority` (closes BACKWARD).
+#   `cb4a_separation`  — nothing reachable from a PDP root names credential
+#                        material; nothing from a CDP root names policy
+#                        (closes FORWARD).
+#
+# WHY THIS WORKFLOW EXISTS AT ALL
+#
+# Both passes were previously run BY HAND. A lint nobody runs is documentation
+# with a build step: it cannot catch the regression it was written for, because
+# the regression arrives in a pull request and the lint runs on somebody's
+# laptop afterwards, if at all. `docs/production-delta.md` recorded that gap
+# honestly; this closes it.
+#
+# WHY LINUX-ONLY
+#
+# The lint dylibs resolve `rustc_driver` through `@rpath`, which
+# `DYLD_FALLBACK_LIBRARY_PATH` does not satisfy on macOS, and SIP strips
+# `DYLD_*` from child processes. Both passes' READMEs record this; it is why
+# neither has a committed UI baseline. On Linux there is no such problem.
+#
+# WHY `mediated` IS NOW ENFORCING (C6 phase 1b)
+#
+# The pass is scoped to the MEDIATED SET — the sealed agent-effect boundary
+# `portcullis_effects` (`MEDIATED_CRATES` in the lint). Over that set it reports
+# ZERO unmediated-I/O findings today: every raw sink in the effect home is
+# reached only after an `Authority` is demanded by value and spent. So the job
+# gates on that count staying zero, exactly like `cb4a_separation` and
+# `identity-isolation`.
+#
+# The earlier "15 open findings" were the host runtime's own infrastructure I/O
+# in transitive workspace deps (config loaders, audit/lineage persistence,
+# keyless-identity fetch, attestation clients, sandbox setup) — NOT
+# agent-attributed effect, and out of scope by the same reasoning that puts
+# jailer spawn and HTTP serving out of scope. Scoping the finding to the effect
+# home makes the enforced claim precise instead of suppressing anything: the
+# closure/unresolved-call reports remain emitted for every crate as an ADVISORY
+# signal, and the gate deliberately does not count them (a higher-order call is a
+# call-graph observation, not an unmediated sink).
+#
+# The gate lives in scripts/check-mediation-dylint.sh (one source of truth), and
+# its `--self-test` proves reds-on-revert on the pinned toolchain every run.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "crates/**"
+      - "tools/nucleus-mediation-lint/**"
+      - "tools/nucleus-cb4a-lint/**"
+      - "tools/nucleus-identity-lint/**"
+      - ".github/workflows/dylint-separation.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "tools/nucleus-mediation-lint/**"
+      - "tools/nucleus-cb4a-lint/**"
+      - "tools/nucleus-identity-lint/**"
+      - ".github/workflows/dylint-separation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dylint-separation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cb4a-separation:
+    name: cb4a_separation (enforced at zero)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The toolchain is a LOCKSTEP TRIPLE with clippy_utils and dylint_linting;
+      # rust-toolchain.toml inside the lint crate pins it. `rustc-dev` and
+      # `llvm-tools-preview` are mandatory — without them the `extern crate
+      # rustc_*` declarations do not resolve.
+      - name: Install the pinned nightly
+        run: |
+          rustup toolchain install nightly-2026-04-16 \
+            --component rustc-dev,llvm-tools-preview --profile minimal
+
+      # Version-pinned: the crates' manifests call the toolchain, clippy_utils rev
+      # and dylint version a LOCKSTEP TRIPLE and say not to bump one in isolation.
+      # An unpinned `cargo install` would drift the third leg silently.
+      - name: Install cargo-dylint
+        run: cargo install cargo-dylint dylint-link --version 6.0.1 --locked
+
+      # `cd` rather than `--manifest-path`: rustup selects a toolchain from the
+      # CURRENT DIRECTORY, so building from the repo root would silently use the
+      # workspace's stable toolchain and fail to resolve `extern crate rustc_*`.
+      - name: Build the pass
+        working-directory: tools/nucleus-cb4a-lint
+        run: cargo build
+
+      # Dylint resolves a library by a `@<toolchain>-<target>` suffixed filename.
+      # A plain `cargo build` does not produce that name, and without it dylint
+      # reports "Could not find --lib" — which reads like a configuration error
+      # and would otherwise be "fixed" by dropping the step, silently disabling
+      # the check.
+      - name: Name the dylib the way dylint resolves it
+        run: |
+          cd tools/nucleus-cb4a-lint/target/debug
+          host=$(rustc -vV | sed -n 's/host: //p')
+          cp libnucleus_cb4a_lint.so \
+             "libnucleus_cb4a_lint@nightly-2026-04-16-${host}.so"
+
+      # ZERO findings, enforced. `cargo dylint` exits 0 even when a pass reports,
+      # because the lint is `Warn` — so exit status is NOT the signal, and a job
+      # that trusted it would pass through any number of violations. Count the
+      # reports instead.
+      - name: Run cb4a_separation over the broker crates
+        env:
+          DYLINT_LIBRARY_PATH: ${{ github.workspace }}/tools/nucleus-cb4a-lint/target/debug
+        run: |
+          set -o pipefail
+          total=0
+          for crate in nucleus-node nucleus-cred-broker nucleus-tool-proxy portcullis-effects; do
+            echo "::group::$crate"
+            out=$(cargo dylint --lib nucleus_cb4a_lint -- -p "$crate" 2>&1) || true
+            echo "$out"
+            echo "::endgroup::"
+            # A crate that fails to COMPILE under the lint reports zero findings,
+            # and the `|| true` above swallows the exit status — so a broken
+            # build would read as a clean separation. Zero is only meaningful
+            # when the check actually ran.
+            if printf '%s\n' "$out" | grep -qE 'could not compile|Compilation failed'; then
+              echo "::error::$crate failed to compile under the lint — zero findings would be a false green."
+              exit 1
+            fi
+            n=$(printf '%s\n' "$out" | grep -c 'reachable from a \(PDP\|CDP\) entry point' || true)
+            echo "$crate: $n finding(s)"
+            total=$((total + n))
+          done
+          echo "cb4a_separation total: $total"
+          if [ "$total" -ne 0 ]; then
+            echo "::error::cb4a_separation reported $total finding(s). CB4A requires that the \
+          component deciding policy never touch credential material, and that the component \
+          dispensing credentials never decide policy. See tools/nucleus-cb4a-lint/README.md."
+            exit 1
+          fi
+
+  mediated:
+    name: mediated (enforced at zero over the sealed effect boundary)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned nightly
+        run: |
+          rustup toolchain install nightly-2026-04-16 \
+            --component rustc-dev,llvm-tools-preview --profile minimal
+
+      # Version-pinned: the crates' manifests call the toolchain, clippy_utils rev
+      # and dylint version a LOCKSTEP TRIPLE and say not to bump one in isolation.
+      # An unpinned `cargo install` would drift the third leg silently.
+      - name: Install cargo-dylint
+        run: cargo install cargo-dylint dylint-link --version 6.0.1 --locked
+
+      - name: Build the pass
+        working-directory: tools/nucleus-mediation-lint
+        run: cargo build
+
+      - name: Name the dylib the way dylint resolves it
+        run: |
+          cd tools/nucleus-mediation-lint/target/debug
+          host=$(rustc -vV | sed -n 's/host: //p')
+          cp libnucleus_mediation_lint.so \
+             "libnucleus_mediation_lint@nightly-2026-04-16-${host}.so"
+
+      # REDS-ON-REVERT FIRST. The gate proves it can fail on its own subject
+      # before it is trusted to pass: an unmediated raw-I/O sink appended to the
+      # effect home must push the count non-zero. A gate that cannot fail is not
+      # a gate. This runs on the pinned toolchain (the scripts/check-gates-can-fail.sh
+      # job has only stable Rust and cannot exercise a dylint gate).
+      - name: Prove the gate reds on a reverted discharge
+        env:
+          DYLINT_LIBRARY_PATH: ${{ github.workspace }}/tools/nucleus-mediation-lint/target/debug
+        run: scripts/check-mediation-dylint.sh --self-test
+
+      # ZERO unmediated-I/O findings over the mediated set, ENFORCED. `cargo
+      # dylint` exits 0 even when the `Warn` pass reports, so the script counts
+      # the findings rather than trusting exit status, and guards the
+      # compile-failure false-green. Closure/unresolved-call reports are printed
+      # but NOT counted (advisory).
+      - name: Enforce zero unmediated I/O in the sealed effect boundary
+        env:
+          DYLINT_LIBRARY_PATH: ${{ github.workspace }}/tools/nucleus-mediation-lint/target/debug
+        run: scripts/check-mediation-dylint.sh
+
+  identity-isolation:
+    name: workload_identity_isolation (enforced at zero)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned nightly
+        run: |
+          rustup toolchain install nightly-2026-04-16 \
+            --component rustc-dev,llvm-tools-preview --profile minimal
+
+      # Version-pinned: the crates' manifests call the toolchain, clippy_utils rev
+      # and dylint version a LOCKSTEP TRIPLE and say not to bump one in isolation.
+      # An unpinned `cargo install` would drift the third leg silently.
+      - name: Install cargo-dylint
+        run: cargo install cargo-dylint dylint-link --version 6.0.1 --locked
+
+      # `cd` rather than `--manifest-path`: rustup selects a toolchain from the
+      # CURRENT DIRECTORY — see the cb4a job's comment.
+      - name: Build the pass
+        working-directory: tools/nucleus-identity-lint
+        run: cargo build
+
+      - name: Name the dylib the way dylint resolves it
+        run: |
+          cd tools/nucleus-identity-lint/target/debug
+          host=$(rustc -vV | sed -n 's/host: //p')
+          cp libnucleus_identity_lint.so \
+             "libnucleus_identity_lint@nightly-2026-04-16-${host}.so"
+
+      # ZERO findings, enforced. Same exit-status trap as the cb4a job: `cargo
+      # dylint` exits 0 on a `Warn` report, so count the reports instead. Both
+      # finding messages (a named hit AND an unresolvable call) contain the
+      # fragment grepped for, so an unsound hole in the closure also fails.
+      - name: Run workload_identity_isolation over the spawn-path crate
+        env:
+          DYLINT_LIBRARY_PATH: ${{ github.workspace }}/tools/nucleus-identity-lint/target/debug
+        run: |
+          set -o pipefail
+          out=$(cargo dylint --lib nucleus_identity_lint -- -p nucleus-tool-proxy 2>&1) || true
+          echo "$out"
+          # Same false-green guard as the cb4a job: a compile failure yields
+          # zero findings and `|| true` swallows the status.
+          if printf '%s\n' "$out" | grep -qE 'could not compile|Compilation failed'; then
+            echo "::error::nucleus-tool-proxy failed to compile under the lint — zero findings would be a false green."
+            exit 1
+          fi
+          n=$(printf '%s\n' "$out" | grep -c 'reachable from a workload-spawn root' || true)
+          echo "workload_identity_isolation: $n finding(s)"
+          if [ "$n" -ne 0 ]; then
+            echo "::error::workload_identity_isolation reported $n finding(s). FM-5 requires \
+          that identity material never enter the workload-spawn call graph. See \
+          tools/nucleus-identity-lint/README.md."
+            exit 1
+          fi

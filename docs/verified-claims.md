@@ -1,0 +1,400 @@
+# Verified Claims
+
+Machine-checked properties of the Nucleus security kernel. Each claim links to
+its proof, states what it guarantees and what it does not, and names the CI gate
+that enforces it on every pull request.
+
+**Verification stack:**
+- **Lean 4** kernel-checked proofs via Aeneas extraction (types + theorems)
+- **Kani BMC** bounded model checking of Rust implementations (114 harnesses repo-wide: portcullis 64, portcullis-core 31, ck-kernel 17, +2)
+- **Rust type system** structural enforcement via sealed types and phantom tags
+
+For why the enforcement boundary is proved rather than tested — and how that
+compares to what other agent-isolation runtimes ship — see
+[Landscape and Rationale](architecture/landscape.md).
+
+---
+
+## Tier 1: Algebraic Properties (Lean 4 + Kani BMC)
+
+### 1. IFC label join is a semilattice
+
+**Plain English:** When two data sources are combined (e.g., a user prompt mixed
+with web content), the resulting security label is always at least as restrictive
+as the most restrictive input. Combining data never makes it *less* restricted.
+
+**Formal statement:** `(IFCLabel, join)` is a commutative, associative,
+idempotent semilattice with `bottom` as identity.
+
+**Proved in:**
+- Lean 4: [`lean/IFCSemilatticeProofs.lean`](../crates/portcullis-core/lean/IFCSemilatticeProofs.lean) — `ifc_join_idempotent`, `ifc_join_comm`, `ifc_join_assoc`
+- Kani: `proof_ifc_join_idempotent`, `proof_ifc_join_commutative`, `proof_ifc_join_associative` (portcullis-core)
+
+**What it does NOT prove:** That labels are assigned correctly at runtime.
+The algebra is sound; labeling depends on correct integration.
+
+**CI gate:** Lean proofs run in the `Aeneas (Rust -> Lean 4)` CI job. Kani
+harnesses run in the `Mutation Testing` job. Both block merge on failure.
+
+---
+
+### 2. Taint is monotone (no silent cleansing)
+
+**Plain English:** Once an AI agent has processed adversarial content (e.g., a
+web page with a prompt injection attempt), that contamination is permanently
+recorded on every output derived from it. No sequence of operations can wash it
+out without explicit human authorization.
+
+**Formal statement:** For all derivation classes `x`:
+`join(x, Deterministic) = x` and `join(OpaqueExternal, x) = OpaqueExternal`.
+The session taint ceiling is monotonically non-decreasing.
+
+**Proved in:**
+- Lean 4: [`lean/DerivationProofs.lean`](../crates/portcullis-core/lean/DerivationProofs.lean) — `no_silent_cleansing`, `join_monotone_left`, `join_opaque_left`
+- Kani: `proof_derivation_no_silent_cleansing`, `proof_derivation_join_monotone` (portcullis-core)
+- Runtime: `FlowTracker::session_taint_ceiling` is only raised, never lowered (except via explicit `reset_session_ceiling` which requires human authority)
+
+**What it does NOT prove:** That the agent will not be compromised. That prompt
+injection will not succeed. Only that if it does, the taint is tracked and
+cannot be erased silently.
+
+**CI gate:** Lean + Kani in CI. The `reset_session_ceiling` escape hatch is
+audited as a security-sensitive operation (#1233).
+
+---
+
+### 3. Adversarial integrity is absorbing
+
+**Plain English:** Mixing any data with adversarial-integrity content always
+produces adversarial-integrity output. There is no "dilution" — even one drop
+of adversarial input contaminates the entire result.
+
+**Formal statement:** For all `IntegLevel b`:
+`Adversarial meet b = Adversarial`.
+
+**Proved in:**
+- Lean 4: [`lean/IFCSemilatticeProofs.lean`](../crates/portcullis-core/lean/IFCSemilatticeProofs.lean) — `integ_inf_adversarial_left`, `integ_inf_adversarial_right`
+- Lean 4: `invariant_exploit_propagates_taint` (end-to-end IFC scenario)
+
+**What it does NOT prove:** That adversarial content will be detected. Only that
+once labeled, the label cannot be weakened through data combination.
+
+**CI gate:** Lean `Aeneas` job.
+
+---
+
+### 4. Secret confidentiality is absorbing
+
+**Plain English:** Mixing any data with secret-classified content always
+produces secret-classified output. Combining a secret API key with public
+documentation does not make the result "mostly public."
+
+**Formal statement:** For all `ConfLevel b`:
+`Secret sup b = Secret`.
+
+**Proved in:**
+- Lean 4: [`lean/IFCSemilatticeProofs.lean`](../crates/portcullis-core/lean/IFCSemilatticeProofs.lean) — `conf_sup_secret_left`, `conf_sup_secret_right`
+
+**What it does NOT prove:** That secrets are labeled correctly at source. A
+secret not labeled as `Secret` will not benefit from this guarantee.
+
+**CI gate:** Lean `Aeneas` job.
+
+---
+
+### 5. Capability lattice is a distributive Heyting algebra
+
+**Plain English:** The permission system (which tools an agent can use) follows
+the mathematical rules of a Heyting algebra. This means permissions compose
+predictably: restricting permissions always produces a valid, less-permissive
+result; combining permissions always produces a valid, more-permissive result.
+
+**Formal statement:** `(CapabilityLattice, meet, join, implies)` satisfies all
+Heyting algebra axioms, including the adjunction property `a meet b <= c iff
+a <= b implies c`.
+
+**Proved in:**
+- Kani: `proof_r1_heyting_adjunction`, `proof_r4_lattice_heyting_adjunction` (portcullis)
+- Lean 4: [`lean/generated/PortcullisCore/Types.lean`](../crates/portcullis-core/lean/generated/PortcullisCore/Types.lean) — type generation from Aeneas
+
+**What it does NOT prove:** That the 13 capability dimensions are the right
+ones for your use case. The algebra is generic; the dimensions are
+application-specific.
+
+**CI gate:** Kani in `Mutation Testing` job. Lean type generation in `Aeneas` job.
+
+---
+
+## Tier 2: Structural Safety (Rust Type System)
+
+### 6. Obligation bypass is a type error
+
+**Plain English:** There is no way to execute a side effect (file write, web
+fetch, shell command) through `NucleusRuntime` without first passing the
+obligation discharge check. The `DischargedBundle` required by effect functions
+can only be obtained from a successful `preflight_action()` call — its
+constructor is private.
+
+**Structural enforcement:** `DischargedBundle` contains a private `Seal` field
+that cannot be named outside its module. `Discharged<O>` tokens are zero-sized
+proof witnesses; `Discharged::mint()` is `fn` (not `pub fn`).
+
+**Scope binding (now machine-checked — see claim 8a):** the type system
+establishes that *a* preflight ran, not that a
+preflight ran for **this** action. The bundle carries the `(Operation, SinkClass)`
+pair it was earned for, and each mediated method checks it; without that check a
+bundle earned for a cheaper action would authorize any other — the confused
+deputy. The check itself is a runtime comparison, but it can no longer be
+*skipped*: effect methods take an owned `Authority`, so reaching the effect
+requires surrendering one.
+
+**Proved in:** Compile-fail doc-test on `DischargedBundle`
+(portcullis-core/src/discharge.rs); scope binding by
+`a_read_bundle_will_not_authorize_a_write` and siblings in
+`portcullis-effects/src/runtime.rs`.
+
+**What it does NOT prove:** That the obligation checks themselves are correct.
+Only that they cannot be skipped. The checks' correctness is tested by 33 unit
+tests and the Kani harnesses above.
+
+Nor does it prove **complete mediation** on its own. For the effect traits that
+property now holds structurally: all 13 methods take an `Authority` **by value**,
+so the scope check cannot be skipped and replay is a compile error. See claim 8a
+for the machine-checked scope predicate, and
+[Production Delta](production-delta.md) for the surfaces still outside it.
+
+**CI gate:** `Tests` job runs the compile-fail doc-test and the scope-binding
+tests. A PR that makes the `Seal` field public, adds a public constructor, or
+drops a `require_scope` call would fail it.
+
+---
+
+### 7. Confidentiality downflow is enforced
+
+**Plain English:** Data classified as `Secret` cannot flow to a sink classified
+as `Public` or `Internal` through `NucleusRuntime`. The session-level
+confidentiality ceiling prevents laundering through clean intermediaries: if
+the session has ever observed `Secret` data, writing to any non-`Secret` sink
+is blocked.
+
+**Structural enforcement:**
+- `FlowTracker::session_conf_ceiling` is monotonically non-decreasing
+- `check_exfiltration_safety()` checks both node-level and session-level conf
+- At the type level, `Labeled<T, I, Secret>` does not implement
+  `ConfAtMost<Public>`, so passing secret data to a public-gated function is a
+  compile error
+
+**Proved in:** 21 unit tests in `ifc_api::tests` + compile-fail doc-test on `Labeled`
+
+**What it does NOT prove:** That all data sources are labeled with the correct
+confidentiality. Mislabeled data bypasses the check. Source labeling is the
+integrator's responsibility.
+
+**CI gate:** `Tests` job.
+
+---
+
+### 8. Type-level IFC prevents tainted-to-trusted flow
+
+**Plain English:** A function that requires `Trusted`-integrity input will not
+compile if passed `Adversarial`-integrity data. This catches the most common
+IFC violation — using web-scraped content in a privileged operation — at
+compile time rather than at runtime.
+
+**Structural enforcement:** `Labeled<T, Adversarial, C>` does not implement
+`IntegAtLeast<Trusted>`. The only way to promote `Adversarial` to `Untrusted`
+is `promote_integrity()` which requires an explicit `DeclassifyReason`. The
+only way to promote `Untrusted` to `Trusted` is `promote_to_trusted()` which
+accepts only `HumanReview` or `DeterministicVerification` — `Sanitization`
+alone is rejected.
+
+**Proved in:** Compile-fail doc-test on `Labeled` + 22 unit tests in `labeled::tests`
+
+**What it does NOT prove:** That runtime IFC checks are redundant. The type-level
+system is an approximation — dynamic data flow through the `FlowTracker` remains
+necessary for paths where the type is erased.
+
+**CI gate:** `Tests` job.
+
+---
+
+### 8a. A discharge authorizes its own action, once, and nothing else
+
+**Plain English:** An authorization earned for one action cannot be spent on a
+different one. A bundle earned for reading a file does not authorize a write, a
+shell spawn, or a push — even when the coarse capability for that action is
+enabled. This is the confused deputy, and it is the first half of complete
+mediation.
+
+**Formal statement, two halves.** The *predicate*: `scope_admits(eo, es, ao, as) ↔
+(eo = ao ∧ es = as)` — reflexive, discriminating on each component, and functional
+(a bundle admits at most one pair). The *machine*: an effect succeeds only from a
+held authority whose scope admits it (`effect_requires_held`), a success
+**consumes** it (`effect_consumes_the_authority`), a refusal does **not**
+(`refusal_preserves_the_authority`), and therefore a second effect with no fresh
+discharge fails (`no_replay_without_a_fresh_discharge`).
+
+**Proved in:**
+- Lean 4: [`lean/MediationScopeExtracted.lean`](../crates/portcullis-core/lean/MediationScopeExtracted.lean)
+  — eight theorems: `scope_admits_{refl,iff_eq,unique,no_escalation}` over the
+  predicate, and `effect_requires_held`, `effect_consumes_the_authority`,
+  `refusal_preserves_the_authority`, `no_replay_without_a_fresh_discharge` over
+  the extracted state machine `med_step`
+- Proven **over the Aeneas-extracted definitions**, not a hand-written model:
+  `crates/nucleus-ifc-kernel/src/extracted/mediation.rs` → charon (scoped
+  `--start-from`) → aeneas → `generated-mediation/PortcullisCoreMediation/`.
+- Rust↔model parity: exhaustive sweep in `src/extracted/mediation.rs` over every
+  earnable pair (27 of 247 pass `PathAllowed`) against all 247 attempted pairs —
+  6,669 comparisons, the complete domain, so this is an equivalence proof rather
+  than a sample.
+
+**Axiom set:** `[propext, Classical.choice, Quot.sound]` — no `sorryAx`, and no
+Aeneas `*External` opaque axiom. The Rust slice compares explicit `u8` ranks
+rather than deriving `PartialEq` precisely so no opaque comparison axiom lands on
+the critical path.
+
+**What it does NOT prove — and cannot:** that every effect path *calls* the
+predicate. That is a whole-program property over an open program, so Lean has
+nothing to quantify over, and the effect layer's real I/O is outside the
+extractable subset regardless. These theorems are the **conditional** half.
+
+The premise is discharged mechanically by the `mediated` Dylint pass
+(`tools/nucleus-mediation-lint`), closed under the call graph, over the set
+defined in [The Mediated Set](architecture/mediated-set.md). seL4 has the same
+shape: it assumes compiler/assembly/hardware correctness and imposes syntactic
+restrictions checked outside Isabelle so the proof has a static call graph.
+
+**Trusted, stated rather than hidden:** rustc's enforcement of affine moves, the
+lint's deny-set completeness, and Charon/Aeneas extraction fidelity.
+
+It also says nothing about the other seven obligations: it governs which action a
+bundle speaks for, not whether that action is safe.
+
+**CI gate:** `Scoped Aeneas (Rust → Lean 4) + parity tests` — re-extracts from
+Rust, rebuilds the theorem against the fresh extraction, and fails on a dirty
+axiom set or any `sorry`/`admit`/`native_decide`.
+
+---
+
+### 9. OIDC→SPIFFE charset is enforced — and the derivation is NOT collision-free
+
+**Plain English:** When a GitHub Actions OIDC token is mapped to a Nucleus
+SPIFFE id, every path segment is sanitized to the SPIFFE-legal charset
+`[A-Za-z0-9._-]`. We machine-check that the extracted-from-Rust byte classifier
+admits *exactly* that charset. We ALSO machine-check the honest negative result:
+because sanitization is **lossy**, the derivation is **not injective** —
+distinct OIDC claim-sets can mint the *same* SPIFFE id within one owner/repo.
+That collision is a real authz-confusion surface and is documented, not hidden.
+
+**Formal statement (proven, sorry-free, over the Aeneas-extracted defs):**
+- `is_spiffe_byte_iff` / `is_spiffe_byte_charset` — for every `U8` byte, the
+  generated `is_spiffe_byte` returns `ok true` iff the byte is in
+  `[0-9A-Za-z._-]` (exhaustive over all 256 values).
+- `collapse_lossy_step` — the generated per-byte sanitizer step maps the
+  DISALLOWED byte `/` (0x2F) and the ALLOWED byte `-` (0x2D), from the same
+  state, to the IDENTICAL continuation. This is the merge that destroys
+  injectivity.
+
+**The collision finding (pinned, NOT a proven safety property):** `"a/b"` and
+`"a-b"` both sanitize to `"a-b"`; `"refs/heads/x"` and `"refs-heads-x"` both →
+`"refs-heads-x"`. So two distinct refs/repos can derive the same SPIFFE id. We
+do **not** claim SPIFFE ids are collision-free — the opposite is true and pinned
+as a regression test.
+
+**Trust chain:** production `sanitize_segment` / `derive_spiffe_id`
+(`claims.rs`) ≡ the byte-indexed `extracted/oidc_spiffe.rs` mirror (proven
+byte-identical across random Unicode by the parity proptests) → Lean via Aeneas.
+
+**Proved in:**
+- Lean 4: [`lean/OidcSpiffeProofs.lean`](../crates/nucleus-github-oidc/lean/OidcSpiffeProofs.lean) — `is_spiffe_byte_iff`, `is_spiffe_byte_charset`, `collapse_lossy_step` (each `#print axioms` = `[propext, Classical.choice, Quot.sound]`)
+- Rust parity + collision proptests: [`src/extracted/oidc_spiffe.rs`](../crates/nucleus-github-oidc/src/extracted/oidc_spiffe.rs) — `sanitize_bytes_matches_production`, `derive_spiffe_bytes_matches_production`, `is_spiffe_byte_matches_production_charset`, `collision_distinct_refs_same_spiffe_id`, `collision_distinct_repo_segments`
+
+**What it does NOT prove:**
+- NOT that SPIFFE ids are collision-free (they are not — see the finding).
+- NOT "no `--` run" in output (production does not guarantee it; a literal `-`
+  next to a collapsed dash yields `--`).
+- The full end-to-end `sanitize_bytes(x) = sanitize_bytes(y)` collision is
+  proven in the Rust proptest, not yet as a closed Lean theorem: Aeneas's `loop`
+  combinator (`partial_fixpoint`) does not reduce under `simp`/`decide`, so the
+  Lean side proves the per-step root cause (`collapse_lossy_step`) rather than
+  evaluating the whole loop. This gap is disclosed, not papered over with a
+  `sorry`.
+- The owner-binding guard (`repository_owner == org(repository)`) and the final
+  `CallSpiffeId::parse` are equality / parser checks outside the extracted
+  rendered-bytes subgraph.
+
+**Why the collision is acceptable in context:** authorization is decided on the
+*verified claim* (the allow-listed `repository_owner` / `repository`), not on the
+rendered SPIFFE id. The SPIFFE id is a downstream identifier. The finding bounds
+where the lossy id may NOT be used as a sole authz key.
+
+**CI gate:** `Aeneas OIDC→SPIFFE (scoped extraction + derivation properties)`
+job — scoped Charon→Aeneas extraction, Rust parity+collision tests, Lean build,
+and the `Assert clean axiom set` / `Reject sorry` audits. Blocks merge.
+
+---
+
+## What happens when a proof breaks
+
+1. The `Aeneas (Rust -> Lean 4)` or `Mutation Testing` CI job fails
+2. The merge queue rejects the PR
+3. The PR author sees the specific theorem that failed and the Lean/Kani error
+4. The Constitutional Gate (external webhook) logs the failure for audit
+
+No code that breaks a verified claim can reach `main`.
+
+---
+
+## Known Gaps
+
+The claims above hold for code paths that go through `PolicyEnforced` or
+`NucleusRuntime`. The following gaps mean they do not hold universally:
+
+### Enforcement completeness ([#1216](https://github.com/coproduct-opensource/nucleus/issues/1216))
+
+146 call sites in `nucleus-claude-hook` and `nucleus-mcp` call `std::fs`,
+`std::process::Command`, and `reqwest` directly, bypassing the `PolicyEnforced`
+effect layer. The effect layer exists and is verified, but is not structurally
+required at every I/O site. Migration is tracked in #1216.
+
+**Impact:** An operation routed through these 146 call sites gets capability
+checking via `Kernel::decide_term()` (which runs obligation discharge), but does
+NOT get the `PolicyEnforced` effect wrapper. A bug in the call site code could
+perform I/O without any policy gate.
+
+### NucleusRuntime escape hatch ([#1248](https://github.com/coproduct-opensource/nucleus/issues/1248)) — CLOSED
+
+The raw `NucleusRuntime::effects()` accessor is **gone**. The only path to a raw
+bundle, `unmediated_effects(&token, proof)`, requires (1) an opt-in
+`UnmediatedAccess` token, (2) a `DischargedBundle` discharged against the
+**strictest** sink (`HTTPEgress`/`Untrusted`, so discharge fails on a tainted
+session), and (3) a `FlowTracker` observe recording an `OutboundAction` node; the
+returned effect methods take `Authority` by value, so an un-preflighted call is a
+compile error. Guarded by `unmediated_preflight_denies_adversarial_session` (a
+tainted session is denied) and an all-profile isolation invariant
+(`prop_unmediated_effects_always_discharges_and_flow_tracks`). In the C6 egress
+inventory this is channel 12, `type-enforced`, and `no_channel_is_an_open_hole`
+asserts no channel remains an open hole. Residual honesty: the audit-DAG
+granularity is coarse (one `OutboundAction` node per grant, not per effect).
+
+### Type-level IFC not composed into runtime ([#1249](https://github.com/coproduct-opensource/nucleus/issues/1249))
+
+`NucleusRuntime::read_file()` returns `Vec<u8>`, not `Labeled<Vec<u8>, Trusted,
+Internal>`. The compile-time IFC layer (`Labeled<T, I, C>`) and the runtime IFC
+layer (`FlowTracker`) are independently correct but not composed at the API
+boundary. Agents using `NucleusRuntime` get runtime tracking but not compile-time
+enforcement of IFC constraints.
+
+---
+
+## Verification coverage summary
+
+| Layer | Tool | Harnesses | Scope |
+|---|---|---|---|
+| IFC semilattice | Lean 4 | 19 theorems | Label algebra, join/meet laws, absorption |
+| Derivation monotonicity | Lean 4 | 9 theorems | Taint propagation, no-cleansing |
+| Capability Heyting algebra | Kani BMC | portcullis-core (31 harnesses) | Meet/join/implies, adjunction |
+| Kernel invariants | Kani BMC | portcullis (64) + ck-kernel (17) harnesses | Exposure, delegation, guards, flow |
+| Discharge sealing | Rust types | 1 compile-fail test | No forging of `DischargedBundle` |
+| Type-level IFC | Rust types | 1 compile-fail test | No `Adversarial` -> `Trusted` flow |
+| Confidentiality downflow | Unit tests | 21 tests | No `Secret` -> `Public` flow |

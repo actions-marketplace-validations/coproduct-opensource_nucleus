@@ -1,0 +1,155 @@
+# North Star ledger population pin — read by scripts/check-north-star-ledger.sh.
+#
+# Both directions, deliberately (the cmdline five-keys ratchet pattern):
+#   CLAUSES may only GROW — a clause leaving the ledger means either the
+#     sentence was weakened (Brandon's call, made in the open) or a row was
+#     deleted to dodge a red, which is the exact move a shrinkable count pays.
+#   NOT_YET may only SHRINK — and the pin must be lowered in the same change
+#     that earns the promotion, so every promotion is on the record with its
+#     evidence handle beside it. The one legitimate RAISE is a demotion: a row
+#     found to be overclaimed. That is a visible event, recorded here.
+#
+# 2026-08-08: raised 3 -> 4. C1 ("cannot learn the secrets Nucleus holds on
+#   its behalf") demoted PROVED -> NOT-YET. FM-5 proves it over the six
+#   child-inheritance channels, but the workload can read `nucleus.approval_secret`
+#   (always) and the AWS audit creds (with an audit sink) from the world-readable
+#   guest /proc/cmdline — a channel FM-5 does not model. The clause is falsified
+#   today; re-earning it is tracked in the C1 note in docs/north-star.md.
+# 2026-08-08: raised 4 -> 6. Two rows demoted after a North Star red-team audit
+#   found their statuses overstated relative to the wiring:
+#   * C5 ("cannot steer which value that is") PROVED -> NOT-YET. The cited
+#     theorem sink_outside_a_singleton_mask_denied proves the SINK axis (where
+#     data goes), not the VALUE axis (which value is released), and the old note
+#     "the released value ... is governor-signed" was false — canonical_bytes
+#     signs node id + level transform + sinks, no content byte, and target_node_id
+#     is a workload-driven index a token can be minted for before the node exists.
+#     Value-non-steerability needs the four-run robustness LTS (NOT-YET).
+#   * C9 ("verify from the outside") TESTED -> NOT-YET. The served SVID carries
+#     no DICE attestation (FETCH_SVID -> plain sign_csr; the attested-cert
+#     producer is dead-code with its result discarded; no CA implements
+#     sign_attested_csr), and no shipped relying party verifies a launch
+#     attestation. admit_posture is real but is self-characterization, not
+#     outside verification, and is inert without a dlc_posture label no pod emits.
+#   Both re-earning paths are recorded in the C5/C9 notes in docs/north-star.md.
+# 2026-08-08: lowered 6 -> 5. C1 ("cannot learn the secrets Nucleus holds on
+#   its behalf") re-promoted NOT-YET -> PROVED. The channel that demoted it
+#   (world-readable guest /proc/cmdline) is now a modelled ChannelKind::Cmdline
+#   in the closed inbound enum (Aeneas-extracted, sorry-free), and a red-team
+#   walk of the four residual inbound surfaces (bind-mounts, /proc/<pid>/environ,
+#   /etc/nucleus/*, the classifier fallthrough — see the C1 note in
+#   docs/north-star.md) resolved them: bind-mounts and /etc/nucleus/* are the
+#   existing VM/mount fence (block devices, no shared host FS; legacy secret
+#   files are never built; pod.yaml is cred-split), and the two real gaps were
+#   closed fail-closed — B: every workload now runs as a distinct unprivileged
+#   uid, never the runtime's (was wired only under credentialed egress), so it
+#   cannot read the runtime's secret-bearing environ via /proc; D: an
+#   unclassified NUCLEUS_* env key is refused at admission instead of falling
+#   through to OrdinaryData and being delivered. The relation leg is the Lean
+#   noninterference; the runtime conformance leg is TESTED and gated by
+#   scripts/check-c1-inbound-fences.sh (reverting fence B or D reds it).
+# 2026-08-10: raised 5 -> 6. C4 ("a governor deliberately released with a
+#   single-use token") demoted PROVED -> NOT-YET. The single-use theorem
+#   (no_second_apply) is real over the extracted core + the kernel
+#   spent-signature ledger, but it is INERT on every shipping deployment (the
+#   tool-proxy POST /v1/declassify wrapper resolves tokens against an empty
+#   kernel flow_graph -> NodeNotFound; nucleus-mcp populates a graph but never
+#   applies a token), and the release path that actually flips a shipping egress
+#   verdict is the DIFFERENT, unproven k-of-n witness-threshold memory path
+#   (nucleus-tool-proxy/src/memory.rs). A flagship PROVED for a mechanism that
+#   fires nowhere in production — while the live mechanism is unproven — is an
+#   overclaim, vacuously satisfied. Re-earning is the graph-unification arc
+#   (Phase 2/3/4) validated under boot-a-real-pod; see the C4 note in
+#   docs/north-star.md.
+# 2026-08-10: lowered 6 -> 4. Two promotions out of NOT-YET (C4 -> TESTED,
+#   C5 -> PROVED), both earned by the declassification graph-unification arc
+#   (#2227-#2236), each with a falsifier that reds on regression:
+#   * C4 ("a governor deliberately released with a single-use token") NOT-YET ->
+#     TESTED (held one notch below PROVED: the single-use theorem holds and the
+#     release now fires live, but the shipping-path e2e is boot-gated — see below).
+#     The dead-mechanism inversion that demoted it is closed: the Ed25519
+#     apply is re-homed onto state.flow_graph — the graph the live egress verdict
+#     reads (#2235) — so a single-use token now FLIPS the egress verdict Deny->Pass
+#     for the committed value (declassify_rehome_egress.rs#c4_flip_back_on_one_graph)
+#     and denies substituted/unsigned-sink/replay/poison. The single-use theorem
+#     (no_second_apply / single_use over the extracted core + the shared burn
+#     ledger) is unchanged and now fires live. Evidence handle: the new falsifier
+#     scripts/check-declassify-value-bound.sh, which also reds if the endpoint is
+#     re-pointed at the orphan kernel graph. Honest caveat (in the C4 note): the
+#     proven mechanism + apply-on-live-graph flip is TESTED at the unit level over
+#     the real FlowGraph type and verified-by-inspection at the endpoint; the full
+#     HTTP-POST-vs-running-pod e2e is boot-gated (the conformance leg, same shape
+#     as C1).
+#   * C5 ("cannot steer which value that is") NOT-YET -> PROVED. Value
+#     non-steering is now ENFORCED (a substituted value is refused ContentMismatch,
+#     fail-closed and non-burning, via FlowGraph::value_binding_ok) AND proven
+#     relationally (four_run_value_robustness: over four attacker-varied runs a
+#     release yields exactly the committed value or denies; sorry-free, axioms =
+#     {propext}). Honest abstraction (in the C5 note): the theorem is over the
+#     u64-tag identity-equality decision in the extracted core; the runtime 32-byte
+#     ContentHash comparison is bound to it by the parity test
+#     authorize_release_value_binding_matches_the_extracted_decision (equal bytes
+#     <=> equal tag). Evidence handle: scripts/check-declassify-value-bound.sh.
+#   C7 stays TESTED: the declassify model<->code gap narrowed (the proofs now bind
+#   to the graph egress actually reads via value_authorized in EXTRACT_ROOTS + the
+#   parity sweep), but C7 is the broader whole-slice<->shipped-code correspondence,
+#   still parity-tested + boot-gate conformance, not proven.
+# 2026-08-11: lowered 4 -> 3. C6 ("every mediated channel") NOT-YET -> TESTED,
+#   earned by the complete-mediation arc Phases 1-3:
+#   * Phase 1 (#2241/#2244): Tier-A total mediation is a theorem
+#     (no_sink_reachable_without_discharge over the closed SinkClass/Operation
+#     enum, sorry-free) AND the `mediated` dylint runs enforcing-at-zero over the
+#     sealed effect home portcullis-effects.
+#   * Phase 2 (#2246): the netns/iptables default-deny egress backstop for the
+#     in-shell/raw-socket surface (channels 5, 10) is PROVEN APPLIED ON BOOT by
+#     the in-guest egress probe (scripts/check-egress-probe.sh, x86_64 boot gate:
+#     an off-allowlist connect from inside the live guest returns ENETUNREACH),
+#     converting it from documented to runtime-observed.
+#   * Phase 3 (#2247): the effects() escape hatch (channel 12, #1248) is closed
+#     (unmediated_effects requires opt-in token + strictest-sink discharge +
+#     FlowTracker observe, fail-closed tested), re-statused type-enforced; and
+#     no_channel_is_an_open_hole asserts the closed EgressChannel inventory holds
+#     ZERO open holes -- the machine meaning of "every". The partial transport
+#     channels (7, 8) rest on tested structural refusals (host-CID pin
+#     only_the_host_cid_is_accepted; broker refusal by absence).
+#   TESTED not PROVED: "every" here is a UNION of tested properties plus one
+#   theorem -- the netns backstop rests on "iptables applies the rules"
+#   (TESTED-on-boot, kernel in the TCB), 7/8 rest on tested structural properties,
+#   and the theorem proves only the API surface. Evidence handle:
+#   scripts/check-egress-probe.sh (reds if the live-path backstop regresses);
+#   no_channel_is_an_open_hole reds if any channel becomes an open hole.
+# 2026-08-11: lowered 3 -> 2. C8 ("re-checked on every change") NOT-YET -> TESTED.
+#   Two gaps closed:
+#   (a) aeneas-ifc-scoped.yml's paths filter was an allowlist of the extracted
+#       Lean files that MISSED the production types the parity tests bind against
+#       (IFCLabel/SinkClass/ConfLevel in ifc_ops.rs/lib.rs) -- so a change to the
+#       enforcement the theorems mirror did not re-run the proof. Now triggers on
+#       the whole crates/nucleus-ifc-kernel/** domain (derived, not enumerated).
+#   (b) Nothing checked the extracted predicates are still WIRED into the live
+#       path (a theorem about an uncalled fn is a proof about dead code). New
+#       required gate scripts/check-extracted-callsites.sh (runs every PR via
+#       ci.yml, covers the live-path crates the scoped proof job does not) asserts
+#       each manifest-covered predicate has a live production call site (test
+#       regions excluded); deleting the call site reds it (perturbation-verified
+#       in check-gates-can-fail.sh).
+#   TESTED not PROVED, and scoped honestly (a call-site audit classified every
+#   extracted family and confirmed none is proven-but-silently-unwired): the wired
+#   families carry a live anchor -- identity (ident_may_deliver direct), mediation
+#   (classify_sink + authorizes/require_scope), declassify (authorize_release),
+#   egress (egress_chain), capability (CapabilityLevel ordering in the trifecta);
+#   channel (channel_admits) and credential (cred_may_deliver) are structural/
+#   proof-only BY DESIGN (C1's uid/no-channel fence; credential built from node
+#   env not the guest spec) and the gate anchors those constructions. 9 entries,
+#   COUNT pinned. Evidence: scripts/check-extracted-callsites.sh.
+# 2026-08-13: added DORMANT_GATES pin (=0). An assurance review found the
+#   cross-declaration guard in check-north-star-ledger.sh had gone SILENTLY IDLE:
+#   it loops over scripts/check-*dormant*.sh, and when declassify went live its
+#   check-declassify-token-dormant.sh was retired, leaving zero such files — so
+#   the one check built to catch "the table is the thing that's lying" iterated
+#   nothing, while the OK line still advertised it as active. The count is now
+#   pinned like CLAUSES/NOT_YET: a dormancy gate appearing or disappearing must be
+#   acknowledged here in the same change, so the guard can never again go idle
+#   unnoticed. Currently 0 (no path is declared dormant); a future dormant subject
+#   raises it to 1 and re-arms the differential.
+CLAUSES=9
+NOT_YET=2
+DORMANT_GATES=0

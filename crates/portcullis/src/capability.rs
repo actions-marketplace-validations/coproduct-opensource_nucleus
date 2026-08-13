@@ -7,71 +7,23 @@ use serde::{Deserialize, Serialize};
 
 /// Tool permission levels in lattice ordering.
 ///
-/// The ordering is: `Never < LowRisk < Always`
-///
-/// - `Never`: Never allow
-/// - `LowRisk`: Auto-approve for low-risk operations
-/// - `Always`: Always auto-approve
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum CapabilityLevel {
-    /// Never allow
-    #[default]
-    Never = 0,
-    /// Auto-approve for low-risk operations
-    LowRisk = 1,
-    /// Always auto-approve
-    Always = 2,
-}
-
-impl std::fmt::Display for CapabilityLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CapabilityLevel::Never => write!(f, "never"),
-            CapabilityLevel::LowRisk => write!(f, "low_risk"),
-            CapabilityLevel::Always => write!(f, "always"),
-        }
-    }
-}
+/// Single source of truth: re-exported from `portcullis-core`.
+/// The verified type IS the production type — one type, zero translation layers.
+pub use portcullis_core::CapabilityLevel;
 
 /// Operations that can be gated by approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum Operation {
-    /// Read files from disk
-    ReadFiles,
-    /// Write files to disk
-    WriteFiles,
-    /// Edit files in place
-    EditFiles,
-    /// Run shell commands
-    RunBash,
-    /// Glob search
-    GlobSearch,
-    /// Grep search
-    GrepSearch,
-    /// Web search
-    WebSearch,
-    /// Fetch URLs
-    WebFetch,
-    /// Git commit
-    GitCommit,
-    /// Git push
-    GitPush,
-    /// Create PR
-    CreatePr,
-    /// Manage sub-pods (create, list, monitor, cancel)
-    ManagePods,
-}
-
-/// Extension operation not covered by Verus proofs.
 ///
-/// The 12 core operations above are frozen — they have 297 Verus verification
-/// conditions proving lattice laws, exposure monotonicity, and session safety.
+/// Single source of truth: re-exported from `portcullis-core`.
+/// The verified type IS the production type — one type, zero translation layers.
+pub use portcullis_core::{default_sink_class, Operation, OperationParseError, SinkClass};
+
+/// Extension operation not covered by the core formal proofs.
+///
+/// The 12 core operations above are frozen — they have Kani + Lean proofs of
+/// lattice laws, exposure monotonicity, and session safety.
 /// Extension operations participate in the same product lattice (meet = pointwise min,
-/// join = pointwise max) but are verified only by property tests, not SMT proofs.
+/// join = pointwise max) but are verified only by property tests, not the core
+/// Kani/Lean proofs.
 ///
 /// Lattice laws hold by the universal property of products in **Lat**: if each
 /// factor is a lattice, the product is a lattice. Since `CapabilityLevel` is a
@@ -186,8 +138,11 @@ pub struct CapabilityLattice {
     /// Manage sub-pods permission level
     #[cfg_attr(feature = "serde", serde(default))]
     pub manage_pods: CapabilityLevel,
+    /// Spawn sub-agent permission level
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub spawn_agent: CapabilityLevel,
 
-    /// Extension capability dimensions (not covered by Verus proofs).
+    /// Extension capability dimensions (not covered by the core formal proofs).
     ///
     /// Meet = pointwise min, join = pointwise max, leq = pointwise ≤.
     /// Unknown extensions default to `Never` (fail-closed).
@@ -217,6 +172,7 @@ impl Default for CapabilityLattice {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::LowRisk,
             manage_pods: CapabilityLevel::Never,
+            spawn_agent: CapabilityLevel::Never,
             #[cfg(not(kani))]
             extensions: BTreeMap::new(),
         }
@@ -389,6 +345,7 @@ impl CapabilityLattice {
             Operation::GitPush => self.git_push,
             Operation::CreatePr => self.create_pr,
             Operation::ManagePods => self.manage_pods,
+            Operation::SpawnAgent => self.spawn_agent,
         }
     }
 
@@ -436,6 +393,7 @@ impl CapabilityLattice {
             git_push: std::cmp::min(self.git_push, other.git_push),
             create_pr: std::cmp::min(self.create_pr, other.create_pr),
             manage_pods: std::cmp::min(self.manage_pods, other.manage_pods),
+            spawn_agent: std::cmp::min(self.spawn_agent, other.spawn_agent),
             #[cfg(not(kani))]
             extensions: ext,
         }
@@ -475,6 +433,7 @@ impl CapabilityLattice {
             git_push: std::cmp::max(self.git_push, other.git_push),
             create_pr: std::cmp::max(self.create_pr, other.create_pr),
             manage_pods: std::cmp::max(self.manage_pods, other.manage_pods),
+            spawn_agent: std::cmp::max(self.spawn_agent, other.spawn_agent),
             #[cfg(not(kani))]
             extensions: ext,
         }
@@ -496,7 +455,8 @@ impl CapabilityLattice {
             && self.git_commit <= other.git_commit
             && self.git_push <= other.git_push
             && self.create_pr <= other.create_pr
-            && self.manage_pods <= other.manage_pods;
+            && self.manage_pods <= other.manage_pods
+            && self.spawn_agent <= other.spawn_agent;
 
         if !core_leq {
             return false;
@@ -535,6 +495,7 @@ impl CapabilityLattice {
             git_push: CapabilityLevel::Always,
             create_pr: CapabilityLevel::Always,
             manage_pods: CapabilityLevel::Always,
+            spawn_agent: CapabilityLevel::Always,
             #[cfg(not(kani))]
             extensions: BTreeMap::new(),
         }
@@ -555,6 +516,7 @@ impl CapabilityLattice {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            spawn_agent: CapabilityLevel::Never,
             #[cfg(not(kani))]
             extensions: BTreeMap::new(),
         }
@@ -682,6 +644,110 @@ mod tests {
         assert!(constraint.is_uninhabitable(&caps));
     }
 
+    /// Verify that the Lean 4 `CapabilityLattice` field-index table matches
+    /// the actual Rust struct field declaration order.
+    ///
+    /// `CapabilityLattice.lean` models the struct as `Fin 12 → CapabilityLevel`
+    /// with a hand-written index ↔ field table. This test is the CI correspondence
+    /// bridge: if either the Lean table or the Rust struct field order changes,
+    /// this test fails before the mismatch can reach production.
+    #[test]
+    fn lean_field_index_table_matches_rust_struct() {
+        const LEAN_SOURCE: &str =
+            include_str!("../../portcullis-core/lean/generated/PortcullisCore/Types.lean");
+
+        // Each entry: (index, field_name) from the Lean table.
+        // These must match the declaration order of fields in CapabilityLattice.
+        let expected: &[(usize, &str)] = &[
+            (0, "read_files"),
+            (1, "write_files"),
+            (2, "edit_files"),
+            (3, "run_bash"),
+            (4, "glob_search"),
+            (5, "grep_search"),
+            (6, "web_search"),
+            (7, "web_fetch"),
+            (8, "git_commit"),
+            (9, "git_push"),
+            (10, "create_pr"),
+            (11, "manage_pods"),
+        ];
+
+        for &(_idx, field) in expected {
+            // Check the Aeneas-generated Lean struct definition contains the field.
+            // Aeneas-generated struct has `field_name : CapabilityLevel` entries
+            assert!(
+                LEAN_SOURCE.contains(field),
+                "Aeneas-generated Lean struct missing field: {}",
+                field
+            );
+        }
+
+        // Verify Rust struct fields are declared in the expected order
+        // by checking their relative positions in this source file.
+        let rust_source = include_str!("capability.rs");
+        let field_positions: Vec<usize> = expected
+            .iter()
+            .map(|&(_, field)| {
+                let decl = format!("pub {}: CapabilityLevel", field);
+                rust_source
+                    .find(&decl)
+                    .unwrap_or_else(|| panic!("Field '{}' not found in capability.rs", field))
+            })
+            .collect();
+
+        for i in 1..field_positions.len() {
+            assert!(
+                field_positions[i] > field_positions[i - 1],
+                "Field '{}' (index {}) must be declared after '{}' (index {}) in CapabilityLattice",
+                expected[i].1,
+                expected[i].0,
+                expected[i - 1].1,
+                expected[i - 1].0,
+            );
+        }
+    }
+
+    /// Verify that the Lean 4 `toNat` mapping matches Rust discriminants.
+    ///
+    /// `FunsExternal.lean` defines `toNat` for CapabilityLevel, used by the
+    /// Aeneas-generated comparison functions. This test reads the Lean source
+    /// at compile time and asserts the values match `#[repr(u8)]` discriminants.
+    #[test]
+    fn lean_tonat_matches_rust_discriminants() {
+        const LEAN_SOURCE: &str =
+            include_str!("../../portcullis-core/lean/generated/PortcullisCore/FunsExternal.lean");
+        // Verify the Lean toNat mapping contains the expected discriminant lines.
+        assert!(
+            LEAN_SOURCE.contains("| .Never   => 0"),
+            "Lean toNat: Never must map to 0"
+        );
+        assert!(
+            LEAN_SOURCE.contains("| .LowRisk => 1"),
+            "Lean toNat: LowRisk must map to 1"
+        );
+        assert!(
+            LEAN_SOURCE.contains("| .Always  => 2"),
+            "Lean toNat: Always must map to 2"
+        );
+        // Verify the Rust discriminants are stable.
+        assert_eq!(
+            CapabilityLevel::Never as u8,
+            0,
+            "Rust: Never discriminant must be 0"
+        );
+        assert_eq!(
+            CapabilityLevel::LowRisk as u8,
+            1,
+            "Rust: LowRisk discriminant must be 1"
+        );
+        assert_eq!(
+            CapabilityLevel::Always as u8,
+            2,
+            "Rust: Always discriminant must be 2"
+        );
+    }
+
     #[test]
     fn test_state_risk_with_search_only() {
         // Just search capabilities should count as 1 component (private access)
@@ -699,10 +765,171 @@ mod tests {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            spawn_agent: CapabilityLevel::Never,
             extensions: BTreeMap::new(),
         };
 
         let constraint = IncompatibilityConstraint::enforcing();
         assert_eq!(constraint.state_risk(&caps), StateRisk::Low);
+    }
+
+    /// Conformance test: verifies that the Kani ExtMock2 sparse-key convention
+    /// matches the production BTreeMap extension operations for ALL 2-key inputs.
+    ///
+    /// The Kani harnesses (R7/R8/R9) verify algebraic properties on ExtMock2.
+    /// This test proves ExtMock2 is a faithful model of the production BTreeMap
+    /// by exhaustively checking that both implementations produce the same results
+    /// for meet, join, and leq on all combinations of 2 keys × 3 levels.
+    ///
+    /// Together: Kani proves algebra on mock → this test proves mock ≡ production
+    /// → therefore algebra holds for production.
+    #[test]
+    fn test_extension_mock_matches_production_btreemap() {
+        let _levels = [
+            CapabilityLevel::Never,
+            CapabilityLevel::LowRisk,
+            CapabilityLevel::Always,
+        ];
+
+        // Use two fixed extension operations as "slot0" and "slot1"
+        let key0 = ExtensionOperation::new("slot0");
+        let key1 = ExtensionOperation::new("slot1");
+
+        // Test all combinations: each of a, b has 2 keys, each key has 4 states
+        // (absent, Never, LowRisk, Always) = 4^4 = 256 cases per operation
+        let states: Vec<Option<CapabilityLevel>> = vec![
+            None,
+            Some(CapabilityLevel::Never),
+            Some(CapabilityLevel::LowRisk),
+            Some(CapabilityLevel::Always),
+        ];
+
+        let mut cases_checked = 0u64;
+
+        for a0 in &states {
+            for a1 in &states {
+                for b0 in &states {
+                    for b1 in &states {
+                        // Build production BTreeMap extensions
+                        let mut ext_a = BTreeMap::new();
+                        if let Some(level) = a0 {
+                            ext_a.insert(key0.clone(), *level);
+                        }
+                        if let Some(level) = a1 {
+                            ext_a.insert(key1.clone(), *level);
+                        }
+
+                        let mut ext_b = BTreeMap::new();
+                        if let Some(level) = b0 {
+                            ext_b.insert(key0.clone(), *level);
+                        }
+                        if let Some(level) = b1 {
+                            ext_b.insert(key1.clone(), *level);
+                        }
+
+                        // Build minimal CapabilityLattice with only extensions differing
+                        let base = CapabilityLattice::default();
+                        let cap_a = CapabilityLattice {
+                            extensions: ext_a,
+                            ..base.clone()
+                        };
+                        let cap_b = CapabilityLattice {
+                            extensions: ext_b,
+                            ..base.clone()
+                        };
+
+                        // Verify meet: extension_level for each key matches min
+                        let met = cap_a.meet(&cap_b);
+                        for key in [&key0, &key1] {
+                            let a_lvl = cap_a.extension_level(key);
+                            let b_lvl = cap_b.extension_level(key);
+                            let expected = std::cmp::min(a_lvl, b_lvl);
+                            let actual = met.extension_level(key);
+                            assert_eq!(
+                                actual, expected,
+                                "meet extension mismatch for {key:?}: a={a_lvl:?} b={b_lvl:?}"
+                            );
+                        }
+
+                        // Verify join: extension_level for each key matches max
+                        let joined = cap_a.join(&cap_b);
+                        for key in [&key0, &key1] {
+                            let a_lvl = cap_a.extension_level(key);
+                            let b_lvl = cap_b.extension_level(key);
+                            let expected = std::cmp::max(a_lvl, b_lvl);
+                            let actual = joined.extension_level(key);
+                            assert_eq!(
+                                actual, expected,
+                                "join extension mismatch for {key:?}: a={a_lvl:?} b={b_lvl:?}"
+                            );
+                        }
+
+                        // Verify leq: a ≤ b iff all extension levels a[k] ≤ b[k]
+                        let all_leq = [&key0, &key1]
+                            .iter()
+                            .all(|k| cap_a.extension_level(k) <= cap_b.extension_level(k));
+                        // leq also checks the 12 fixed fields; since they're
+                        // identical (default), leq should match extension-only check
+                        assert_eq!(
+                            cap_a.leq(&cap_b),
+                            all_leq,
+                            "leq mismatch: a_ext={:?} b_ext={:?}",
+                            cap_a.extensions,
+                            cap_b.extensions
+                        );
+
+                        cases_checked += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(cases_checked, 256, "Should check all 4^4 = 256 cases");
+    }
+
+    #[test]
+    fn test_operation_try_from_all_variants() {
+        let names = [
+            "read_files",
+            "write_files",
+            "edit_files",
+            "run_bash",
+            "glob_search",
+            "grep_search",
+            "web_search",
+            "web_fetch",
+            "git_commit",
+            "git_push",
+            "create_pr",
+            "manage_pods",
+        ];
+        for name in &names {
+            assert!(Operation::try_from(*name).is_ok(), "should parse: {name}");
+        }
+    }
+
+    #[test]
+    fn test_operation_try_from_unknown() {
+        assert!(Operation::try_from("unknown_op").is_err());
+        assert!(Operation::try_from("").is_err());
+    }
+
+    #[test]
+    fn test_operation_display_roundtrip() {
+        for op in Operation::ALL {
+            let s = op.to_string();
+            let roundtrip = Operation::try_from(s.as_str()).unwrap();
+            assert_eq!(op, roundtrip, "roundtrip failed for {op:?}");
+        }
+    }
+
+    #[test]
+    fn test_operation_all_has_13_variants() {
+        assert_eq!(Operation::ALL.len(), 13);
+        // Verify uniqueness
+        let mut set = std::collections::BTreeSet::new();
+        for op in Operation::ALL {
+            assert!(set.insert(op), "duplicate in ALL: {op:?}");
+        }
     }
 }

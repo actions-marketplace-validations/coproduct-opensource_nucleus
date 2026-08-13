@@ -21,7 +21,9 @@
 //! If no allowed hashes are specified but attestation is required, any valid
 //! attestation is accepted (useful for logging without enforcement).
 
-use nucleus_identity::LaunchAttestation;
+use ed25519_dalek::VerifyingKey;
+use nucleus_identity::{AssuranceLevel, LaunchAttestation, VerifiedAttestation};
+use portcullis::mediation_receipt::MediationReceipt;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -45,6 +47,13 @@ pub struct AttestationConfig {
     /// Set of allowed config hashes (SHA-256, hex-encoded).
     /// Empty means any config hash is allowed.
     pub allowed_config_hashes: HashSet<String>,
+    /// Minimum normalized assurance level a request's SVID must carry (North Star
+    /// C9). `L0Bearer` (the default) imposes no floor. A floor above `L0Bearer`
+    /// makes attestation effectively required and refuses any SVID whose verified
+    /// assurance is below it — fail-closed on absent/invalid evidence. Note a
+    /// `L2Device`+ floor refuses every SVID until the EK-manufacturer root lands
+    /// (residency alone is `L1Software`).
+    pub min_assurance: AssuranceLevel,
 }
 
 impl AttestationConfig {
@@ -85,6 +94,16 @@ impl AttestationConfig {
             if !hash.is_empty() {
                 self.allowed_config_hashes.insert(hash);
             }
+        }
+        self
+    }
+
+    /// Sets the minimum assurance floor. A floor above `L0Bearer` also makes
+    /// attestation required (a floor cannot be checked without a client cert).
+    pub fn with_min_assurance(mut self, level: AssuranceLevel) -> Self {
+        self.min_assurance = level;
+        if level > AssuranceLevel::L0Bearer {
+            self.require_attestation = true;
         }
         self
     }
@@ -343,6 +362,84 @@ impl AttestationVerifier {
     pub fn is_required(&self) -> bool {
         self.config.require_attestation
     }
+
+    /// Enforces the assurance floor (North Star C9) for a request whose launch
+    /// attestation already passed.
+    ///
+    /// The launch attestation establishes at most `L1Software`; TPM residency
+    /// evidence carried by the client certificate can raise the effective level,
+    /// and a present-but-invalid or replayed proof makes this err (fail-closed).
+    /// Returns `Err(reason)` when the SVID's verified assurance is below the floor.
+    /// A no-op (`Ok`) when the floor is `L0Bearer`.
+    pub fn enforce_floor(
+        &self,
+        client_cert_der: Option<&[u8]>,
+        attestation_result: &AttestationResult,
+    ) -> Result<(), String> {
+        let min = self.config.min_assurance;
+        if min <= AssuranceLevel::L0Bearer {
+            return Ok(());
+        }
+        let cert_der = client_cert_der
+            .ok_or_else(|| "assurance floor requires an mTLS client certificate".to_string())?;
+        let launch_verified =
+            attestation_result.attestation_present && attestation_result.matches_requirements;
+        let level = nucleus_identity::tpm_devid::effective_assurance(cert_der, launch_verified)
+            .map_err(|e| format!("residency evidence invalid: {e}"))?;
+        if level < min {
+            return Err(format!("assurance {level:?} below required floor {min:?}"));
+        }
+        Ok(())
+    }
+}
+
+/// Relying-party cross-check for a forensic [`MediationReceipt`] (North Star C9 /
+/// signed-agent-actions): verify the mediator's signature **and** that the
+/// receipt's self-claimed `{signer_assurance, signer_backend}` **exactly match** an
+/// independently-verified attestation of the signer's SVID.
+///
+/// This is what makes the receipt's self-claim non-load-bearing: a receipt is a
+/// perfectly valid signature over whatever assurance the signer *wrote*, so the
+/// claim is believed only when it equals the attestation a relying party derived
+/// itself (e.g. via [`effective_assurance`](nucleus_identity::tpm_devid::effective_assurance)
+/// over the signer's SVID). An inflated claim — an `L1Software` signer asserting
+/// `L2Device` / `apple-sep` — is rejected here, never trusted on the signer's word.
+///
+/// Returns the cross-checked assurance level. Fail-closed on any mismatch.
+///
+/// Not yet wired to a live path: emitting receipts on the mediation path (the
+/// tool-proxy issuing them with its own assurance) and invoking this from a
+/// relying party are follow bricks; this is the verified cross-check primitive.
+#[allow(dead_code)]
+pub fn verify_attested_receipt(
+    receipt: &MediationReceipt,
+    signer_pubkey: &VerifyingKey,
+    attestation: &VerifiedAttestation,
+) -> Result<AssuranceLevel, String> {
+    // 1. The signature must hold. Because `{signer_assurance, signer_backend}` are
+    //    in the signed preimage, a post-issue tamper of either breaks this.
+    receipt
+        .verify(signer_pubkey)
+        .map_err(|e| format!("receipt signature invalid: {e}"))?;
+
+    // 2. The self-claim must EQUAL the independently-verified attestation — the
+    //    load-bearing check. Backend first, then the assurance level.
+    if receipt.signer_backend != attestation.backend {
+        return Err(format!(
+            "signer backend claim {:?} does not match verified attestation backend {:?}",
+            receipt.signer_backend, attestation.backend
+        ));
+    }
+    if receipt.signer_assurance != attestation.assurance().as_u8() {
+        return Err(format!(
+            "signer assurance claim L{} does not match verified attestation L{} \
+             (inflated claim rejected)",
+            receipt.signer_assurance,
+            attestation.assurance().as_u8()
+        ));
+    }
+
+    Ok(attestation.assurance())
 }
 
 /// Extracts attestation from a DER-encoded X.509 certificate.
@@ -396,6 +493,61 @@ mod tests {
         assert!(!config.require_attestation);
         assert!(config.allowed_kernel_hashes.is_empty());
         assert!(config.allowed_rootfs_hashes.is_empty());
+        // No floor by default — existing deployments are unaffected.
+        assert_eq!(config.min_assurance, AssuranceLevel::L0Bearer);
+    }
+
+    #[test]
+    fn enforce_floor_admits_refuses_and_fails_closed() {
+        // Any DER works here: with no residency extension the effective assurance is
+        // exactly the launch base, so this exercises the floor RESULT mapping without
+        // TPM fixtures. (A garbage DER simply parses to "no residency" → base level.)
+        let dummy_cert = [0x30u8, 0x00];
+        let launch_ok = AttestationResult {
+            attestation_present: true,
+            attestation: None,
+            matches_requirements: true, // launch verified → base L1Software
+            rejection_reason: None,
+        };
+        let bearer = AttestationResult {
+            attestation_present: false,
+            attestation: None,
+            matches_requirements: false, // no launch → base L0Bearer
+            rejection_reason: None,
+        };
+
+        // No floor → always Ok, even without a client cert.
+        let v0 = AttestationVerifier::new(AttestationConfig::default());
+        assert!(v0.enforce_floor(None, &bearer).is_ok());
+
+        // L1 floor: a launch-verified SVID is admitted; a bare bearer is refused.
+        let v1 = AttestationVerifier::new(
+            AttestationConfig::default().with_min_assurance(AssuranceLevel::L1Software),
+        );
+        assert!(v1.enforce_floor(Some(&dummy_cert), &launch_ok).is_ok());
+        assert!(v1.enforce_floor(Some(&dummy_cert), &bearer).is_err());
+        // A floor with no client certificate fails closed.
+        assert!(v1.enforce_floor(None, &launch_ok).is_err());
+
+        // L2 floor refuses even a launch-verified SVID: residency-only tops out at
+        // L1Software until the EK-manufacturer root lands (never over-admits L2).
+        let v2 = AttestationVerifier::new(
+            AttestationConfig::default().with_min_assurance(AssuranceLevel::L2Device),
+        );
+        assert!(v2.enforce_floor(Some(&dummy_cert), &launch_ok).is_err());
+    }
+
+    #[test]
+    fn test_min_assurance_floor_implies_required() {
+        // A floor above L0 makes attestation required (can't check a floor without
+        // a client cert); an L0 floor leaves require_attestation untouched.
+        let floored = AttestationConfig::default().with_min_assurance(AssuranceLevel::L2Device);
+        assert_eq!(floored.min_assurance, AssuranceLevel::L2Device);
+        assert!(floored.require_attestation);
+
+        let no_floor = AttestationConfig::default().with_min_assurance(AssuranceLevel::L0Bearer);
+        assert_eq!(no_floor.min_assurance, AssuranceLevel::L0Bearer);
+        assert!(!no_floor.require_attestation);
     }
 
     #[test]
@@ -524,5 +676,102 @@ mod tests {
         assert_eq!(info.kernel_hash, "11".repeat(32));
         assert_eq!(info.rootfs_hash, "22".repeat(32));
         assert_eq!(info.config_hash, "33".repeat(32));
+    }
+
+    // ── Forensic receipt cross-check (signed-agent-actions brick 2) ────────────
+    use ed25519_dalek::{Signer, SigningKey};
+    use nucleus_identity::AttestedSubject;
+    use portcullis::mediation_receipt::MEDIATION_RECEIPT_SCHEMA_VERSION;
+    use std::collections::BTreeSet;
+
+    /// A validly-signed receipt whose signer self-claims `{assurance, backend}`.
+    fn signed_receipt(sk: &SigningKey, assurance: u8, backend: &str) -> MediationReceipt {
+        let mut r = MediationReceipt {
+            schema_version: MEDIATION_RECEIPT_SCHEMA_VERSION,
+            mediator_spiffe_id: "spiffe://demo/proxy".into(),
+            session_id: "sess-1".into(),
+            decision_seq: 1,
+            operation: "read_file".into(),
+            subject: "/etc/hosts".into(),
+            verdict: "allow".into(),
+            art12_record_hash: "abc".into(),
+            signer_assurance: assurance,
+            signer_backend: backend.into(),
+            signature: String::new(),
+        };
+        r.signature = hex::encode(sk.sign(&r.preimage()).to_bytes());
+        r
+    }
+
+    /// An independently-verified attestation — what a relying party derives itself.
+    fn att(backend: &'static str, level: AssuranceLevel) -> VerifiedAttestation {
+        VerifiedAttestation {
+            backend,
+            assurance: level,
+            subject: AttestedSubject::SelfMeasuredNode,
+            proves: BTreeSet::new(),
+            not_proven: BTreeSet::new(),
+            launch: None,
+        }
+    }
+
+    #[test]
+    fn attested_receipt_admits_when_claim_matches_the_verified_attestation() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let r = signed_receipt(&sk, 1, "self-measured");
+        let level = verify_attested_receipt(
+            &r,
+            &sk.verifying_key(),
+            &att("self-measured", AssuranceLevel::L1Software),
+        )
+        .expect("a matching claim is admitted");
+        assert_eq!(level, AssuranceLevel::L1Software);
+    }
+
+    /// THE load-bearing test: a validly-signed receipt inflating its assurance (an
+    /// L1 signer claiming L2Device, same backend) is REJECTED against the real L1
+    /// attestation — the self-claim is never believed on the signer's own word.
+    /// Reverting the assurance cross-check turns this green.
+    #[test]
+    fn attested_receipt_rejects_an_inflated_assurance_claim() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let inflated = signed_receipt(&sk, 2, "self-measured"); // signs a claim of L2Device
+        let err = verify_attested_receipt(
+            &inflated,
+            &sk.verifying_key(),
+            &att("self-measured", AssuranceLevel::L1Software),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("assurance") && err.contains("inflated"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn attested_receipt_rejects_a_backend_mismatch() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let r = signed_receipt(&sk, 1, "apple-sep"); // claims a hardware backend it isn't
+        let err = verify_attested_receipt(
+            &r,
+            &sk.verifying_key(),
+            &att("self-measured", AssuranceLevel::L1Software),
+        )
+        .unwrap_err();
+        assert!(err.contains("backend"), "{err}");
+    }
+
+    #[test]
+    fn attested_receipt_rejects_a_wrong_signer_key() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let r = signed_receipt(&sk, 1, "self-measured");
+        let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let err = verify_attested_receipt(
+            &r,
+            &other,
+            &att("self-measured", AssuranceLevel::L1Software),
+        )
+        .unwrap_err();
+        assert!(err.contains("signature"), "{err}");
     }
 }

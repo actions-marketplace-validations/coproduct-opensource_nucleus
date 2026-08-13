@@ -1,0 +1,1201 @@
+//! Declassification rules — controlled, auditable label downgrading.
+//!
+//! Labels are monotone by default: once data is tainted, the taint cannot
+//! be removed. Declassification provides a controlled exception: specific
+//! label dimensions can be downgraded under explicit, auditable conditions.
+//!
+//! # Trust model
+//!
+//! Declassification rules are policy-level declarations, not runtime escapes.
+//! They must be declared before the session starts and cannot be added later
+//! (monotonicity of the rule set). Each declassification produces an audit
+//! entry recording what was downgraded, from what, to what, and why.
+//!
+//! # Example
+//!
+//! A web search tool returns public results. The results are web-sourced
+//! (Adversarial integrity, NoAuthority) but the tool operator has verified
+//! that the search API only returns curated content. A declassification
+//! rule can upgrade integrity from Adversarial to Untrusted for output
+//! from this specific tool.
+
+use crate::flow::NodeId;
+use crate::{AuthorityLevel, ConfLevel, IFCLabel, IntegLevel, Operation};
+
+/// A declassification rule — permits controlled label downgrading.
+///
+/// Each rule specifies:
+/// - Which dimension to modify
+/// - What the source level must be (precondition)
+/// - What the target level becomes (postcondition)
+/// - A human-readable justification (for audit)
+///
+/// Rules are checked against the CURRENT label. If the precondition
+/// matches, the label is modified. If not, the rule has no effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeclassificationRule {
+    /// What dimension and direction to modify.
+    pub action: DeclassifyAction,
+    /// Human-readable justification for this declassification.
+    /// Included in audit records. `String` (not `&'static str`) because a
+    /// governor supplies it at runtime over the declassification wire and it
+    /// is part of the signed `canonical_bytes`.
+    pub justification: String,
+}
+
+/// The specific label modification a declassification performs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DeclassifyAction {
+    /// Lower confidentiality (e.g., Secret → Internal for sanitized output).
+    /// Precondition: label.confidentiality >= from.
+    LowerConfidentiality { from: ConfLevel, to: ConfLevel },
+    /// Raise integrity (e.g., Adversarial → Untrusted for validated input).
+    /// Precondition: label.integrity <= from.
+    RaiseIntegrity { from: IntegLevel, to: IntegLevel },
+    /// Raise authority (e.g., NoAuthority → Informational for curated content).
+    /// Precondition: label.authority <= from.
+    RaiseAuthority {
+        from: AuthorityLevel,
+        to: AuthorityLevel,
+    },
+}
+
+/// Result of applying a declassification rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclassifyResult {
+    /// The label after declassification (unchanged if precondition didn't match).
+    pub label: IFCLabel,
+    /// Whether the rule was actually applied.
+    pub applied: bool,
+    /// The rule that was checked.
+    pub rule: DeclassificationRule,
+    /// Label before declassification (for audit).
+    pub original: IFCLabel,
+}
+
+impl DeclassificationRule {
+    /// Apply this rule to a label. Returns the modified label and audit info.
+    ///
+    /// The rule only fires if the precondition matches. If not, the label
+    /// is returned unchanged with `applied: false`.
+    pub fn apply(&self, label: IFCLabel) -> DeclassifyResult {
+        let original = label;
+        let mut modified = label;
+        let applied = match &self.action {
+            DeclassifyAction::LowerConfidentiality { from, to } => {
+                if modified.confidentiality >= *from && to < from {
+                    modified.confidentiality = *to;
+                    true
+                } else {
+                    false
+                }
+            }
+            DeclassifyAction::RaiseIntegrity { from, to } => {
+                if modified.integrity <= *from && to > from {
+                    modified.integrity = *to;
+                    true
+                } else {
+                    false
+                }
+            }
+            DeclassifyAction::RaiseAuthority { from, to } => {
+                if modified.authority <= *from && to > from {
+                    modified.authority = *to;
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        DeclassifyResult {
+            label: modified,
+            applied,
+            rule: self.clone(),
+            original,
+        }
+    }
+}
+
+/// A scoped, time-bounded, signed declassification token.
+///
+/// Unlike `DeclassificationRule` (which applies to any matching label),
+/// a token targets a specific flow graph node and restricts which sinks
+/// the declassified data may reach. Tokens are signed with the session's
+/// Ed25519 key for tamper detection.
+///
+/// # Security properties
+///
+/// - **Artifact-scoped**: Only applies to `target_node_id`, not the whole session
+/// - **Time-bounded**: Expires at `valid_until` (unix timestamp)
+/// - **Sink-restricted**: the declassified node contributes its released label
+///   only to operations in `allowed_sinks`; every other operation keeps seeing
+///   the strict label (enforced in `FlowGraph` via a per-node declass scope —
+///   the node's stored label is never mutated)
+/// - **Signed**: Ed25519 signature over the token's canonical bytes
+/// - **Auditable**: Justification string included for receipt chain
+///
+/// # How the sink restriction is enforced
+///
+/// `allowed_sinks` is signed (count-prefixed into [`Self::canonical_bytes`]
+/// under the `nucleus-declass-v2` domain tag) and compiled to a bit mask by
+/// [`Self::sink_mask`]. `FlowGraph::apply_token` records a
+/// `DeclassScope { released_label, sink_mask }` for the target node instead of
+/// modifying its label; flow verdicts are computed over the *effective* label —
+/// released inside the mask, strict outside — via the extracted decision
+/// functions in `nucleus-ifc-kernel::extracted::declassify`
+/// (`mask_admits` / `effective_conf` / `declass_release_ok`), whose parity with
+/// [`Self::allows_sink`] is checked exhaustively over the whole 2^13 × 13
+/// domain below. A token scoped `allowed_sinks = [WebSearch]` therefore clears
+/// its node for `WebSearch` and nothing else.
+///
+/// The signed-token path is LIVE: the governor endpoint
+/// `POST /v1/declassify` (nucleus-tool-proxy `declassify.rs`) applies tokens
+/// via `Kernel::apply_declassification_token`, which verifies the Ed25519
+/// signature against the trusted governor keys and is fail-closed with none
+/// configured. `scripts/check-declassify-sink-scope-enforced.sh` asserts the
+/// scope is enforced (replacing the former dormancy gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeclassificationToken {
+    /// The flow graph node this token applies to.
+    pub target_node_id: NodeId,
+    /// The label transformation to apply.
+    pub rule: DeclassificationRule,
+    /// Operations that the declassified node may reach.
+    /// Empty = no sinks allowed (effectively a no-op).
+    pub allowed_sinks: Vec<Operation>,
+    /// Unix timestamp after which this token is invalid.
+    pub valid_until: u64,
+    /// Human-readable justification (included in receipts).
+    pub justification: String,
+    /// SHA-256 commitment to the exact content the token authorizes releasing —
+    /// the bytes the governor reviewed. Bound into the signed
+    /// [`Self::canonical_bytes`] (v3) so a token is valid ONLY for the value it
+    /// was minted over: at apply time the target node's recorded ingest content
+    /// hash must equal this, or the release is refused. This closes the
+    /// value-steering vector — where an adversary arranges for the node to hold a
+    /// different value than the one the governor signed for — which the
+    /// sink-scope binding (the *where*) does not address (the *which value*).
+    ///
+    /// `[0u8; 32]` (the [`Self::new`] default) means "no value binding": a legacy
+    /// or unbound token, which the value-binding apply check refuses. A hex
+    /// string on the wire, like the signature — a 32-byte array is a cleaner
+    /// commitment than a 32-element JSON number list for the governor endpoint.
+    #[cfg_attr(feature = "serde", serde(default, with = "commitment_hex"))]
+    pub content_commitment: [u8; 32],
+    /// Ed25519 signature over the token's canonical form.
+    /// Zero-filled if unsigned (for testing).
+    ///
+    /// Serialized as a 128-char lowercase hex string (serde does not derive
+    /// arrays larger than 32; a hex string is also a cleaner wire form than a
+    /// 64-element JSON array for the governor endpoint).
+    #[cfg_attr(feature = "serde", serde(with = "signature_hex"))]
+    pub signature: [u8; 64],
+}
+
+/// serde adapter for the 64-byte Ed25519 signature ↔ lowercase hex string.
+/// Dependency-free; only compiled with the `serde` feature.
+#[cfg(feature = "serde")]
+mod signature_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(sig: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        let mut hex = String::with_capacity(128);
+        for b in sig {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        s.serialize_str(&hex)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let s = String::deserialize(d)?;
+        if s.len() != 128 {
+            return Err(serde::de::Error::custom(
+                "signature must be exactly 128 hex chars (64 bytes)",
+            ));
+        }
+        let mut out = [0u8; 64];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte =
+                u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(serde::de::Error::custom)?;
+        }
+        Ok(out)
+    }
+}
+
+/// serde adapter for the 32-byte content commitment ↔ lowercase hex string,
+/// mirroring [`signature_hex`]. A hex string is a cleaner wire form for the
+/// governor endpoint than a 32-element JSON number array.
+#[cfg(feature = "serde")]
+mod commitment_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        let mut hex = String::with_capacity(64);
+        for b in bytes {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        s.serialize_str(&hex)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        if s.len() != 64 {
+            return Err(serde::de::Error::custom(
+                "content_commitment must be exactly 64 hex chars (32 bytes)",
+            ));
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte =
+                u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(serde::de::Error::custom)?;
+        }
+        Ok(out)
+    }
+}
+
+/// Result of attempting to apply a declassification token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenApplyResult {
+    /// Token applied successfully — label was modified.
+    Applied {
+        original_label: IFCLabel,
+        new_label: IFCLabel,
+    },
+    /// Token's target node was not found in the graph.
+    NodeNotFound,
+    /// The target node already carries a declassification scope. A node is
+    /// declassified at most once; a second token — including a differently
+    /// scoped one — is refused, and (like every refusal) does not burn.
+    AlreadyDeclassified,
+    /// Token has expired (now > valid_until).
+    Expired { valid_until: u64, now: u64 },
+    /// The underlying rule's precondition didn't match the node's label.
+    PreconditionUnmet,
+    /// Ed25519 signature is missing (all zeros) or failed verification.
+    InvalidSignature,
+    /// **Value binding (Phase 3).** The release was refused because it does not
+    /// name the specific value the governor committed to: either the token is
+    /// UNBOUND (`content_commitment == [0u8; 32]`), the target node has NO
+    /// monitor-recorded content hash, or the recorded hash does not EQUAL the
+    /// token's `content_commitment`. Like every refusal this does NOT burn the
+    /// one-shot token — an adversary substituting a different value into the
+    /// node cannot ride the governor's signature, and a legitimate value put in
+    /// place later still applies. This is what denies steering WHICH value a
+    /// signed release clears (C5).
+    ContentMismatch,
+}
+
+impl DeclassificationToken {
+    /// Create a new unsigned token (for testing or when signing is deferred).
+    pub fn new(
+        target_node_id: NodeId,
+        rule: DeclassificationRule,
+        allowed_sinks: Vec<Operation>,
+        valid_until: u64,
+        justification: String,
+    ) -> Self {
+        Self {
+            target_node_id,
+            rule,
+            allowed_sinks,
+            valid_until,
+            justification,
+            content_commitment: [0u8; 32],
+            signature: [0u8; 64],
+        }
+    }
+
+    /// Bind this token to a content commitment — the SHA-256 of the exact bytes
+    /// the governor authorizes releasing. Required for a value-bound release: the
+    /// apply-time check refuses a token whose commitment does not equal the
+    /// target node's recorded ingest content hash. Must be set BEFORE signing,
+    /// since the commitment is part of [`Self::canonical_bytes`].
+    #[must_use]
+    pub fn with_content_commitment(mut self, commitment: [u8; 32]) -> Self {
+        self.content_commitment = commitment;
+        self
+    }
+
+    /// The content commitment (SHA-256 of the authorized value), or all-zeros if
+    /// the token is unbound.
+    pub fn content_commitment(&self) -> [u8; 32] {
+        self.content_commitment
+    }
+
+    /// Whether the token carries a value binding (a non-zero content commitment).
+    pub fn is_value_bound(&self) -> bool {
+        self.content_commitment != [0u8; 32]
+    }
+
+    /// Check if the token has been signed (signature is not all zeros).
+    pub fn is_signed(&self) -> bool {
+        self.signature != [0u8; 64]
+    }
+
+    /// Set the signature bytes (called by the signing layer).
+    pub fn set_signature(&mut self, sig: [u8; 64]) {
+        self.signature = sig;
+    }
+
+    /// Check if the token has expired.
+    pub fn is_expired(&self, now: u64) -> bool {
+        now > self.valid_until
+    }
+
+    /// Check if a sink operation is allowed by this token.
+    pub fn allows_sink(&self, op: Operation) -> bool {
+        self.allowed_sinks.contains(&op)
+    }
+
+    /// The signed sink list compiled to a bit mask (`1 << discriminant` per
+    /// operation) — the form the `FlowGraph`'s declass-scope machinery and
+    /// the extracted decision functions
+    /// (`nucleus-ifc-kernel::extracted::declassify::mask_admits`) consume.
+    ///
+    /// Equivalence with [`Self::allows_sink`] is checked exhaustively over
+    /// the whole 2^13 × 13 domain in this file's tests.
+    pub fn sink_mask(&self) -> u16 {
+        let mut mask = 0u16;
+        for op in &self.allowed_sinks {
+            mask |= 1u16 << (*op as u8);
+        }
+        mask
+    }
+
+    /// The canonical bytes for signing.
+    ///
+    /// **Encoding (v3)**: All variable-length fields are length-prefixed with
+    /// a 4-byte little-endian u32 count, eliminating the ambiguous
+    /// concatenation from v1. The format is:
+    ///
+    /// ```text
+    /// b"nucleus-declass-v3\n"      // 19-byte version tag
+    /// target_node_id: u64 LE       // 8 bytes
+    /// valid_until: u64 LE          // 8 bytes
+    /// content_commitment: [u8; 32] // 32 bytes — SHA-256 of the authorized value
+    /// action_discriminant: u8      // 1 byte (0=LowerConf, 1=RaiseInteg, 2=RaiseAuth)
+    /// action_from: u8              // 1 byte
+    /// action_to: u8                // 1 byte
+    /// rule_justification_len: u32 LE
+    /// rule_justification: [u8]
+    /// allowed_sinks_count: u32 LE  // number of sink entries
+    /// allowed_sinks: [u8]          // one byte per Operation variant
+    /// justification_len: u32 LE
+    /// justification: [u8]
+    /// ```
+    ///
+    /// **Breaking change**: v3 adds the `content_commitment` (fixed 32 bytes,
+    /// right after `valid_until`) so the value binding is signed. Signatures
+    /// produced under v2 (which lacked it) will not verify against v3 canonical
+    /// bytes — exactly as v2 broke v1's bare-`0xFF`-separator encoding.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Version tag — domain separation for this encoding format
+        buf.extend_from_slice(b"nucleus-declass-v3\n");
+
+        // Fixed-size fields
+        buf.extend_from_slice(&self.target_node_id.to_le_bytes());
+        buf.extend_from_slice(&self.valid_until.to_le_bytes());
+
+        // The value binding — the SHA-256 the governor committed to. Signed as a
+        // fixed 32-byte field so a token authorizes exactly one value; the apply
+        // check compares it to the target node's recorded ingest content hash.
+        buf.extend_from_slice(&self.content_commitment);
+
+        // Encode rule action discriminant + fields
+        match &self.rule.action {
+            DeclassifyAction::LowerConfidentiality { from, to } => {
+                buf.push(0);
+                buf.push(*from as u8);
+                buf.push(*to as u8);
+            }
+            DeclassifyAction::RaiseIntegrity { from, to } => {
+                buf.push(1);
+                buf.push(*from as u8);
+                buf.push(*to as u8);
+            }
+            DeclassifyAction::RaiseAuthority { from, to } => {
+                buf.push(2);
+                buf.push(*from as u8);
+                buf.push(*to as u8);
+            }
+        }
+
+        // Rule justification (length-prefixed)
+        let rule_just = self.rule.justification.as_bytes();
+        buf.extend_from_slice(&(rule_just.len() as u32).to_le_bytes());
+        buf.extend_from_slice(rule_just);
+
+        // Allowed sinks (count-prefixed)
+        buf.extend_from_slice(&(self.allowed_sinks.len() as u32).to_le_bytes());
+        for op in &self.allowed_sinks {
+            buf.push(*op as u8);
+        }
+
+        // Token justification (length-prefixed)
+        let just = self.justification.as_bytes();
+        buf.extend_from_slice(&(just.len() as u32).to_le_bytes());
+        buf.extend_from_slice(just);
+
+        buf
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Kani BMC harnesses — declassification safety properties
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(kani)]
+mod kani_declassify_proofs {
+    use super::*;
+    use crate::{Freshness, ProvenanceSet};
+
+    /// Generate a symbolic ConfLevel.
+    fn any_conf() -> ConfLevel {
+        let v: u8 = kani::any();
+        kani::assume(v <= 2);
+        match v {
+            0 => ConfLevel::Public,
+            1 => ConfLevel::Internal,
+            _ => ConfLevel::Secret,
+        }
+    }
+
+    /// Generate a symbolic IntegLevel.
+    fn any_integ() -> IntegLevel {
+        let v: u8 = kani::any();
+        kani::assume(v <= 2);
+        match v {
+            0 => IntegLevel::Adversarial,
+            1 => IntegLevel::Untrusted,
+            _ => IntegLevel::Trusted,
+        }
+    }
+
+    /// Generate a symbolic AuthorityLevel.
+    fn any_auth() -> AuthorityLevel {
+        let v: u8 = kani::any();
+        kani::assume(v <= 3);
+        match v {
+            0 => AuthorityLevel::NoAuthority,
+            1 => AuthorityLevel::Informational,
+            2 => AuthorityLevel::Suggestive,
+            _ => AuthorityLevel::Directive,
+        }
+    }
+
+    /// Generate a symbolic DerivationClass.
+    fn any_derivation() -> crate::DerivationClass {
+        let v: u8 = kani::any();
+        kani::assume(v <= 4);
+        match v {
+            0 => crate::DerivationClass::Deterministic,
+            1 => crate::DerivationClass::AIDerived,
+            2 => crate::DerivationClass::Mixed,
+            3 => crate::DerivationClass::HumanPromoted,
+            _ => crate::DerivationClass::OpaqueExternal,
+        }
+    }
+
+    /// Generate a symbolic IFCLabel.
+    fn any_label() -> IFCLabel {
+        IFCLabel {
+            confidentiality: any_conf(),
+            integrity: any_integ(),
+            provenance: ProvenanceSet::from_bits(kani::any::<u8>()),
+            freshness: Freshness {
+                observed_at: kani::any(),
+                ttl_secs: kani::any(),
+            },
+            authority: any_auth(),
+            derivation: any_derivation(),
+        }
+    }
+
+    /// **D1 — Declassification can only lower confidentiality or raise integrity/authority.**
+    ///
+    /// For any symbolic label and any declassification rule: the resulting label
+    /// never has HIGHER confidentiality, LOWER integrity, or LOWER authority
+    /// than the original. Provenance and freshness are never modified.
+    ///
+    /// This is the core safety property: declassification can only weaken
+    /// restrictions (lower conf) or strengthen guarantees (raise integ/auth),
+    /// never the reverse.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn proof_declassification_only_weakens_restrictions() {
+        let label = any_label();
+        let from_conf = any_conf();
+        let to_conf = any_conf();
+        let from_integ = any_integ();
+        let to_integ = any_integ();
+        let from_auth = any_auth();
+        let to_auth = any_auth();
+
+        // Test all three action kinds via symbolic choice
+        let action_kind: u8 = kani::any();
+        kani::assume(action_kind <= 2);
+
+        let rule = match action_kind {
+            0 => DeclassificationRule {
+                action: DeclassifyAction::LowerConfidentiality {
+                    from: from_conf,
+                    to: to_conf,
+                },
+                justification: "kani".to_string(),
+            },
+            1 => DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: from_integ,
+                    to: to_integ,
+                },
+                justification: "kani".to_string(),
+            },
+            _ => DeclassificationRule {
+                action: DeclassifyAction::RaiseAuthority {
+                    from: from_auth,
+                    to: to_auth,
+                },
+                justification: "kani".to_string(),
+            },
+        };
+
+        let result = rule.apply(label);
+
+        // Confidentiality can only decrease or stay the same
+        assert!(result.label.confidentiality <= label.confidentiality);
+        // Integrity can only increase or stay the same
+        assert!(result.label.integrity >= label.integrity);
+        // Authority can only increase or stay the same
+        assert!(result.label.authority >= label.authority);
+        // Provenance is never modified
+        assert_eq!(result.label.provenance.bits(), label.provenance.bits());
+        // Freshness is never modified
+        assert_eq!(
+            result.label.freshness.observed_at,
+            label.freshness.observed_at
+        );
+        assert_eq!(result.label.freshness.ttl_secs, label.freshness.ttl_secs);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Rate-limited declassification (#962)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Sliding-window rate limiter for declassification rules (#962).
+///
+/// Prevents slow exfiltration attacks where a compromised agent repeatedly
+/// triggers legitimate declassification rules to leak data through many
+/// small declassifications.
+#[derive(Debug, Clone)]
+pub struct DeclassifyRateLimiter {
+    /// Maximum declassifications allowed in the window.
+    pub max_per_window: u32,
+    /// Window duration in seconds.
+    pub window_secs: u64,
+    /// Timestamps of recent declassifications (unix seconds).
+    events: Vec<u64>,
+}
+
+/// Rate limit exceeded error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitExceeded {
+    /// Number of declassifications in the current window.
+    pub count: u32,
+    /// Maximum allowed.
+    pub max: u32,
+    /// Window duration.
+    pub window_secs: u64,
+}
+
+impl std::fmt::Display for RateLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "declassification rate limit exceeded: {} in {}s (max: {})",
+            self.count, self.window_secs, self.max
+        )
+    }
+}
+
+impl std::error::Error for RateLimitExceeded {}
+
+impl DeclassifyRateLimiter {
+    /// Create a new rate limiter.
+    pub fn new(max_per_window: u32, window_secs: u64) -> Self {
+        Self {
+            max_per_window,
+            window_secs,
+            events: Vec::new(),
+        }
+    }
+
+    /// Check if a declassification is allowed, and record it if so.
+    ///
+    /// Returns `Ok(())` if under the limit, `Err(RateLimitExceeded)` if not.
+    pub fn check_and_record(&mut self, now: u64) -> Result<(), RateLimitExceeded> {
+        // Evict events outside the window.
+        let cutoff = now.saturating_sub(self.window_secs);
+        self.events.retain(|&t| t >= cutoff);
+
+        if self.events.len() as u32 >= self.max_per_window {
+            return Err(RateLimitExceeded {
+                count: self.events.len() as u32,
+                max: self.max_per_window,
+                window_secs: self.window_secs,
+            });
+        }
+
+        self.events.push(now);
+        Ok(())
+    }
+
+    /// Number of declassifications in the current window.
+    pub fn current_count(&self, now: u64) -> u32 {
+        let cutoff = now.saturating_sub(self.window_secs);
+        self.events.iter().filter(|&&t| t >= cutoff).count() as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Freshness, ProvenanceSet};
+
+    fn web_label() -> IFCLabel {
+        IFCLabel {
+            confidentiality: ConfLevel::Public,
+            integrity: IntegLevel::Adversarial,
+            provenance: ProvenanceSet::WEB,
+            freshness: Freshness {
+                observed_at: 1000,
+                ttl_secs: 0,
+            },
+            authority: AuthorityLevel::NoAuthority,
+            derivation: crate::DerivationClass::OpaqueExternal,
+        }
+    }
+
+    fn secret_label() -> IFCLabel {
+        IFCLabel {
+            confidentiality: ConfLevel::Secret,
+            integrity: IntegLevel::Trusted,
+            provenance: ProvenanceSet::SYSTEM,
+            freshness: Freshness {
+                observed_at: 1000,
+                ttl_secs: 0,
+            },
+            authority: AuthorityLevel::Directive,
+            derivation: crate::DerivationClass::Deterministic,
+        }
+    }
+
+    #[test]
+    fn raise_integrity_for_validated_input() {
+        let rule = DeclassificationRule {
+            action: DeclassifyAction::RaiseIntegrity {
+                from: IntegLevel::Adversarial,
+                to: IntegLevel::Untrusted,
+            },
+            justification: "Search API returns curated content".to_string(),
+        };
+        let result = rule.apply(web_label());
+        assert!(result.applied);
+        assert_eq!(result.label.integrity, IntegLevel::Untrusted);
+        // Other dimensions unchanged
+        assert_eq!(result.label.authority, AuthorityLevel::NoAuthority);
+        assert_eq!(result.label.confidentiality, ConfLevel::Public);
+    }
+
+    #[test]
+    fn raise_authority_for_curated_content() {
+        let rule = DeclassificationRule {
+            action: DeclassifyAction::RaiseAuthority {
+                from: AuthorityLevel::NoAuthority,
+                to: AuthorityLevel::Informational,
+            },
+            justification: "Tool output is informational only".to_string(),
+        };
+        let result = rule.apply(web_label());
+        assert!(result.applied);
+        assert_eq!(result.label.authority, AuthorityLevel::Informational);
+    }
+
+    #[test]
+    fn lower_confidentiality_for_sanitized_output() {
+        let rule = DeclassificationRule {
+            action: DeclassifyAction::LowerConfidentiality {
+                from: ConfLevel::Secret,
+                to: ConfLevel::Internal,
+            },
+            justification: "Output sanitized by redaction filter".to_string(),
+        };
+        let result = rule.apply(secret_label());
+        assert!(result.applied);
+        assert_eq!(result.label.confidentiality, ConfLevel::Internal);
+    }
+
+    #[test]
+    fn rule_does_not_fire_if_precondition_unmet() {
+        let rule = DeclassificationRule {
+            action: DeclassifyAction::RaiseIntegrity {
+                from: IntegLevel::Adversarial,
+                to: IntegLevel::Untrusted,
+            },
+            justification: "N/A".to_string(),
+        };
+        // Label already has Trusted integrity — precondition (<=Adversarial) doesn't match
+        let result = rule.apply(secret_label());
+        assert!(!result.applied);
+        assert_eq!(result.label, secret_label());
+    }
+
+    #[test]
+    fn cannot_raise_beyond_target() {
+        // Rule says Adversarial → Untrusted, not Adversarial → Trusted
+        let rule = DeclassificationRule {
+            action: DeclassifyAction::RaiseIntegrity {
+                from: IntegLevel::Adversarial,
+                to: IntegLevel::Untrusted,
+            },
+            justification: "Partial trust".to_string(),
+        };
+        let result = rule.apply(web_label());
+        assert!(result.applied);
+        assert_eq!(
+            result.label.integrity,
+            IntegLevel::Untrusted,
+            "Must not exceed target"
+        );
+    }
+
+    #[test]
+    fn cannot_lower_below_target() {
+        let rule = DeclassificationRule {
+            action: DeclassifyAction::LowerConfidentiality {
+                from: ConfLevel::Secret,
+                to: ConfLevel::Internal,
+            },
+            justification: "Sanitized".to_string(),
+        };
+        let result = rule.apply(secret_label());
+        assert!(result.applied);
+        assert_eq!(
+            result.label.confidentiality,
+            ConfLevel::Internal,
+            "Must not go below target"
+        );
+    }
+
+    #[test]
+    fn audit_trail_preserved() {
+        let rule = DeclassificationRule {
+            action: DeclassifyAction::RaiseAuthority {
+                from: AuthorityLevel::NoAuthority,
+                to: AuthorityLevel::Informational,
+            },
+            justification: "Curated search results".to_string(),
+        };
+        let original = web_label();
+        let result = rule.apply(original);
+        assert_eq!(result.original, original);
+        assert_eq!(result.rule.justification, "Curated search results");
+    }
+
+    // ── DeclassificationToken tests ──────────────────────────────────
+
+    #[test]
+    fn token_expiry() {
+        let token = DeclassificationToken::new(
+            42,
+            DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: IntegLevel::Adversarial,
+                    to: IntegLevel::Untrusted,
+                },
+                justification: "test".to_string(),
+            },
+            vec![Operation::WriteFiles],
+            1000,
+            "test justification".to_string(),
+        );
+        assert!(!token.is_expired(999));
+        assert!(!token.is_expired(1000));
+        assert!(token.is_expired(1001));
+    }
+
+    #[test]
+    fn token_sink_restriction() {
+        let token = DeclassificationToken::new(
+            42,
+            DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: IntegLevel::Adversarial,
+                    to: IntegLevel::Untrusted,
+                },
+                justification: "test".to_string(),
+            },
+            vec![Operation::WriteFiles, Operation::GitCommit],
+            u64::MAX,
+            "allow write and commit only".to_string(),
+        );
+        assert!(token.allows_sink(Operation::WriteFiles));
+        assert!(token.allows_sink(Operation::GitCommit));
+        assert!(!token.allows_sink(Operation::GitPush));
+        assert!(!token.allows_sink(Operation::RunBash));
+    }
+
+    #[test]
+    fn token_empty_sinks_allows_nothing() {
+        let token = DeclassificationToken::new(
+            42,
+            DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: IntegLevel::Adversarial,
+                    to: IntegLevel::Untrusted,
+                },
+                justification: "test".to_string(),
+            },
+            vec![],
+            u64::MAX,
+            "no sinks allowed".to_string(),
+        );
+        assert!(!token.allows_sink(Operation::WriteFiles));
+        assert!(!token.allows_sink(Operation::RunBash));
+    }
+
+    #[test]
+    fn token_canonical_bytes_deterministic() {
+        let token = DeclassificationToken::new(
+            42,
+            DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: IntegLevel::Adversarial,
+                    to: IntegLevel::Untrusted,
+                },
+                justification: "test".to_string(),
+            },
+            vec![Operation::WriteFiles],
+            1000,
+            "justification".to_string(),
+        );
+        let bytes1 = token.canonical_bytes();
+        let bytes2 = token.canonical_bytes();
+        assert_eq!(bytes1, bytes2, "canonical bytes must be deterministic");
+        assert!(!bytes1.is_empty());
+    }
+
+    #[test]
+    fn token_different_params_different_bytes() {
+        let token1 = DeclassificationToken::new(
+            42,
+            DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: IntegLevel::Adversarial,
+                    to: IntegLevel::Untrusted,
+                },
+                justification: "test".to_string(),
+            },
+            vec![Operation::WriteFiles],
+            1000,
+            "same".to_string(),
+        );
+        let token2 = DeclassificationToken::new(
+            99, // different node
+            DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: IntegLevel::Adversarial,
+                    to: IntegLevel::Untrusted,
+                },
+                justification: "test".to_string(),
+            },
+            vec![Operation::WriteFiles],
+            1000,
+            "same".to_string(),
+        );
+        assert_ne!(token1.canonical_bytes(), token2.canonical_bytes());
+    }
+
+    #[test]
+    fn token_canonical_bytes_v3_has_version_tag() {
+        let token = DeclassificationToken::new(
+            1,
+            DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: IntegLevel::Adversarial,
+                    to: IntegLevel::Untrusted,
+                },
+                justification: "test".to_string(),
+            },
+            vec![Operation::WriteFiles],
+            1000,
+            "j".to_string(),
+        );
+        let bytes = token.canonical_bytes();
+        assert!(
+            bytes.starts_with(b"nucleus-declass-v3\n"),
+            "canonical bytes must start with v3 version tag"
+        );
+    }
+
+    /// The content commitment is SIGNED: two tokens identical but for the value
+    /// they commit to must produce different canonical bytes, so a governor
+    /// signature over one does not authorize releasing the other. This is the
+    /// value-binding property at the signing layer (the apply-time enforcement
+    /// that the target node's content matches is a separate gate).
+    #[test]
+    fn token_canonical_bytes_bind_the_content_commitment() {
+        let mk = |commitment: [u8; 32]| {
+            DeclassificationToken::new(
+                7,
+                DeclassificationRule {
+                    action: DeclassifyAction::LowerConfidentiality {
+                        from: ConfLevel::Secret,
+                        to: ConfLevel::Public,
+                    },
+                    justification: "release the curated value".to_string(),
+                },
+                vec![Operation::WebSearch],
+                1000,
+                "j".to_string(),
+            )
+            .with_content_commitment(commitment)
+        };
+        let value_v = mk([0xAA; 32]);
+        let value_w = mk([0xBB; 32]);
+        assert_ne!(
+            value_v.canonical_bytes(),
+            value_w.canonical_bytes(),
+            "a token committing to a different value must sign different bytes"
+        );
+        // The commitment bytes actually appear in the signed form.
+        assert!(
+            value_v
+                .canonical_bytes()
+                .windows(32)
+                .any(|w| w == [0xAA; 32]),
+            "the content commitment must be part of the signed canonical bytes"
+        );
+        // A committed token is value-bound; the all-zeros default is not.
+        assert!(value_v.is_value_bound());
+        assert!(!mk([0u8; 32]).is_value_bound());
+    }
+
+    #[test]
+    fn token_canonical_bytes_field_boundary_collision() {
+        // Two tokens where v1 encoding would collide but v2 must not.
+        // Token A: justification="AB", one sink with value 0x43 ('C')
+        // Token B: justification="ABC", no sinks
+        // Under v1: both produce ...0x43 0xFF 0x41 0x42... (ambiguous)
+        // Under v2: length prefixes disambiguate
+        let rule = DeclassificationRule {
+            action: DeclassifyAction::RaiseIntegrity {
+                from: IntegLevel::Adversarial,
+                to: IntegLevel::Untrusted,
+            },
+            justification: "same".to_string(),
+        };
+
+        let token_a = DeclassificationToken::new(
+            1,
+            rule.clone(),
+            vec![Operation::WriteFiles, Operation::EditFiles],
+            1000,
+            "AB".to_string(),
+        );
+        let token_b = DeclassificationToken::new(
+            1,
+            rule.clone(),
+            vec![Operation::WriteFiles],
+            1000,
+            "AB".to_string(),
+        );
+        // Different number of sinks, same justification
+        assert_ne!(
+            token_a.canonical_bytes(),
+            token_b.canonical_bytes(),
+            "tokens with different sink counts must have different canonical bytes"
+        );
+
+        // Same sinks, different justification that could collide without length prefix
+        let token_c =
+            DeclassificationToken::new(1, rule.clone(), vec![], 1000, "hello".to_string());
+        let token_d = DeclassificationToken::new(1, rule.clone(), vec![], 1000, "hell".to_string());
+        assert_ne!(
+            token_c.canonical_bytes(),
+            token_d.canonical_bytes(),
+            "tokens with different justifications must have different canonical bytes"
+        );
+    }
+
+    #[test]
+    fn token_canonical_bytes_rule_justification_included() {
+        // Two tokens identical except for the rule justification
+        let token_a = DeclassificationToken::new(
+            1,
+            DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: IntegLevel::Adversarial,
+                    to: IntegLevel::Untrusted,
+                },
+                justification: "reason A".to_string(),
+            },
+            vec![],
+            1000,
+            "same".to_string(),
+        );
+        let token_b = DeclassificationToken::new(
+            1,
+            DeclassificationRule {
+                action: DeclassifyAction::RaiseIntegrity {
+                    from: IntegLevel::Adversarial,
+                    to: IntegLevel::Untrusted,
+                },
+                justification: "reason B".to_string(),
+            },
+            vec![],
+            1000,
+            "same".to_string(),
+        );
+        assert_ne!(
+            token_a.canonical_bytes(),
+            token_b.canonical_bytes(),
+            "different rule justifications must produce different canonical bytes"
+        );
+    }
+
+    #[test]
+    fn wrong_direction_rejected() {
+        // Trying to "lower" confidentiality with to > from — should not apply
+        let rule = DeclassificationRule {
+            action: DeclassifyAction::LowerConfidentiality {
+                from: ConfLevel::Internal,
+                to: ConfLevel::Secret, // to > from — wrong direction
+            },
+            justification: "Invalid".to_string(),
+        };
+        let label = IFCLabel {
+            confidentiality: ConfLevel::Internal,
+            ..web_label()
+        };
+        let result = rule.apply(label);
+        assert!(!result.applied, "Cannot escalate via declassification");
+    }
+
+    // -----------------------------------------------------------------
+    // Rate limiter (#962)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rate_limiter_allows_under_limit() {
+        let mut rl = DeclassifyRateLimiter::new(3, 60);
+        assert!(rl.check_and_record(100).is_ok());
+        assert!(rl.check_and_record(110).is_ok());
+        assert!(rl.check_and_record(120).is_ok());
+    }
+
+    #[test]
+    fn rate_limiter_denies_over_limit() {
+        let mut rl = DeclassifyRateLimiter::new(2, 60);
+        assert!(rl.check_and_record(100).is_ok());
+        assert!(rl.check_and_record(110).is_ok());
+        let err = rl.check_and_record(120).unwrap_err();
+        assert_eq!(err.count, 2);
+        assert_eq!(err.max, 2);
+    }
+
+    #[test]
+    fn rate_limiter_evicts_old_events() {
+        let mut rl = DeclassifyRateLimiter::new(2, 60);
+        assert!(rl.check_and_record(100).is_ok());
+        assert!(rl.check_and_record(110).is_ok());
+        // At t=170, the event at t=100 is outside the 60s window.
+        assert!(rl.check_and_record(170).is_ok());
+    }
+
+    #[test]
+    fn rate_limiter_current_count() {
+        let mut rl = DeclassifyRateLimiter::new(10, 60);
+        rl.check_and_record(100).ok();
+        rl.check_and_record(110).ok();
+        assert_eq!(rl.current_count(120), 2);
+        assert_eq!(rl.current_count(200), 0); // both events expired
+    }
+
+    // ── sink_mask ↔ allows_sink ↔ extracted mask_admits parity ─────────
+    //
+    // The FlowGraph consults the extracted bit test over `sink_mask()`; the
+    // token's own API is `allows_sink()` over the signed list. These are two
+    // implementations of one relation, so the check is EXHAUSTIVE over the
+    // whole domain — all 2^13 sink sets × all 13 operations, 106 496 cases.
+    // For a finite domain an exhaustive check is a complete equivalence
+    // proof, not a sample.
+
+    /// Production `Operation` by discriminant — the same order as
+    /// `Operation::ALL`, pinned by ifc_ops.rs's compile-time asserts.
+    #[test]
+    fn sink_mask_and_extracted_mask_admits_match_allows_sink_exhaustively() {
+        use nucleus_ifc_kernel::extracted::declassify::mask_admits;
+        use nucleus_ifc_kernel::extracted::mediation::MedOperation;
+
+        const ALL_MED: [MedOperation; 13] = [
+            MedOperation::ReadFiles,
+            MedOperation::WriteFiles,
+            MedOperation::EditFiles,
+            MedOperation::RunBash,
+            MedOperation::GlobSearch,
+            MedOperation::GrepSearch,
+            MedOperation::WebSearch,
+            MedOperation::WebFetch,
+            MedOperation::GitCommit,
+            MedOperation::GitPush,
+            MedOperation::CreatePr,
+            MedOperation::ManagePods,
+            MedOperation::SpawnAgent,
+        ];
+
+        for mask in 0u16..(1 << 13) {
+            // The sink set this mask denotes.
+            let allowed: Vec<Operation> = Operation::ALL
+                .iter()
+                .copied()
+                .filter(|op| mask & (1u16 << (*op as u8)) != 0)
+                .collect();
+            let token = DeclassificationToken::new(
+                1,
+                DeclassificationRule {
+                    action: DeclassifyAction::LowerConfidentiality {
+                        from: ConfLevel::Secret,
+                        to: ConfLevel::Internal,
+                    },
+                    justification: "parity sweep".to_string(),
+                },
+                allowed,
+                u64::MAX,
+                "parity sweep".to_string(),
+            );
+
+            // The derivation itself round-trips.
+            assert_eq!(
+                token.sink_mask(),
+                mask,
+                "sink_mask() did not round-trip mask {mask:#06x}"
+            );
+
+            for (i, op) in Operation::ALL.iter().enumerate() {
+                let via_list = token.allows_sink(*op);
+                let via_bits = mask_admits(token.sink_mask(), ALL_MED[i]);
+                assert_eq!(
+                    via_list, via_bits,
+                    "allows_sink and mask_admits diverged: mask={mask:#06x}, op={op:?}"
+                );
+            }
+        }
+    }
+}

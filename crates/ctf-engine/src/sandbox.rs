@@ -4,6 +4,28 @@ use serde::{Deserialize, Serialize};
 
 use portcullis::guard::ExposureLabel;
 
+/// Which code path produced the verdict for a step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionSource {
+    /// The `approve` tool was used — blocked by anti-self-escalation.
+    AntiSelfEscalation,
+    /// Tool name didn't map to any known operation.
+    UnknownTool,
+    /// Tool exists in the operation algebra but isn't available at this level.
+    ToolUnavailable,
+    /// Capability level is `Never` in the current profile.
+    CapabilityNever,
+    /// Bash command matched an exfiltration pattern.
+    CommandExfilDetection,
+    /// `should_deny()` returned true (exposure set is uninhabitable).
+    UninhabitableGuard,
+    /// Projected exposure would become uninhabitable.
+    UninhabitableProjection,
+    /// Operation was allowed.
+    Allowed,
+}
+
 /// A single tool call submitted by the attacker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -30,7 +52,7 @@ pub enum Verdict {
         reason: String,
         /// Which defense layer blocked it.
         defense: String,
-        /// Verus proof reference (if any).
+        /// Formal proof reference (Lean 4 + Kani), if any.
         proof: Option<String>,
     },
     /// Tool call requires human approval (uninhabitable state triggered).
@@ -42,9 +64,7 @@ pub enum Verdict {
         proof: Option<String>,
     },
     /// Tool is not available at this level.
-    Unavailable {
-        tool: String,
-    },
+    Unavailable { tool: String },
 }
 
 /// Result of a single step in the attack sequence.
@@ -56,8 +76,25 @@ pub struct StepResult {
     pub tool_call: ToolCall,
     /// The verdict.
     pub verdict: Verdict,
-    /// Exposure state AFTER this step.
+    /// Which code path produced this verdict.
+    pub decision_source: DecisionSource,
+    /// Human-readable narrative explaining WHY this verdict was given,
+    /// grounded in real-world incidents and CVEs.
+    pub narrative: String,
+    /// Exposure state AFTER this step (actual recorded state).
     pub exposure: ExposureState,
+    /// What the exposure state WOULD be if this operation were allowed.
+    /// Only present when a guard blocks preemptively.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projected_exposure: Option<ExposureState>,
+    /// Exposure classification of this operation: "PrivateData", "UntrustedContent",
+    /// "ExfilVector", or null for neutral/unknown operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_class: Option<String>,
+    /// Permission level for this operation in the current profile:
+    /// "Always", "LowRisk", "Never", or null for special tools like approve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_level: Option<String>,
 }
 
 /// Snapshot of the exposure accumulator.
@@ -107,6 +144,11 @@ pub struct AttackResult {
     pub final_exposure: ExposureState,
     /// Error message if the attack sequence was malformed.
     pub error: Option<String>,
+    /// Human-readable explanation of how the score was computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_reason: Option<String>,
+    /// Benchmark version that produced this result.
+    pub benchmark_version: String,
 }
 
 impl AttackResult {
@@ -118,6 +160,8 @@ impl AttackResult {
             score: 0,
             final_exposure: ExposureState::empty(),
             error: Some(msg),
+            score_reason: None,
+            benchmark_version: crate::BENCHMARK_VERSION.to_string(),
         }
     }
 }

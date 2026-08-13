@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "MCP server that bridges Claude Code to nucleus-tool-proxy"
-repository = "https://github.com/coproduct-opensource/nucleus"
+description = "MCP server that bridges an MCP client (any AI-agent runtime) to nucleus-tool-proxy"
+repository = "https://github.com/coproduct-opensource/nucleus"  # vendor-allow: project repo URL
 documentation = "https://docs.rs/nucleus-mcp"
 readme = "README.md"
-keywords = ["mcp", "claude", "tools", "security", "sandbox"]
+keywords = ["mcp", "ai-agent", "tools", "security", "sandbox"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
@@ -29,8 +29,10 @@ uuid = { workspace = true }
 nucleus-client = { path = "../nucleus-client" }
 nucleus-spec = { path = "../nucleus-spec" }
 portcullis = { path = "../portcullis", features = ["serde"] }
+portcullis-core = { path = "../portcullis-core" }
 
 [dev-dependencies]
+portcullis = { path = "../portcullis", features = ["serde", "testing"] }
 tempfile = { workspace = true }
 
 [lints]

@@ -37,33 +37,39 @@ fn arb_capability_level() -> impl Strategy<Value = CapabilityLevel> {
 // Strategy for generating arbitrary CapabilityLattice
 fn arb_capability_lattice() -> impl Strategy<Value = portcullis::CapabilityLattice> {
     (
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
+        (
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+        ),
         arb_capability_level(),
     )
         .prop_map(
             |(
-                read_files,
-                write_files,
-                edit_files,
-                run_bash,
-                glob_search,
-                grep_search,
-                web_search,
-                web_fetch,
-                git_commit,
-                git_push,
-                create_pr,
-                manage_pods,
+                (
+                    read_files,
+                    write_files,
+                    edit_files,
+                    run_bash,
+                    glob_search,
+                    grep_search,
+                    web_search,
+                    web_fetch,
+                    git_commit,
+                    git_push,
+                    create_pr,
+                    manage_pods,
+                ),
+                spawn_agent,
             )| {
                 portcullis::CapabilityLattice {
                     read_files,
@@ -78,6 +84,7 @@ fn arb_capability_lattice() -> impl Strategy<Value = portcullis::CapabilityLatti
                     git_push,
                     create_pr,
                     manage_pods,
+                    spawn_agent,
                     extensions: std::collections::BTreeMap::new(),
                 }
             },
@@ -85,12 +92,11 @@ fn arb_capability_lattice() -> impl Strategy<Value = portcullis::CapabilityLatti
 }
 
 /// Build a PermissionLattice from arbitrary capabilities.
+#[allow(clippy::field_reassign_with_default)]
 fn perms_from_caps(caps: portcullis::CapabilityLattice) -> PermissionLattice {
-    PermissionLattice {
-        capabilities: caps,
-        ..Default::default()
-    }
-    .normalize()
+    let mut p = PermissionLattice::default();
+    p.capabilities = caps;
+    p.normalize()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

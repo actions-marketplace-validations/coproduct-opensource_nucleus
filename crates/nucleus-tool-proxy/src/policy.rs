@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // #1216 exempt: reads policy config before kernel exists
 //! Identity-based policy enforcement for tool-proxy.
 //!
 //! This module integrates SPIFFE workload identity with the portcullis
@@ -226,6 +227,7 @@ impl PolicyEngine {
     }
 
     /// Get the matching policy for logging/debugging.
+    #[allow(dead_code)]
     pub fn matching_policy(&self, spiffe_id: &str) -> Option<&IdentityPolicy> {
         self.policy_set.matching_policy(spiffe_id)
     }

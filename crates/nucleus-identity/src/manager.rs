@@ -153,6 +153,25 @@ impl<C: CaClient + 'static> SecretManager<C> {
         self.fetch_new_certificate(identity).await
     }
 
+    /// Warms the certificate cache with a pre-signed certificate for an identity.
+    ///
+    /// This is how an *attested* certificate (one carrying an embedded
+    /// launch-attestation X.509 extension, signed out-of-band via
+    /// `CaClient::sign_attested_csr`) reaches the served `FETCH_SVID` fast-path,
+    /// which reads this same cache in [`Self::fetch_certificate`]. Without warming
+    /// the cache, an attested cert is signed and then dropped — the fast-path keeps
+    /// serving the plain cert and the measurement never leaves the node.
+    pub async fn cache_certificate(&self, identity: &Identity, cert: Arc<WorkloadCertificate>) {
+        let mut certs = self.certs.write().await;
+        certs.insert(
+            identity.clone(),
+            CertState::Available {
+                cert,
+                last_refresh_attempt: Instant::now(),
+            },
+        );
+    }
+
     /// Fetches a session-scoped certificate derived from a parent workload identity.
     ///
     /// Session certificates enable audit correlation across multiple tool calls within
@@ -653,7 +672,7 @@ mod tests {
         let ca = Arc::new(SelfSignedCa::new("nucleus.local").unwrap());
         let manager = SecretManager::new(ca, Duration::from_secs(3600));
 
-        let parent = Identity::new("nucleus.local", "agents", "claude");
+        let parent = Identity::new("nucleus.local", "agents", "agent");
         let session = SessionIdentity::new(parent.clone(), Duration::from_secs(3600));
 
         let cert = manager.fetch_session_certificate(&session).await.unwrap();
@@ -661,7 +680,7 @@ mod tests {
         // Session cert identity should contain the session ID
         let cert_identity = cert.identity();
         assert!(
-            cert_identity.service_account().starts_with("claude-"),
+            cert_identity.service_account().starts_with("agent-"),
             "session cert should embed session ID in service account"
         );
         assert!(!cert.is_expired());
@@ -672,7 +691,7 @@ mod tests {
         let ca = Arc::new(SelfSignedCa::new("nucleus.local").unwrap());
         let manager = SecretManager::new(ca, Duration::from_secs(3600));
 
-        let parent = Identity::new("nucleus.local", "agents", "claude");
+        let parent = Identity::new("nucleus.local", "agents", "agent");
         let session = SessionIdentity::new(parent, Duration::from_secs(3600));
 
         let cert1 = manager.fetch_session_certificate(&session).await.unwrap();
@@ -687,7 +706,7 @@ mod tests {
         let ca = Arc::new(SelfSignedCa::new("nucleus.local").unwrap());
         let manager = SecretManager::new(ca, Duration::from_secs(3600));
 
-        let parent = Identity::new("nucleus.local", "agents", "claude");
+        let parent = Identity::new("nucleus.local", "agents", "agent");
         let session1 = SessionIdentity::new(parent.clone(), Duration::from_secs(3600));
         let session2 = SessionIdentity::new(parent, Duration::from_secs(3600));
 
@@ -704,7 +723,7 @@ mod tests {
         let ca = Arc::new(SelfSignedCa::new("nucleus.local").unwrap());
         let manager = SecretManager::new(ca, Duration::from_secs(3600));
 
-        let parent = Identity::new("nucleus.local", "agents", "claude");
+        let parent = Identity::new("nucleus.local", "agents", "agent");
         let session = SessionIdentity::new(parent.clone(), Duration::from_secs(3600));
 
         let cert1 = manager.fetch_session_certificate(&session).await.unwrap();
@@ -722,7 +741,7 @@ mod tests {
         let ca = Arc::new(SelfSignedCa::new("nucleus.local").unwrap());
         let manager = SecretManager::new(ca, Duration::from_secs(3600));
 
-        let parent = Identity::new("nucleus.local", "agents", "claude");
+        let parent = Identity::new("nucleus.local", "agents", "agent");
         let session1 = SessionIdentity::new(parent.clone(), Duration::from_secs(3600));
         let session2 = SessionIdentity::new(parent.clone(), Duration::from_secs(3600));
 
@@ -738,7 +757,7 @@ mod tests {
         let ca = Arc::new(SelfSignedCa::new("nucleus.local").unwrap());
         let manager = SecretManager::new(ca, Duration::from_secs(3600));
 
-        let parent = Identity::new("nucleus.local", "agents", "claude");
+        let parent = Identity::new("nucleus.local", "agents", "agent");
         // Create an already-expired session
         let session = SessionIdentity {
             parent,

@@ -33,9 +33,12 @@ use std::sync::Arc;
 
 use crate::approval::{ApprovalRequest, ApprovalToken, Approver, CallbackApprover};
 use crate::error::{NucleusError, Result};
+use portcullis::kernel::DecisionToken;
 use portcullis::{
     CapabilityLattice, CapabilityLevel, Obligations, Operation, PathLattice, PermissionLattice,
+    SinkClass,
 };
+use portcullis_effects::authority::Authority;
 
 /// A capability-based file sandbox.
 ///
@@ -54,9 +57,23 @@ pub struct Sandbox {
     obligations: Obligations,
     /// Approver for approval-gated operations
     approver: Option<Arc<dyn Approver>>,
+    /// The log every authority spent through this sandbox is recorded against.
+    ///
+    /// Sandbox writes spend their authority DIRECTLY, in `spend_as`, rather than
+    /// through `PolicyEnforced` — which is where every other effect picks up its
+    /// witness. So this was the one path in the workspace where an authority was
+    /// spent with no log attached, and the writes it authorised left no record.
+    /// `Authority::spend` now refuses that outright; this is the log that makes
+    /// the refusal unnecessary.
+    receipts: Arc<portcullis_effects::receipt::ReceiptLog>,
 }
 
 impl Sandbox {
+    /// The receipts for authorities spent through this sandbox.
+    pub fn receipts(&self) -> &portcullis_effects::receipt::ReceiptLog {
+        &self.receipts
+    }
+
     /// Create a new sandbox rooted at the given path.
     ///
     /// The `policy` determines which files within the sandbox can be accessed
@@ -70,6 +87,7 @@ impl Sandbox {
         let root_dir = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())?;
 
         Ok(Self {
+            receipts: Arc::new(portcullis_effects::receipt::ReceiptLog::new()),
             root: root_dir,
             root_path,
             policy: normalized.paths,
@@ -117,12 +135,37 @@ impl Sandbox {
     /// Open a file for reading.
     ///
     /// The path is relative to the sandbox root. Policy is checked before opening.
-    pub fn open(&self, path: impl AsRef<Path>) -> Result<File> {
+    /// Requires a `DecisionToken` from `Kernel::decide()` proving the operation
+    /// was authorized.
+    pub fn open(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<File> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::ReadFiles, SinkClass::AuditLogAppend)?;
         self.open_internal(path.as_ref(), None)
     }
 
     /// Open a file for reading with an approval token.
-    pub fn open_approved(&self, path: impl AsRef<Path>, approval: &ApprovalToken) -> Result<File> {
+    pub fn open_approved(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        approval: &ApprovalToken,
+        authority: Authority,
+    ) -> Result<File> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::ReadFiles, SinkClass::AuditLogAppend)?;
         self.open_internal(path.as_ref(), Some(approval))
     }
 
@@ -142,7 +185,19 @@ impl Sandbox {
     }
 
     /// Open a file with custom options.
-    pub fn open_with(&self, path: impl AsRef<Path>, options: &OpenOptions) -> Result<File> {
+    pub fn open_with(
+        &self,
+        path: impl AsRef<Path>,
+        options: &OpenOptions,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<File> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::EditFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::EditFiles, SinkClass::WorkspaceWrite)?;
         self.open_with_internal(path.as_ref(), options, None)
     }
 
@@ -151,8 +206,16 @@ impl Sandbox {
         &self,
         path: impl AsRef<Path>,
         options: &OpenOptions,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<File> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::EditFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::EditFiles, SinkClass::WorkspaceWrite)?;
         self.open_with_internal(path.as_ref(), options, Some(approval))
     }
 
@@ -177,7 +240,18 @@ impl Sandbox {
     /// Create a new file for writing.
     ///
     /// The path is relative to the sandbox root. Policy is checked before creating.
-    pub fn create(&self, path: impl AsRef<Path>) -> Result<File> {
+    pub fn create(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<File> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::WriteFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::WriteFiles, SinkClass::WorkspaceWrite)?;
         self.create_internal(path.as_ref(), None)
     }
 
@@ -185,8 +259,16 @@ impl Sandbox {
     pub fn create_approved(
         &self,
         path: impl AsRef<Path>,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<File> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::WriteFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::WriteFiles, SinkClass::WorkspaceWrite)?;
         self.create_internal(path.as_ref(), Some(approval))
     }
 
@@ -203,7 +285,18 @@ impl Sandbox {
     }
 
     /// Read a file's contents as bytes.
-    pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
+    pub fn read(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<Vec<u8>> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::ReadFiles, SinkClass::AuditLogAppend)?;
         self.read_internal(path.as_ref(), None)
     }
 
@@ -211,8 +304,16 @@ impl Sandbox {
     pub fn read_approved(
         &self,
         path: impl AsRef<Path>,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<Vec<u8>> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::ReadFiles, SinkClass::AuditLogAppend)?;
         self.read_internal(path.as_ref(), Some(approval))
     }
 
@@ -227,7 +328,18 @@ impl Sandbox {
     }
 
     /// Read a file's contents as a string.
-    pub fn read_to_string(&self, path: impl AsRef<Path>) -> Result<String> {
+    pub fn read_to_string(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<String> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::ReadFiles, SinkClass::AuditLogAppend)?;
         self.read_to_string_internal(path.as_ref(), None)
     }
 
@@ -235,8 +347,16 @@ impl Sandbox {
     pub fn read_to_string_approved(
         &self,
         path: impl AsRef<Path>,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<String> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::ReadFiles, SinkClass::AuditLogAppend)?;
         self.read_to_string_internal(path.as_ref(), Some(approval))
     }
 
@@ -257,18 +377,92 @@ impl Sandbox {
     }
 
     /// Write bytes to a file (creates if needed, truncates if exists).
-    pub fn write(&self, path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<()> {
+    ///
+    /// Requires a `&DischargedBundle` proof (mint via
+    /// [`preflight_action`](nucleus_ifc_kernel::discharge::preflight_action),
+    /// e.g. the tool-proxy's `run_gate::preflight_fs`). This makes the
+    /// FILESYSTEM-WRITE effect class a *compile*-checked precondition — parity
+    /// with the spawn executor-proof gate ([`Executor::run_args`](crate::Executor)
+    /// and the net [`NetEffect::fetch`]) — so an un-preflighted fs write cannot be
+    /// typed. The existing `DecisionToken` and cap-std root confinement are
+    /// retained (dual-stack, additive): the proof does not replace them. The
+    /// bundle is a sealed 8-witness proof that only `preflight_action` can mint;
+    /// there is no other constructor, so a caller that reaches this method has
+    /// necessarily passed the fail-closed discharge preflight.
+    ///
+    /// The following omits the proof and does **not** compile (mirrors the
+    /// sealed-bundle `compile_fail` doctest in `nucleus_ifc_kernel::discharge`
+    /// and the spawn gate in `command.rs`):
+    ///
+    /// ```compile_fail
+    /// use nucleus::Sandbox;
+    /// use nucleus::portcullis::kernel::DecisionToken;
+    ///
+    /// fn un_preflighted_write(sandbox: &Sandbox, dt: &DecisionToken) {
+    ///     // No trailing `Authority` — the sealed proof is missing, so this
+    ///     // call cannot be typed. There is no way to write without one, and
+    ///     // the one supplied must have been earned FOR a workspace write.
+    ///     let _ = sandbox.write("out.txt", b"data", dt);
+    /// }
+    /// ```
+    pub fn write(
+        &self,
+        path: impl AsRef<Path>,
+        contents: impl AsRef<[u8]>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::WriteFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::WriteFiles, SinkClass::WorkspaceWrite)?;
         self.write_internal(path.as_ref(), contents, None)
     }
 
     /// Write bytes to a file with an approval token.
+    ///
+    /// The approval-elevated sibling of [`Self::write`]; it is behind the same
+    /// FILESYSTEM-WRITE effect gate and requires a `&DischargedBundle` proof in
+    /// addition to the `ApprovalToken` (parity with
+    /// [`Executor::run_args_with_approval`](crate::Executor)).
     pub fn write_approved(
         &self,
         path: impl AsRef<Path>,
         contents: impl AsRef<[u8]>,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::WriteFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::WriteFiles, SinkClass::WorkspaceWrite)?;
         self.write_internal(path.as_ref(), contents, Some(approval))
+    }
+
+    /// Spend a write authority, refusing one earned for anything else.
+    ///
+    /// Both write entry points previously took the bundle as `_proof` and never
+    /// read it, so ANY bundle authorized a write — the confused deputy, and the
+    /// same defect fixed in `NucleusRuntime` (#2087). The doc-test above claimed
+    /// "there is no way to write without one", which was true of *presenting* a
+    /// bundle and false of presenting the *right* one.
+    ///
+    /// Takes `&self` so it can attach the sandbox's receipt log. It was an
+    /// associated function, which is precisely why it could not witness: there
+    /// was no log in scope, and `spend` accepted that silently.
+    fn spend_as(&self, authority: Authority, op: Operation, sink: SinkClass) -> Result<()> {
+        authority
+            .witnessed_by(Arc::clone(&self.receipts))
+            .spend(op, sink)
+            .map(drop)
+            .map_err(|e| NucleusError::ScopeMismatch {
+                reason: e.to_string(),
+            })
     }
 
     fn write_internal(
@@ -289,7 +483,18 @@ impl Sandbox {
     }
 
     /// Create a directory.
-    pub fn create_dir(&self, path: impl AsRef<Path>) -> Result<()> {
+    pub fn create_dir(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::WriteFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::WriteFiles, SinkClass::WorkspaceWrite)?;
         self.create_dir_internal(path.as_ref(), None)
     }
 
@@ -297,8 +502,16 @@ impl Sandbox {
     pub fn create_dir_approved(
         &self,
         path: impl AsRef<Path>,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::WriteFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::WriteFiles, SinkClass::WorkspaceWrite)?;
         self.create_dir_internal(path.as_ref(), Some(approval))
     }
 
@@ -315,7 +528,18 @@ impl Sandbox {
     }
 
     /// Create a directory and all parent directories.
-    pub fn create_dir_all(&self, path: impl AsRef<Path>) -> Result<()> {
+    pub fn create_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::WriteFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::WriteFiles, SinkClass::WorkspaceWrite)?;
         self.create_dir_all_internal(path.as_ref(), None)
     }
 
@@ -323,8 +547,16 @@ impl Sandbox {
     pub fn create_dir_all_approved(
         &self,
         path: impl AsRef<Path>,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::WriteFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::WriteFiles, SinkClass::WorkspaceWrite)?;
         self.create_dir_all_internal(path.as_ref(), Some(approval))
     }
 
@@ -341,7 +573,18 @@ impl Sandbox {
     }
 
     /// Remove a file.
-    pub fn remove_file(&self, path: impl AsRef<Path>) -> Result<()> {
+    pub fn remove_file(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::EditFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::EditFiles, SinkClass::WorkspaceWrite)?;
         self.remove_file_internal(path.as_ref(), None)
     }
 
@@ -349,8 +592,16 @@ impl Sandbox {
     pub fn remove_file_approved(
         &self,
         path: impl AsRef<Path>,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::EditFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::EditFiles, SinkClass::WorkspaceWrite)?;
         self.remove_file_internal(path.as_ref(), Some(approval))
     }
 
@@ -367,7 +618,18 @@ impl Sandbox {
     }
 
     /// Remove an empty directory.
-    pub fn remove_dir(&self, path: impl AsRef<Path>) -> Result<()> {
+    pub fn remove_dir(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::EditFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::EditFiles, SinkClass::WorkspaceWrite)?;
         self.remove_dir_internal(path.as_ref(), None)
     }
 
@@ -375,8 +637,16 @@ impl Sandbox {
     pub fn remove_dir_approved(
         &self,
         path: impl AsRef<Path>,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<()> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::EditFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::EditFiles, SinkClass::WorkspaceWrite)?;
         self.remove_dir_internal(path.as_ref(), Some(approval))
     }
 
@@ -393,12 +663,27 @@ impl Sandbox {
     }
 
     /// Check if a path exists within the sandbox.
-    pub fn exists(&self, path: impl AsRef<Path>) -> bool {
+    pub fn exists(&self, path: impl AsRef<Path>, decision: &DecisionToken) -> bool {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
         self.exists_internal(path.as_ref(), None)
     }
 
     /// Check if a path exists within the sandbox with an approval token.
-    pub fn exists_approved(&self, path: impl AsRef<Path>, approval: &ApprovalToken) -> bool {
+    pub fn exists_approved(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        approval: &ApprovalToken,
+    ) -> bool {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
         self.exists_internal(path.as_ref(), Some(approval))
     }
 
@@ -415,6 +700,29 @@ impl Sandbox {
     /// Get the absolute path of the sandbox root.
     pub fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    /// Read a file for search/grep operations (#1273).
+    ///
+    /// Uses the cap-std sandbox directory for I/O, bypassing raw `std::fs`.
+    ///
+    /// Takes no `DecisionToken` — the caller obtains a GrepSearch decision via
+    /// `kernel_decide` — but it DOES require an `Authority` scoped to
+    /// `(GrepSearch, AuditLogAppend)`. That requirement used to be a comment
+    /// saying the caller "must have already obtained a decision", which is a
+    /// convention rather than an enforcement; the `mediated` lint flagged it as
+    /// an agent-reachable read with no discharge.
+    ///
+    /// Returns `Err` for paths outside the sandbox or unreadable files.
+    pub fn read_to_string_for_search(&self, path: &Path, authority: Authority) -> Result<String> {
+        self.spend_as(authority, Operation::GrepSearch, SinkClass::AuditLogAppend)?;
+        self.check_policy(path)?;
+        self.root
+            .read_to_string(path)
+            .map_err(|e| NucleusError::PathDenied {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })
     }
 
     /// Check if a path is allowed by the policy.
@@ -533,7 +841,18 @@ impl Sandbox {
     ///
     /// The returned sandbox is constrained to the subdirectory and inherits
     /// the parent's policy (which will further restrict access).
-    pub fn open_dir(&self, path: impl AsRef<Path>) -> Result<Sandbox> {
+    pub fn open_dir(
+        &self,
+        path: impl AsRef<Path>,
+        decision: &DecisionToken,
+        authority: Authority,
+    ) -> Result<Sandbox> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::ReadFiles, SinkClass::AuditLogAppend)?;
         self.open_dir_internal(path.as_ref(), None)
     }
 
@@ -541,8 +860,16 @@ impl Sandbox {
     pub fn open_dir_approved(
         &self,
         path: impl AsRef<Path>,
+        decision: &DecisionToken,
         approval: &ApprovalToken,
+        authority: Authority,
     ) -> Result<Sandbox> {
+        debug_assert_eq!(
+            decision.operation(),
+            Operation::ReadFiles,
+            "DecisionToken operation mismatch"
+        );
+        self.spend_as(authority, Operation::ReadFiles, SinkClass::AuditLogAppend)?;
         self.open_dir_internal(path.as_ref(), Some(approval))
     }
 
@@ -559,6 +886,7 @@ impl Sandbox {
             })?;
 
         Ok(Sandbox {
+            receipts: Arc::new(portcullis_effects::receipt::ReceiptLog::new()),
             root: subdir,
             root_path: self.root_path.join(path),
             policy: self.policy.clone(),
@@ -572,65 +900,294 @@ impl Sandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Sanctioned test-only sealed bundle (WriteFiles/WorkspaceWrite term) — the
+    // only supported way for a test to obtain a `DischargedBundle` for the
+    // `_proof`-gated write path (the constructor is private to discharge).
+    use nucleus_ifc_kernel::discharge::test_helpers::{allowed_bundle, bundle_for};
+    use portcullis::kernel::Kernel;
     use tempfile::tempdir;
 
+    #[allow(clippy::field_reassign_with_default)]
     fn permissive_policy() -> PermissionLattice {
-        let mut policy = PermissionLattice {
-            paths: PathLattice::default(),
-            ..PermissionLattice::default()
-        };
+        let mut policy = PermissionLattice::default();
+        policy.paths = PathLattice::default();
         policy.obligations = Obligations::default();
         policy.capabilities.write_files = CapabilityLevel::LowRisk;
         policy.capabilities.edit_files = CapabilityLevel::LowRisk;
         policy
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     fn sensitive_policy() -> PermissionLattice {
-        let mut policy = PermissionLattice {
-            paths: PathLattice::block_sensitive(),
-            ..PermissionLattice::default()
-        };
+        let mut policy = PermissionLattice::default();
+        policy.paths = PathLattice::block_sensitive();
         policy.obligations = Obligations::default();
         policy.capabilities.write_files = CapabilityLevel::LowRisk;
         policy.capabilities.edit_files = CapabilityLevel::LowRisk;
         policy
+    }
+
+    /// Helper: get a DecisionToken from a permissive kernel for a given operation.
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
+    fn token(kernel: &mut Kernel, op: Operation, subject: &str) -> DecisionToken {
+        let (_decision, tok) = kernel.decide(op, subject);
+        tok.expect("permissive kernel should allow this operation")
+    }
+
+    /// EVERY `DecisionToken`-taking method refuses an authority earned for a
+    /// different action, and refuses it BEFORE the effect.
+    ///
+    /// Before this work only `write`/`write_approved` took a discharge at all,
+    /// and they ignored it. The rest — including `remove_file`, which deletes —
+    /// passed `DecisionToken` + capability-lattice checks but none of the eight
+    /// obligations. That is the tier-B state the effect traits were in before
+    /// the B1/B2 cutover, and it meant an agent routed through `Sandbox`
+    /// bypassed obligations `FileEffect` enforces on the other filesystem path.
+    ///
+    /// A `git_push`-scoped authority is wrong for all of them, so one authority
+    /// kind exercises the whole surface.
+    #[test]
+    fn no_sandbox_method_accepts_an_authority_earned_elsewhere() {
+        let tmp = tempdir().unwrap();
+        let policy = PermissionLattice::permissive();
+        let mut kernel = Kernel::new(policy.clone());
+        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
+
+        // Seed a file and a directory so failures cannot come from absence.
+        std::fs::write(tmp.path().join("seed.txt"), b"seed").unwrap();
+        std::fs::create_dir_all(tmp.path().join("seeddir")).unwrap();
+
+        let wrong = || Authority::new(bundle_for(Operation::GitPush, SinkClass::GitPush));
+        let rt = token(&mut kernel, Operation::ReadFiles, "seed.txt");
+        let wt = token(&mut kernel, Operation::WriteFiles, "new.txt");
+        let et = token(&mut kernel, Operation::EditFiles, "seed.txt");
+
+        macro_rules! refused {
+            ($label:expr, $call:expr) => {{
+                let e = $call.err().unwrap_or_else(|| {
+                    panic!("{} accepted an authority earned for GitPush", $label)
+                });
+                assert!(
+                    matches!(e, NucleusError::ScopeMismatch { .. }),
+                    "{} refused for the wrong reason: {e:?}",
+                    $label
+                );
+            }};
+        }
+
+        refused!("open", sandbox.open("seed.txt", &rt, wrong()));
+        refused!("read", sandbox.read("seed.txt", &rt, wrong()));
+        refused!(
+            "read_to_string",
+            sandbox.read_to_string("seed.txt", &rt, wrong())
+        );
+        refused!("open_dir", sandbox.open_dir("seeddir", &rt, wrong()));
+        refused!("create", sandbox.create("new.txt", &wt, wrong()));
+        refused!("create_dir", sandbox.create_dir("d1", &wt, wrong()));
+        refused!(
+            "create_dir_all",
+            sandbox.create_dir_all("d2/d3", &wt, wrong())
+        );
+        refused!("remove_file", sandbox.remove_file("seed.txt", &et, wrong()));
+        refused!("remove_dir", sandbox.remove_dir("seeddir", &et, wrong()));
+        refused!("write", sandbox.write("new.txt", b"x", &wt, wrong()));
+
+        // Nothing was created and nothing was deleted.
+        assert!(tmp.path().join("seed.txt").exists(), "seed.txt was removed");
+        assert!(tmp.path().join("seeddir").exists(), "seeddir was removed");
+        assert!(!tmp.path().join("new.txt").exists(), "new.txt was created");
+        assert!(!tmp.path().join("d1").exists(), "d1 was created");
+    }
+
+    /// The gap this closes: `write` took the bundle as `_proof` and never read
+    /// it, so a bundle earned for a READ authorized a write — the confused
+    /// deputy, the same defect fixed in `NucleusRuntime` (#2087). The doc-test
+    /// on `write` claimed "there is no way to write without one", which was true
+    /// of presenting *a* bundle and false of presenting the *right* one.
+    #[test]
+    fn a_read_authority_will_not_pay_for_a_sandbox_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = PermissionLattice::permissive();
+        let mut kernel = Kernel::new(policy.clone());
+        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
+
+        let wt = token(&mut kernel, Operation::WriteFiles, "escalated.txt");
+        let read_authority =
+            Authority::new(bundle_for(Operation::ReadFiles, SinkClass::AuditLogAppend));
+
+        let err = sandbox
+            .write(
+                "escalated.txt",
+                b"written under a read",
+                &wt,
+                read_authority,
+            )
+            .expect_err("a read authority must not pay for a sandbox write");
+        assert!(
+            matches!(err, NucleusError::ScopeMismatch { .. }),
+            "expected a scope mismatch, got: {err:?}"
+        );
+        assert!(
+            !tmp.path().join("escalated.txt").exists(),
+            "the refusal must precede the write, but the file was created"
+        );
+    }
+
+    /// No false denial: the correctly-scoped authority still writes. A check
+    /// that refused everything would satisfy the test above and break the API.
+    #[test]
+    fn a_write_authority_still_pays_for_a_sandbox_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = PermissionLattice::permissive();
+        let mut kernel = Kernel::new(policy.clone());
+        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
+
+        let wt = token(&mut kernel, Operation::WriteFiles, "ok.txt");
+        sandbox
+            .write("ok.txt", b"in scope", &wt, Authority::new(allowed_bundle()))
+            .expect("a correctly-scoped write must succeed");
+        assert!(tmp.path().join("ok.txt").exists());
+    }
+
+    /// **The payoff.** Sandbox writes spend their authority directly rather than
+    /// through `PolicyEnforced`, which is where every other effect picks up its
+    /// witness — so this was the one path in the workspace that authorised an
+    /// effect and recorded nothing. `Authority::spend` now refuses an
+    /// unwitnessed spend outright, and these six write tests failing is what
+    /// surfaced it.
+    #[test]
+    fn a_sandbox_write_leaves_a_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = PermissionLattice::permissive();
+        let mut kernel = Kernel::new(policy.clone());
+        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
+        assert_eq!(sandbox.receipts().len(), 0);
+
+        let wt = token(&mut kernel, Operation::WriteFiles, "ok.txt");
+        sandbox
+            .write("ok.txt", b"in scope", &wt, Authority::new(allowed_bundle()))
+            .expect("write succeeds");
+
+        let entries = sandbox.receipts().entries();
+        assert_eq!(entries.len(), 1, "the write must be recorded: {entries:?}");
+        assert_eq!(entries[0].operation, Operation::WriteFiles);
+    }
+
+    /// A REFUSED write is recorded too. A log that only held successes would
+    /// answer "what was allowed" but not "what was attempted", and the second
+    /// question is the one an audit trail exists for.
+    #[test]
+    fn a_refused_sandbox_write_is_also_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = PermissionLattice::permissive();
+        let mut kernel = Kernel::new(policy.clone());
+        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
+
+        let wt = token(&mut kernel, Operation::WriteFiles, "no.txt");
+        // An authority earned for reading cannot buy a write.
+        let bundle = bundle_for(Operation::ReadFiles, SinkClass::AuditLogAppend);
+        let err = sandbox.write("no.txt", b"nope", &wt, Authority::new(bundle));
+        assert!(err.is_err(), "a read authority must not buy a write");
+
+        let entries = sandbox.receipts().entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the refusal must be recorded, not just the successes: {entries:?}"
+        );
+        assert_eq!(
+            entries[0].outcome,
+            portcullis_effects::receipt::EffectOutcome::DeniedByScope
+        );
     }
 
     #[test]
     fn test_basic_read_write() {
         let tmp = tempdir().unwrap();
-        let sandbox = Sandbox::new(&permissive_policy(), tmp.path()).unwrap();
+        let policy = permissive_policy();
+        let mut kernel = Kernel::new(policy.clone());
+        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
 
         // Write a file
-        sandbox.write("test.txt", b"hello world").unwrap();
+        let wt = token(&mut kernel, Operation::WriteFiles, "test.txt");
+        sandbox
+            .write(
+                "test.txt",
+                b"hello world",
+                &wt,
+                Authority::new(allowed_bundle()),
+            )
+            .unwrap();
 
         // Read it back
-        let contents = sandbox.read_to_string("test.txt").unwrap();
+        let rt = token(&mut kernel, Operation::ReadFiles, "test.txt");
+        let contents = sandbox
+            .read_to_string(
+                "test.txt",
+                &rt,
+                Authority::new(bundle_for(Operation::ReadFiles, SinkClass::AuditLogAppend)),
+            )
+            .unwrap();
         assert_eq!(contents, "hello world");
     }
 
     #[test]
     fn test_policy_blocks_sensitive() {
         let tmp = tempdir().unwrap();
-        let sandbox = Sandbox::new(&sensitive_policy(), tmp.path()).unwrap();
+        let policy = sensitive_policy();
+        let mut kernel = Kernel::capability_only(policy.clone());
+        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
 
-        // Should be able to write normal files
-        sandbox.write("readme.md", b"# Hello").unwrap();
+        // Use issue_approved_token to bypass the kernel's PathLattice check.
+        // The kernel's can_access() resolves relative paths via the CWD, which
+        // on macOS case-insensitive FS may canonicalize to existing files whose
+        // absolute path matches blocked patterns like `**/.ssh/**` when
+        // running inside a git worktree. This test exercises the *sandbox*'s
+        // path policy, not the kernel's.
+        let wt = kernel.issue_approved_token(Operation::WriteFiles, "test: write normal file");
+        sandbox
+            .write(
+                "normal_file.txt",
+                b"# Hello",
+                &wt,
+                Authority::new(allowed_bundle()),
+            )
+            .unwrap();
 
-        // Should block .env files
-        let result = sandbox.write(".env", b"SECRET=foo");
+        // Should block .env files (sandbox policy blocks it; kernel also blocks via PathLattice)
+        // Force a token to test the sandbox's own path policy enforcement
+        let wt2 =
+            kernel.issue_approved_token(Operation::WriteFiles, "test: .env blocked by sandbox");
+        let result = sandbox.write(
+            ".env",
+            b"SECRET=foo",
+            &wt2,
+            Authority::new(allowed_bundle()),
+        );
         assert!(result.is_err());
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_write_requires_capability() {
         let tmp = tempdir().unwrap();
         let mut policy = permissive_policy();
         policy.capabilities.write_files = CapabilityLevel::Never;
 
+        let mut kernel = Kernel::new(policy.clone());
         let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
 
-        let result = sandbox.create("blocked.txt");
+        // Kernel will deny this — no token produced
+        let (_decision, tok) = kernel.decide(Operation::WriteFiles, "blocked.txt");
+        assert!(tok.is_none(), "kernel should deny Never capability");
+
+        // Even if we bypass the kernel (issue_approved_token for test), sandbox blocks it
+        let forced_token = kernel.issue_approved_token(Operation::WriteFiles, "test: force token");
+        let result = sandbox.create(
+            "blocked.txt",
+            &forced_token,
+            Authority::new(bundle_for(Operation::WriteFiles, SinkClass::WorkspaceWrite)),
+        );
         assert!(matches!(
             result,
             Err(NucleusError::InsufficientCapability { .. })
@@ -638,45 +1195,105 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Migration to decide_term tracked in #1194
     fn test_write_requires_approval() {
         let tmp = tempdir().unwrap();
         let mut policy = permissive_policy();
         policy.obligations.insert(Operation::WriteFiles);
 
-        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
-        let result = sandbox.create("needs_approval.txt");
-        assert!(matches!(result, Err(NucleusError::ApprovalRequired { .. })));
+        let mut kernel = Kernel::new(policy.clone());
+
+        // Without pre-granted approval, kernel returns RequiresApproval — no token
+        let (decision, tok) = kernel.decide(Operation::WriteFiles, "needs_approval.txt");
+        assert!(
+            matches!(
+                decision.verdict,
+                portcullis::kernel::Verdict::RequiresApproval
+            ),
+            "should require approval"
+        );
+        assert!(tok.is_none());
+
+        // Grant approval, then get a token
+        kernel.grant_approval(Operation::WriteFiles, 1);
+        let (_, tok2) = kernel.decide(Operation::WriteFiles, "approved.txt");
+        let decision_token = tok2.expect("should get token after grant_approval");
 
         let approved = Sandbox::new(&policy, tmp.path())
             .unwrap()
             .with_approval_callback(|_| true);
-        let token = approved.request_approval("create approved.txt").unwrap();
-        let result = approved.create_approved("approved.txt", &token);
+        let approval_token = approved.request_approval("create approved.txt").unwrap();
+        let result = approved.create_approved(
+            "approved.txt",
+            &decision_token,
+            &approval_token,
+            Authority::new(bundle_for(Operation::WriteFiles, SinkClass::WorkspaceWrite)),
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_escape_via_absolute_path() {
         let tmp = tempdir().unwrap();
-        let sandbox = Sandbox::new(&permissive_policy(), tmp.path()).unwrap();
+        let policy = permissive_policy();
+        let mut kernel = Kernel::new(policy.clone());
+        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
 
         // Absolute paths should be rejected at policy level
-        let result = sandbox.open("/etc/passwd");
+        let rt = token(&mut kernel, Operation::ReadFiles, "/etc/passwd");
+        let result = sandbox.open(
+            "/etc/passwd",
+            &rt,
+            Authority::new(bundle_for(Operation::ReadFiles, SinkClass::AuditLogAppend)),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_subdirectory_sandbox() {
         let tmp = tempdir().unwrap();
-        let sandbox = Sandbox::new(&permissive_policy(), tmp.path()).unwrap();
+        let policy = permissive_policy();
+        let mut kernel = Kernel::new(policy.clone());
+        let sandbox = Sandbox::new(&policy, tmp.path()).unwrap();
 
         // Create a subdirectory
-        sandbox.create_dir("subdir").unwrap();
-        sandbox.write("subdir/file.txt", b"nested").unwrap();
+        let wt1 = token(&mut kernel, Operation::WriteFiles, "subdir");
+        sandbox
+            .create_dir(
+                "subdir",
+                &wt1,
+                Authority::new(bundle_for(Operation::WriteFiles, SinkClass::WorkspaceWrite)),
+            )
+            .unwrap();
+
+        let wt2 = token(&mut kernel, Operation::WriteFiles, "subdir/file.txt");
+        sandbox
+            .write(
+                "subdir/file.txt",
+                b"nested",
+                &wt2,
+                Authority::new(allowed_bundle()),
+            )
+            .unwrap();
 
         // Open as sub-sandbox
-        let subsandbox = sandbox.open_dir("subdir").unwrap();
-        let contents = subsandbox.read_to_string("file.txt").unwrap();
+        let rt1 = token(&mut kernel, Operation::ReadFiles, "subdir");
+        let subsandbox = sandbox
+            .open_dir(
+                "subdir",
+                &rt1,
+                Authority::new(bundle_for(Operation::ReadFiles, SinkClass::AuditLogAppend)),
+            )
+            .unwrap();
+
+        let rt2 = token(&mut kernel, Operation::ReadFiles, "file.txt");
+        let contents = subsandbox
+            .read_to_string(
+                "file.txt",
+                &rt2,
+                Authority::new(bundle_for(Operation::ReadFiles, SinkClass::AuditLogAppend)),
+            )
+            .unwrap();
         assert_eq!(contents, "nested");
     }
 }

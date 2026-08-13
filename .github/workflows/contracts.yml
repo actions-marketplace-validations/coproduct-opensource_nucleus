@@ -1,0 +1,48 @@
+name: Marketplace Contracts (Foundry)
+
+# Closes part of gap G5: the on-chain credible-settlement contracts (and the
+# CommitSet completeness closure that catches OMIT / FABRICATE) had Foundry tests
+# but NO CI running them. This builds + tests them on every change so the on-chain
+# money path stays pinned to the proven kernels (settlement/commons parity) and the
+# set-completeness gate cannot regress.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "examples/marketplace-live/contracts/**"
+      - ".github/workflows/contracts.yml"
+  pull_request:
+    paths:
+      - "examples/marketplace-live/contracts/**"
+      - ".github/workflows/contracts.yml"
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  forge:
+    name: forge test (credible settlement + commit-set)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: examples/marketplace-live/contracts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1.9.0
+
+      # `lib/` is gitignored (not a submodule), so fetch the pinned forge-std the
+      # tests import. Keep this version in sync with the locally-installed one.
+      - name: Install forge-std (pinned)
+        run: forge install foundry-rs/forge-std@v1.16.1 --no-git
+
+      - name: forge build
+        run: forge build --sizes
+
+      - name: forge test
+        run: forge test -vvv

@@ -22,6 +22,13 @@
 //!
 //! The fixed points `Lⱼ = { x : j(x) = x }` form a frame (the quotient frame).
 //!
+//! **Note on `UninhabitableQuotient`**: this operator satisfies (1) and (2) but
+//! NOT (3). It is a **kernel operator** (deflationary + idempotent), not a full
+//! frame-theoretic nucleus. The Kani harness in `portcullis/src/kani.rs`
+//! formally disproves meet-preservation (`proof_nucleus_not_meet_preserving`).
+//! Fixed points remain closed under the **quotient meet** (`PermissionLattice::meet`
+//! which re-normalizes internally), not under the raw lattice meet.
+//!
 //! # Example
 //!
 //! ```rust
@@ -44,51 +51,9 @@ use serde::{Deserialize, Serialize};
 use crate::capability::IncompatibilityConstraint;
 use crate::PermissionLattice;
 
-/// A lattice with meet (∧) and join (∨) operations.
-///
-/// # Laws
-///
-/// For all `a`, `b`, `c`:
-/// - Commutativity: `a ∧ b = b ∧ a`, `a ∨ b = b ∨ a`
-/// - Associativity: `(a ∧ b) ∧ c = a ∧ (b ∧ c)`
-/// - Idempotence: `a ∧ a = a`, `a ∨ a = a`
-/// - Absorption: `a ∧ (a ∨ b) = a`, `a ∨ (a ∧ b) = a`
-pub trait Lattice: Clone + PartialEq {
-    /// Greatest lower bound (meet, ∧).
-    fn meet(&self, other: &Self) -> Self;
-
-    /// Least upper bound (join, ∨).
-    fn join(&self, other: &Self) -> Self;
-
-    /// Partial order: `a ≤ b` iff `a ∧ b = a`.
-    fn leq(&self, other: &Self) -> bool;
-}
-
-/// A bounded lattice with top (⊤) and bottom (⊥) elements.
-///
-/// # Laws
-///
-/// - `a ∧ ⊤ = a` (top is identity for meet)
-/// - `a ∨ ⊥ = a` (bottom is identity for join)
-/// - `a ∧ ⊥ = ⊥` (bottom is annihilator for meet)
-/// - `a ∨ ⊤ = ⊤` (top is annihilator for join)
-pub trait BoundedLattice: Lattice {
-    /// Top element (⊤): greatest element in the lattice.
-    fn top() -> Self;
-
-    /// Bottom element (⊥): least element in the lattice.
-    fn bottom() -> Self;
-}
-
-/// A distributive lattice where meet distributes over join.
-///
-/// # Law
-///
-/// `a ∧ (b ∨ c) = (a ∧ b) ∨ (a ∧ c)`
-///
-/// Note: In a distributive lattice, join also distributes over meet:
-/// `a ∨ (b ∧ c) = (a ∨ b) ∧ (a ∨ c)`
-pub trait DistributiveLattice: Lattice {}
+// Re-export the core algebraic traits from portcullis-core.
+// These are the canonical definitions — all lattice types implement them.
+pub use portcullis_core::category::{BoundedLattice, DistributiveLattice, Lattice};
 
 /// A complete lattice with arbitrary meets and joins.
 ///
@@ -96,12 +61,29 @@ pub trait DistributiveLattice: Lattice {}
 ///
 /// - Every subset has a greatest lower bound (meet)
 /// - Every subset has a least upper bound (join)
+///
+/// Blanket-implemented for all `BoundedLattice` types: `meet_all`
+/// folds via `meet` with `top()` as identity, `join_all` folds via
+/// `join` with `bottom()` as identity. Override if a type has a more
+/// efficient implementation.
 pub trait CompleteLattice: BoundedLattice {
     /// Meet of all elements in an iterator.
     fn meet_all<I: IntoIterator<Item = Self>>(iter: I) -> Self;
 
     /// Join of all elements in an iterator.
     fn join_all<I: IntoIterator<Item = Self>>(iter: I) -> Self;
+}
+
+/// Blanket implementation: any bounded lattice is trivially complete
+/// over finite collections (fold with identity element).
+impl<L: BoundedLattice> CompleteLattice for L {
+    fn meet_all<I: IntoIterator<Item = Self>>(iter: I) -> Self {
+        portcullis_core::category::meet_all_bounded(iter)
+    }
+
+    fn join_all<I: IntoIterator<Item = Self>>(iter: I) -> Self {
+        portcullis_core::category::join_all_bounded(iter)
+    }
 }
 
 /// A frame: a complete lattice where finite meets distribute over arbitrary joins.
@@ -115,21 +97,41 @@ pub trait CompleteLattice: BoundedLattice {
 /// `a ∧ (⋁ᵢ bᵢ) = ⋁ᵢ (a ∧ bᵢ)` for all a and arbitrary families {bᵢ}
 pub trait Frame: CompleteLattice + DistributiveLattice {}
 
-/// A nucleus on a frame: a closure operator that preserves meets.
+/// A closure operator on a frame: deflationary and idempotent.
 ///
-/// Nuclei define quotient frames. The fixed points of a nucleus form a frame,
-/// and the nucleus provides the projection from the original frame to the quotient.
+/// This trait models a **kernel operator** (also called a deflationary
+/// closure operator). In the frame-theoretic literature a full nucleus also
+/// requires meet-preservation (`j(x ∧ y) = j(x) ∧ j(y)`), but
+/// `UninhabitableQuotient` does **not** satisfy that property — it is
+/// formally disproven by the Kani proof in `portcullis/src/kani.rs`
+/// (`proof_nucleus_not_meet_preserving`).
 ///
-/// # Properties
+/// # Properties satisfied by `UninhabitableQuotient`
 ///
 /// 1. **Idempotent**: `j(j(x)) = j(x)`
-/// 2. **Inflationary** (standard) or **Deflationary** (our case): `j(x) ≤ x`
-/// 3. **Meet-preserving**: `j(x ∧ y) = j(x) ∧ j(y)`
+/// 2. **Deflationary**: `j(x) ≤ x`
+///
+/// # Property NOT satisfied
+///
+/// 3. **Meet-preserving** `j(x ∧ y) = j(x) ∧ j(y)` — this does **NOT** hold
+///    for `UninhabitableQuotient`. Counterexample (see the Kani proof
+///    `proof_nucleus_not_meet_preserving` in `portcullis/src/kani.rs`):
+///    `a` = full caps (uninhabitable-complete), empty obligations;
+///    `b` = no-private-access caps, empty obligations.
+///    `j(a∧b)` adds no obligations (meet caps are not uninhabitable),
+///    but `j(a)∧j(b)` retains `j(a)`'s exfiltration-approval obligations.
+///
+/// # Why `SafePermissionLattice::meet` is still safe
+///
+/// `PermissionLattice::meet` is the **quotient meet** — it re-applies the
+/// uninhabitable_state constraint internally (via `obligations_for`). Fixed
+/// points are therefore closed under the quotient meet even without
+/// meet-preservation of the raw operator.
 ///
 /// # Security Application
 ///
-/// The uninhabitable_state constraint is modeled as a nucleus. The quotient frame
-/// contains only "safe" configurations where the uninhabitable_state is
+/// The uninhabitable_state constraint is modeled as this kernel operator.
+/// The quotient contains only configurations where uninhabitable_state is
 /// either absent or gated by approval obligations.
 pub trait Nucleus<L: Frame> {
     /// Apply the nucleus operator.
@@ -278,8 +280,12 @@ impl SafePermissionLattice {
 
     /// Meet of two safe permission lattices.
     ///
-    /// The result is automatically safe because the meet of fixed points
-    /// is a fixed point (nuclei preserve meets).
+    /// The result is safe because `PermissionLattice::meet` is the **quotient
+    /// meet** — it re-applies the uninhabitable_state normalization internally
+    /// (via `IncompatibilityConstraint::obligations_for`). This is distinct
+    /// from the meet-preservation property `j(x∧y) = j(x)∧j(y)`, which does
+    /// NOT hold for the raw `UninhabitableQuotient` nucleus operator (see
+    /// `proof_nucleus_not_meet_preserving` in `portcullis/src/kani.rs`).
     pub fn meet(&self, other: &Self) -> Self {
         Self(self.0.meet(&other.0))
     }
@@ -321,19 +327,7 @@ impl BoundedLattice for PermissionLattice {
 
 impl DistributiveLattice for PermissionLattice {}
 
-impl CompleteLattice for PermissionLattice {
-    fn meet_all<I: IntoIterator<Item = Self>>(iter: I) -> Self {
-        iter.into_iter()
-            .reduce(|a, b| a.meet(&b))
-            .unwrap_or_else(Self::top)
-    }
-
-    fn join_all<I: IntoIterator<Item = Self>>(iter: I) -> Self {
-        iter.into_iter()
-            .reduce(|a, b| a.join(&b))
-            .unwrap_or_else(Self::bottom)
-    }
-}
+// CompleteLattice: provided by blanket impl on BoundedLattice
 
 impl Frame for PermissionLattice {}
 
@@ -394,14 +388,23 @@ pub struct NucleusLawViolation {
     pub sample_index: usize,
 }
 
-/// The three nucleus laws.
+/// Verifiable properties of a kernel/nucleus operator.
+///
+/// **Note on `MeetPreservation`**: the frame-theoretic nucleus axiom
+/// `j(x∧y) = j(x)∧j(y)` is listed here for completeness, but
+/// `UninhabitableQuotient` does **not** satisfy it. The Kani proof
+/// `proof_nucleus_not_meet_preserving` in `portcullis/src/kani.rs`
+/// provides a concrete witness. Do not assert `MeetPreservation` passes for
+/// `UninhabitableQuotient` — see `proof_nucleus_counterexample_witness` in
+/// `portcullis/src/kani.rs` for the regression harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NucleusLaw {
     /// `j(j(x)) = j(x)`
     Idempotency,
     /// `j(x) ≤ x` (deflationary)
     Deflation,
-    /// `j(x ∧ y) = j(x) ∧ j(y)`
+    /// `j(x ∧ y) = j(x) ∧ j(y)` — NOT satisfied by `UninhabitableQuotient`.
+    /// Only holds for certain input pairs (e.g., both already fixed points).
     MeetPreservation,
 }
 
@@ -425,16 +428,25 @@ impl std::fmt::Display for NucleusLawViolation {
     }
 }
 
-/// Verify that a nucleus satisfies all three laws against sample inputs.
+/// Verify that a nucleus satisfies idempotency and deflation against sample inputs.
 ///
-/// This provides runtime confidence that a custom or composed nucleus is
-/// mathematically valid. For full verification, combine with property-based
-/// testing using `proptest`.
+/// This checks idempotency (`j(j(x)) = j(x)`), deflation (`j(x) ≤ x`), and
+/// optionally meet-preservation (`j(x∧y) = j(x)∧j(y)`) across the provided
+/// samples. Meet-preservation violations are **expected** for
+/// `UninhabitableQuotient` when samples include inputs with full capabilities
+/// and empty obligations — see `proof_nucleus_counterexample_witness` in
+/// `portcullis/src/kani.rs`.
+///
+/// The sample set `[permissive, restrictive, default, codegen]` happens to
+/// avoid the meet-preservation counterexample because `permissive()` and
+/// `restrictive()` both call `normalize()`, which pre-populates obligations
+/// before any nucleus application. Raw inputs with empty obligations (as the
+/// Verus witness uses) are needed to trigger the violation.
 ///
 /// # Example
 ///
 /// ```rust
-/// use portcullis::frame::{UninhabitableQuotient, verify_nucleus_laws};
+/// use portcullis::frame::{UninhabitableQuotient, NucleusLaw, verify_nucleus_laws};
 /// use portcullis::PermissionLattice;
 ///
 /// let nucleus = UninhabitableQuotient::new();
@@ -445,7 +457,12 @@ impl std::fmt::Display for NucleusLawViolation {
 /// ];
 ///
 /// let violations = verify_nucleus_laws(&nucleus, &samples);
-/// assert!(violations.is_empty(), "UninhabitableQuotient should satisfy all laws");
+/// // Idempotency and deflation always hold; meet-preservation does NOT hold
+/// // in general for UninhabitableQuotient (Verus-proven counterexample exists).
+/// let hard_violations: Vec<_> = violations.iter()
+///     .filter(|v| v.law != NucleusLaw::MeetPreservation)
+///     .collect();
+/// assert!(hard_violations.is_empty(), "Idempotency/deflation violated: {:?}", hard_violations);
 /// ```
 pub fn verify_nucleus_laws<N: Nucleus<PermissionLattice>>(
     nucleus: &N,
@@ -541,25 +558,98 @@ mod tests {
         assert!(projected.requires_approval(Operation::GitPush));
     }
 
+    /// Verify that j(a∧b) = j(a)∧j(b) for the specific (permissive, restrictive)
+    /// pair. These inputs both go through `normalize()` which pre-populates
+    /// obligations, and happen to avoid the meet-preservation counterexample.
+    /// This test does NOT prove general meet-preservation — see
+    /// `test_nucleus_does_not_preserve_meets_counterexample` for the violation.
     #[test]
-    fn test_nucleus_preserves_meets() {
+    fn test_nucleus_quotient_meet_fixed_points_for_normalized_inputs() {
         let nucleus = UninhabitableQuotient::new();
 
         let a = PermissionLattice::permissive();
         let b = PermissionLattice::restrictive();
 
-        // j(a ∧ b) should equal j(a) ∧ j(b)
+        // For pre-normalized inputs (both from constructors that call normalize()),
+        // j(a∧b) and j(a)∧j(b) agree because the quotient meet re-normalizes.
         let lhs = nucleus.apply(&a.meet(&b));
         let rhs = nucleus.apply(&a).meet(&nucleus.apply(&b));
 
-        // Check both capabilities AND obligations for full lattice equality
         assert_eq!(
             lhs.capabilities, rhs.capabilities,
-            "Nucleus must preserve meets (capabilities)"
+            "Quotient meet must agree for normalized inputs (capabilities)"
         );
         assert_eq!(
             lhs.obligations, rhs.obligations,
-            "Nucleus must preserve meets (obligations)"
+            "Quotient meet must agree for normalized inputs (obligations)"
+        );
+    }
+
+    /// Regression test: the raw `UninhabitableQuotient` nucleus does NOT preserve
+    /// meets in general. This is the concrete counterexample from the Kani proof
+    /// `proof_nucleus_not_meet_preserving` in `portcullis/src/kani.rs`.
+    ///
+    /// Witness:
+    /// - `a` = full caps (uninhabitable-complete), empty obligations
+    /// - `b` = no private-access caps (read_files/glob/grep = Never), empty obligations
+    ///
+    /// - `j(a∧b)`: meet caps lose private access → not uninhabitable → no obligations added.
+    /// - `j(a)∧j(b)`: j(a) has exfil-approval obligations; those persist in the meet.
+    ///   So `j(a∧b) ≠ j(a)∧j(b)`.
+    #[test]
+    fn test_nucleus_does_not_preserve_meets_counterexample() {
+        use crate::CapabilityLevel;
+
+        let nucleus = UninhabitableQuotient::new();
+
+        // a: full capabilities, uninhabitable-complete, empty obligations (not pre-normalized)
+        let mut a = PermissionLattice::default();
+        a.capabilities.read_files = CapabilityLevel::Always;
+        a.capabilities.write_files = CapabilityLevel::Always;
+        a.capabilities.edit_files = CapabilityLevel::Always;
+        a.capabilities.run_bash = CapabilityLevel::Always;
+        a.capabilities.glob_search = CapabilityLevel::Always;
+        a.capabilities.grep_search = CapabilityLevel::Always;
+        a.capabilities.web_search = CapabilityLevel::Always;
+        a.capabilities.web_fetch = CapabilityLevel::Always;
+        a.capabilities.git_commit = CapabilityLevel::Always;
+        a.capabilities.git_push = CapabilityLevel::Always;
+        a.capabilities.create_pr = CapabilityLevel::Always;
+        a.capabilities.manage_pods = CapabilityLevel::Always;
+        a.obligations = crate::capability::Obligations::default(); // empty
+        a.uninhabitable_constraint = true;
+
+        // b: no private-access capabilities (read/glob/grep = Never), empty obligations
+        let mut b = a.clone();
+        b.capabilities.read_files = CapabilityLevel::Never;
+        b.capabilities.glob_search = CapabilityLevel::Never;
+        b.capabilities.grep_search = CapabilityLevel::Never;
+        b.obligations = crate::capability::Obligations::default(); // empty
+
+        let ja = nucleus.apply(&a); // full caps + exfil-approval obligations
+        let jb = nucleus.apply(&b); // no private access → not uninhabitable → same as b
+
+        // j(a) should have obligations (uninhabitable-complete)
+        assert!(
+            !ja.obligations.is_empty(),
+            "j(a) must add obligations for uninhabitable-complete caps"
+        );
+        // j(b) should have no obligations (not uninhabitable)
+        assert!(
+            jb.obligations.is_empty(),
+            "j(b) must not add obligations when private access is absent"
+        );
+
+        // j(a ∧ b): meet caps = no private access → not uninhabitable → no obligations added
+        let j_a_meet_b = nucleus.apply(&a.meet(&b));
+        // j(a) ∧ j(b): j(a)'s obligations persist in the meet result
+        let ja_meet_jb = ja.meet(&jb);
+
+        // The counterexample: they must differ in obligations
+        assert_ne!(
+            j_a_meet_b.obligations, ja_meet_jb.obligations,
+            "Counterexample regression: j(a∧b) should NOT equal j(a)∧j(b) in obligations \
+             (UninhabitableQuotient does not preserve meets — Kani proof_nucleus_not_meet_preserving)"
         );
     }
 
@@ -619,6 +709,11 @@ mod tests {
             .leq(&PermissionLattice::restrictive().capabilities));
     }
 
+    /// Verify idempotency and deflation hold for UninhabitableQuotient on the
+    /// standard sample set. These normalized inputs happen to avoid the
+    /// meet-preservation counterexample (all call `normalize()` which
+    /// pre-populates obligations). Meet-preservation is intentionally not
+    /// asserted as a hard requirement here.
     #[test]
     fn test_verify_nucleus_laws_uninhabitable_quotient() {
         let nucleus = UninhabitableQuotient::new();
@@ -630,11 +725,21 @@ mod tests {
         ];
 
         let violations = verify_nucleus_laws(&nucleus, &samples);
+
+        // Only idempotency and deflation are hard requirements.
+        // Meet-preservation does NOT hold for UninhabitableQuotient in general
+        // (see proof_nucleus_not_meet_preserving in portcullis/src/kani.rs).
+        let hard_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.law != NucleusLaw::MeetPreservation)
+            .collect();
         assert!(
-            violations.is_empty(),
-            "UninhabitableQuotient violated {} law(s): {:?}",
-            violations.len(),
-            violations.iter().map(|v| v.to_string()).collect::<Vec<_>>()
+            hard_violations.is_empty(),
+            "UninhabitableQuotient violated idempotency/deflation: {:?}",
+            hard_violations
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
         );
     }
 

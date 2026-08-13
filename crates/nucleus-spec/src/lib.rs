@@ -1,5 +1,8 @@
 //! PodSpec definitions shared by nucleus-node and nucleus-tool-proxy.
 
+pub mod tier2_artifacts;
+pub mod vmm_version;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -74,6 +77,15 @@ pub struct PodSpecInner {
     /// Optional VM image hints (Firecracker).
     #[serde(default)]
     pub image: Option<ImageSpec>,
+    /// Upstreams the pod may reach with a credential it never sees.
+    #[serde(default)]
+    pub credentialed_egress: Vec<CredentialedEgressSpec>,
+    /// Optional workload to run inside the pod under mediation.
+    ///
+    /// Absent means the pod serves its API and runs nothing of its own, which is
+    /// the historical behaviour.
+    #[serde(default)]
+    pub workload: Option<WorkloadSpec>,
     /// Optional vsock configuration for VM communication.
     #[serde(default)]
     pub vsock: Option<VsockSpec>,
@@ -261,12 +273,14 @@ pub struct NetworkSpec {
     /// If non-empty, only URLs matching at least one pattern are permitted.
     #[serde(default)]
     pub url_allow: Vec<String>,
-    /// Override the default MIME type allowlist for web_fetch responses.
-    /// If None, the built-in allowlist (text + structured data) is used.
+    /// Override the built-in MIME-type allowlist for web_fetch responses.
+    /// When `Some`, the listed prefixes REPLACE the built-in list; when `None`,
+    /// the built-in allowlist (text + structured data) is used.
     #[serde(default)]
     pub mime_allow: Option<Vec<String>>,
-    /// Maximum response body size in bytes for web_fetch.
-    /// Defaults to 10 MiB if not specified.
+    /// Per-pod maximum response body size in bytes for web_fetch.
+    /// When `None`, the proxy's configured cap applies
+    /// (`--web-fetch-max-bytes` / `NUCLEUS_TOOL_PROXY_WEB_FETCH_MAX_BYTES`).
     #[serde(default)]
     pub max_response_bytes: Option<u64>,
 }
@@ -288,7 +302,7 @@ impl NetworkSpec {
         }
     }
 
-    /// Allow package registries + GitHub API — minimum for build/test work.
+    /// Allow package registries + source-host APIs — minimum for build/test work.
     ///
     /// DNS entries are resolved and pinned at pod start by the dnsmasq proxy.
     /// Used for `TrustLevel::OrgBYOK` or `NetworkIsolation::Filtered`.
@@ -306,13 +320,13 @@ impl NetworkSpec {
                 // Python
                 "pypi.org".into(),
                 "files.pythonhosted.org".into(),
-                // GitHub (API, web, uploads, LFS)
-                "github.com".into(),
-                "api.github.com".into(),
-                "uploads.github.com".into(),
-                "objects.githubusercontent.com".into(),
-                // Anthropic API (for Claude CLI)
-                "api.anthropic.com".into(),
+                // Source host (API, web, uploads, LFS)
+                "github.com".into(), // vendor-allow: load-bearing default egress host for source/VCS access
+                "api.github.com".into(), // vendor-allow: load-bearing default egress host for source/VCS API
+                "uploads.github.com".into(), // vendor-allow: load-bearing default egress host for release/artifact uploads
+                "objects.githubusercontent.com".into(), // vendor-allow: load-bearing default egress host for LFS/object fetches
+                // LLM provider API (default agent-CLI egress)
+                "api.anthropic.com".into(), // vendor-allow: load-bearing default egress host for the agent's model API
             ],
             url_allow: vec![],
             mime_allow: None,
@@ -396,21 +410,44 @@ pub struct CgroupSetting {
 
 /// Credentials to inject into a pod.
 ///
-/// Credentials are passed securely to the pod's workload as environment variables.
-/// Values are stored in memory-mapped tmpfs and never written to persistent storage.
+/// Two delivery modes, both vendor-agnostic:
 ///
-/// SECURITY NOTE: This struct implements a custom `Debug` that redacts secret values.
+/// 1. `env` — long-lived secrets passed as environment variables. Suitable for
+///    development loops and providers that do not support OIDC token exchange.
+///    Values are stored in memory-mapped tmpfs and never written to persistent
+///    storage.
+///
+/// 2. `workload_identity` — short-lived OIDC tokens (typically JWT-SVIDs from a
+///    SPIFFE workload API or Kubernetes projected service-account tokens) fetched
+///    at pod start and refreshed before expiry. The pod sees only a file path via
+///    an env var; no static secret material crosses the boundary. Works with any
+///    relying party that accepts OIDC token exchange (a cloud STS, an LLM
+///    provider API, …); nucleus only knows about the token-exchange dance.
+///
+/// SECURITY NOTE: This struct implements a custom `Debug` that redacts secret
+/// values for the `env` map. `workload_identity` entries contain no secret
+/// material so they debug normally.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct CredentialsSpec {
     /// Environment variables containing credentials.
     /// Keys are the variable names (e.g., `LLM_API_TOKEN`), values are the secrets.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+
+    /// OIDC workload-identity token bindings.
+    ///
+    /// Each entry causes the pod runtime to fetch a short-lived JWT before the
+    /// workload starts, write it to `token_path` on a memory-backed tmpfs, and
+    /// refresh it before expiry. The application reads the file path from the
+    /// `env_var` environment variable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workload_identity: Vec<WorkloadIdentitySpec>,
 }
 
 impl std::fmt::Debug for CredentialsSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Redact all credential values for safe debug output
+        // Redact env values for safe debug output. Workload-identity entries
+        // contain no secret material (just an audience and a file path).
         let redacted: BTreeMap<&str, &str> = self
             .env
             .keys()
@@ -418,6 +455,7 @@ impl std::fmt::Debug for CredentialsSpec {
             .collect();
         f.debug_struct("CredentialsSpec")
             .field("env", &redacted)
+            .field("workload_identity", &self.workload_identity)
             .finish()
     }
 }
@@ -434,9 +472,15 @@ impl CredentialsSpec {
         self
     }
 
+    /// Add a workload-identity binding.
+    pub fn with_workload_identity(mut self, spec: WorkloadIdentitySpec) -> Self {
+        self.workload_identity.push(spec);
+        self
+    }
+
     /// Check if credentials are empty.
     pub fn is_empty(&self) -> bool {
-        self.env.is_empty()
+        self.env.is_empty() && self.workload_identity.is_empty()
     }
 
     /// Get a redacted representation for logging.
@@ -448,13 +492,109 @@ impl CredentialsSpec {
     }
 }
 
+/// A single OIDC workload-identity binding.
+///
+/// **Status: draft RFC, no runtime consumer in this repo today.** This type
+/// parses and serializes; nothing in `nucleus`, `nucleus-tool-proxy`,
+/// `nucleus-node`, or `nucleus-mcp` reads `credentials.workload_identity` yet.
+/// A `PodSpec` that sets this field will start the pod normally — but no token
+/// file appears, no env var is set, and no audit record is emitted. Wait for
+/// the runtime PR before depending on the documented behavior below.
+///
+/// **Intended (not yet implemented) behavior:** at pod start, the runtime
+/// fetches a JWT from `source` with the configured `audience`, writes it to
+/// `token_path` on a memory-backed tmpfs, and refreshes before expiry per
+/// `refresh`. The workload reads the file path via `env_var`.
+///
+/// This type is provider-agnostic. The orchestrator (or operator) chooses the
+/// `audience` value for whichever relying party the workload calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadIdentitySpec {
+    /// Logical name (e.g. "llm-provider", "prod-sts"). Used in audit records.
+    pub name: String,
+
+    /// OIDC audience to request. Provider-defined; **nucleus does not yet
+    /// validate** that this is a well-formed URL or coordinate against an
+    /// allow-list. A typo here will silently produce a JWT no relying party
+    /// accepts. Validation is tracked for the runtime PR.
+    /// Examples: `https://oidc.example.com`, `https://sts.example.com`.
+    pub audience: String,
+
+    /// Environment variable the application reads to find the token file.
+    /// Convention: `<PROVIDER>_IDENTITY_TOKEN_FILE`.
+    pub env_var: String,
+
+    /// Where the token is written inside the pod. MUST be on a memory-backed
+    /// mount; the runtime is responsible for enforcing this.
+    pub token_path: PathBuf,
+
+    /// Refresh policy. Defaults to refreshing at 50% of token lifetime.
+    #[serde(default)]
+    pub refresh: RefreshPolicy,
+
+    /// Where the JWT comes from. Defaults to the local SPIFFE Workload API.
+    #[serde(default)]
+    pub source: IdentitySource,
+}
+
+/// Token refresh policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RefreshPolicy {
+    /// Refresh when the token has consumed `fraction` of its lifetime.
+    /// Value is in basis points (0–10000) so the type stays `Eq`.
+    LifetimeFraction { basis_points: u16 },
+    /// Refresh at a fixed cadence regardless of token lifetime.
+    FixedInterval { seconds: u64 },
+}
+
+impl Default for RefreshPolicy {
+    fn default() -> Self {
+        // 5000 bp = 50% of token lifetime.
+        Self::LifetimeFraction { basis_points: 5000 }
+    }
+}
+
+/// Source of the workload identity token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IdentitySource {
+    /// Fetch from the local SPIFFE Workload API (e.g. SPIRE Agent socket).
+    /// `socket_path` defaults to the SPIFFE-standard well-known location when
+    /// `None` (the runtime resolves it).
+    Spiffe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket_path: Option<PathBuf>,
+    },
+    /// Fetch a Kubernetes projected service-account token via the kubelet.
+    KubernetesProjected {
+        /// Audience to request from the kubelet (separate from the relying
+        /// party's audience; some setups require an intermediate audience).
+        kubelet_audience: String,
+        /// Requested token lifetime in seconds.
+        expiration_seconds: u64,
+    },
+    /// Read a pre-provisioned static JWT from disk. For **testing** or for
+    /// issuers that do not support online refresh. Production deployments
+    /// should not use this variant: the (planned) runtime will not validate
+    /// the JWT's signature or expiry before serving it, and there is no
+    /// path-canonicalization or symlink restriction.
+    StaticFile { path: PathBuf },
+}
+
+impl Default for IdentitySource {
+    fn default() -> Self {
+        Self::Spiffe { socket_path: None }
+    }
+}
+
 /// Remote audit sink configuration for deletion-resistant log shipping.
 ///
 /// When configured, audit entries are written to an S3-compatible object store
 /// in addition to the local HMAC-signed JSONL log. Each entry is a separate
 /// object with `if_none_match("*")` to enforce append-only semantics.
 ///
-/// Compatible with: AWS S3, MinIO, Cloudflare R2, Tigris.
+/// Compatible with: any S3-compatible object store (e.g. AWS S3, MinIO).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditSinkSpec {
     /// S3 bucket name.
@@ -502,6 +642,233 @@ pub struct ExitReport {
     /// Estimated cost in USD.
     #[serde(default)]
     pub cost_usd: f64,
+
+    // ── Verified Exposure (written by tool proxy's McpMediator) ───────
+    /// Observed exposure legs during execution.
+    /// e.g., ["PrivateData", "UntrustedContent", "ExfilVector"]
+    #[serde(default)]
+    pub observed_exposure_labels: Vec<String>,
+
+    /// Observed risk tier: "safe", "low", "medium", "critical".
+    #[serde(default)]
+    pub observed_risk_tier: String,
+
+    /// Whether the uninhabitable state was reached during execution.
+    #[serde(default)]
+    pub uninhabitable_reached: bool,
+
+    // ── Runtime verification (written by the tool proxy's TraceMonitor) ──
+    /// Decision-stream properties observed to be violated during execution,
+    /// as class labels (`OutcomeWithoutDecision`, `PermissionDiscontinuity`,
+    /// `ExposureRegressed`).
+    ///
+    /// These are *observations of what ran*, complementing
+    /// `observed_exposure_labels`: exposure says which capability legs the
+    /// session exercised, this says whether the mediation invariants held while
+    /// it did. An empty list on a session with a non-zero
+    /// `audit_entry_count` is the expected, healthy case.
+    ///
+    /// Detail fields are deliberately not carried across this boundary — the
+    /// class is enough to say which property broke without exporting the
+    /// session state that broke it.
+    #[serde(default)]
+    pub monitor_violations: Vec<String>,
+
+    /// Violations observed but not retained, because the in-memory cap was
+    /// reached. Non-zero means `monitor_violations` is truncated and its length
+    /// must not be read as the total.
+    #[serde(default)]
+    pub monitor_violations_dropped: u64,
+
+    // ── Article 12 record-keeping (written by the tool proxy at shutdown) ──
+    /// The Article 12 log's chain head at shutdown, empty when no log was kept.
+    ///
+    /// This is the hash the host binds with its OWN key. Its purpose is to close
+    /// the limitation the verifier otherwise has to report: an HMAC'd chain shows
+    /// no party lacking the secret altered the file, but says nothing about a
+    /// holder of the secret rewriting history. A pod that rewrites its log
+    /// produces a different head, and cannot forge the executor's signature over
+    /// the new one.
+    ///
+    /// The binding is only as strong as the moment it happens: the host signs at
+    /// pod exit, which the pod does not control.
+    #[serde(default)]
+    pub art12_chain_head: String,
+
+    /// Records the Article 12 log wrote, and how many it could not.
+    ///
+    /// A non-zero `dropped` means the log went degraded — the runtime then
+    /// refuses further operations, so this bounds the gap rather than hiding it.
+    #[serde(default)]
+    pub art12_records: u64,
+    #[serde(default)]
+    pub art12_dropped: u64,
+}
+
+/// An upstream the workload may call without holding the credential.
+///
+/// # The problem this solves
+///
+/// A workload given an API token in its environment can exfiltrate it, and its
+/// calls to that API bypass every gate the runtime applies to tool calls — the
+/// data it has read leaves in a request body nothing inspected. Both follow from
+/// the same choice: putting the credential in the guest.
+///
+/// The runtime holds it instead and forwards on the workload's behalf. The
+/// workload is told a LOCAL address; the upstream and the header are fixed here,
+/// so it can neither redirect the request nor read what authenticates it.
+///
+/// # Per-pod, and it must stay that way
+///
+/// This concentrates a credential in the proxy, and credential-concentrating AI
+/// gateways are a demonstrated supply-chain target (the LiteLLM compromise of
+/// March 2026 shipped releases that harvested exactly the keys such services
+/// hold). The mitigation is structural: this proxy is per-pod and holds one
+/// pod's credentials, not a fleet's. Do not turn it into a shared gateway.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialedEgressSpec {
+    /// Name the workload refers to this upstream by.
+    pub name: String,
+    /// Absolute upstream base URL. Fixed here; a request cannot change it.
+    pub upstream: String,
+    /// Environment variable **in the NODE's environment** holding the credential.
+    ///
+    /// # It is the node's, not the guest's, and not the pod spec's
+    ///
+    /// This said "the RUNTIME's environment" when the runtime that held the
+    /// credential was the in-guest proxy. The host holds it now, and the
+    /// distinction is load-bearing rather than a rename:
+    ///
+    /// * **Not the pod spec.** On Firecracker `build-rootfs.sh` copies the pod
+    ///   spec into the image at BUILD time, so a credential taken from
+    ///   `credentials.env` would be written into the guest rootfs — the exact
+    ///   opposite of what this type exists to arrange.
+    /// * **Not the guest.** That is the whole point: the guest receives the
+    ///   RESULT of a call made with this, never this.
+    ///
+    /// `nucleus_node::broker_launch::store_from_node_environment` cannot reach a
+    /// `PodSpec` at all, so the first of those is a property of a signature
+    /// rather than a rule someone has to remember.
+    ///
+    /// An unset or empty variable registers nothing and the broker refuses that
+    /// upstream by absence.
+    pub credential_env: String,
+    /// Header the credential is injected as (e.g. `authorization`).
+    pub header: String,
+    /// Optional prefix for the header value (e.g. `Bearer `).
+    #[serde(default)]
+    pub value_prefix: String,
+}
+
+impl CredentialedEgressSpec {
+    /// Resolve a caller-supplied path against this upstream's FIXED base.
+    ///
+    /// # This is the fixity property, and it lives here so there is one of it
+    ///
+    /// Two different components now send a credential on a workload's behalf:
+    /// the in-guest proxy forwards to the upstream itself, and the host performs
+    /// the call for a pod whose guest never receives the credential at all. Both
+    /// take a path chosen by the agent, and both must refuse to let that path
+    /// decide *where the credential is sent*.
+    ///
+    /// That is one property, so it is one function. Two copies would be two
+    /// chances to fix a traversal bug in one place and not the other, and a
+    /// green test suite on either side would say nothing about the other's
+    /// copy — the caller-pins-its-own-use tests in each crate call THIS, rather
+    /// than restating it.
+    ///
+    /// # Refused, not normalised
+    ///
+    /// An absolute URL or any `..` is rejected outright rather than cleaned up.
+    /// Normalising is how "the workload cannot choose the upstream" quietly
+    /// stops being true: every normaliser is a small parser, and the agent
+    /// supplying the input gets unlimited attempts at finding the case it gets
+    /// wrong.
+    ///
+    /// # What is deliberately NOT checked, and why
+    ///
+    /// Protocol-relative (`//host/x`) and backslash paths look like traversal
+    /// and are not, *here*: the join trims leading `/` from the path and
+    /// trailing `/` from the base, so `//host/x` becomes `<base>/host/x` — a
+    /// path under the upstream, not a redirect away from it. Checks for them
+    /// were written and then removed rather than kept "just in case", because a
+    /// control that does nothing still reads to the next person as evidence that
+    /// the case was handled.
+    ///
+    /// The join is therefore load-bearing, and
+    /// `a_protocol_relative_path_stays_under_the_base` pins it: if the
+    /// concatenation ever changes so that a leading `//` survives, that test
+    /// fails and this comment stops being true at the same moment.
+    #[must_use]
+    pub fn url_for(&self, path: &str) -> Option<String> {
+        if path.contains("..")
+            || path.starts_with("http://")
+            || path.starts_with("https://")
+            // Percent-encoded dots, which is traversal that `..` does not see.
+            // The path is handed to the upstream verbatim, and an upstream that
+            // percent-decodes before it normalises resolves `%2e%2e/` exactly
+            // as it resolves `../` — reaching a path ABOVE the base this spec
+            // fixes. Same host, so it is not a redirect; it is still the guest
+            // choosing a path the operator did not grant.
+            || path.to_ascii_lowercase().contains("%2e")
+        {
+            return None;
+        }
+        let base = self.upstream.trim_end_matches('/');
+        let path = path.trim_start_matches('/');
+        Some(format!("{base}/{path}"))
+    }
+}
+
+/// A process the pod runs under its own mediation.
+///
+/// # Why the runtime starts it, rather than the image
+///
+/// The workload's whole value is that every effect it attempts goes through the
+/// kernel. If it were started by the boot process alongside the proxy, there
+/// would be a window — however short — in which it is running and mediation is
+/// not, and anything it did in that window would be unmediated AND unrecorded.
+/// So the proxy spawns it, after its sink chain and kernel are live. See
+/// `spawn_workload`.
+///
+/// # Vendor neutrality
+///
+/// `command`, `args` and `env` are opaque. Nucleus does not know or care what
+/// agent this is; a vendor-aware orchestrator supplies the binary, its
+/// credentials (via `credentials.env`) and any endpoint it needs on the network
+/// allowlist. Nothing vendor-specific belongs in this struct or in the runtime
+/// that reads it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadSpec {
+    /// Executable to run. Resolved inside the guest, not on the host.
+    pub command: String,
+    /// Arguments, passed through verbatim.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment for the workload.
+    ///
+    /// Merged UNDER the runtime's own injected variables, so a spec cannot
+    /// redirect the workload away from the mediating proxy by setting the same
+    /// key — see `workload_env`.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// UID to run the workload as.
+    ///
+    /// # Why this matters more than it looks
+    ///
+    /// The runtime and the workload share a guest. On Linux a process can read
+    /// `/proc/<pid>/environ` of any process with the SAME uid, so a workload
+    /// running as the runtime's user can simply read the runtime's environment —
+    /// including a credential that `credentialed_egress` exists to keep out of
+    /// its hands. "Not in the workload's environment" is not the same as "the
+    /// workload cannot get it", and only a uid boundary makes the second true.
+    ///
+    /// `None` means the workload runs as the runtime's user, which is fine when
+    /// no credential is being withheld from it. When `credentialed_egress` is
+    /// configured, a distinct uid is REQUIRED and the pod refuses to start
+    /// without one.
+    #[serde(default)]
+    pub uid: Option<u32>,
 }
 
 /// Errors resolving policies.
@@ -510,6 +877,106 @@ pub enum PolicyError {
     /// The named profile was not found.
     #[error("unknown policy profile: {0}")]
     UnknownProfile(String),
+}
+
+#[cfg(test)]
+mod credentialed_egress_fixity {
+    use super::*;
+
+    fn spec() -> CredentialedEgressSpec {
+        CredentialedEgressSpec {
+            name: "model-api".into(),
+            upstream: "https://upstream.invalid/v1".into(),
+            credential_env: "NUCLEUS_TEST_EGRESS_CRED".into(),
+            header: "authorization".into(),
+            value_prefix: "Bearer ".into(),
+        }
+    }
+
+    /// **The control, first.** Everything below asserts a refusal, and an
+    /// implementation that refused every path would satisfy all of them while
+    /// being completely broken. This says the ordinary case still works.
+    #[test]
+    fn an_ordinary_path_resolves_under_the_configured_base() {
+        assert_eq!(
+            spec().url_for("/messages").as_deref(),
+            Some("https://upstream.invalid/v1/messages")
+        );
+        assert_eq!(
+            spec().url_for("messages").as_deref(),
+            Some("https://upstream.invalid/v1/messages")
+        );
+    }
+
+    /// **A caller cannot redirect where the credential is sent.** This is the
+    /// property; the guest picks the path and must not thereby pick the host.
+    #[test]
+    fn a_path_cannot_redirect_the_upstream() {
+        for hostile in [
+            "https://attacker.invalid/steal",
+            "http://attacker.invalid/steal",
+            "../../../other",
+            "messages/../../escape",
+        ] {
+            assert!(
+                spec().url_for(hostile).is_none(),
+                "{hostile:?} must not resolve to an upstream URL"
+            );
+        }
+    }
+
+    /// Percent-encoded traversal, which a plain `..` scan does not see.
+    ///
+    /// The path reaches the upstream verbatim, so an upstream that decodes
+    /// before it normalises treats `%2e%2e/` exactly as `../`. Same host, so
+    /// this is not a redirect — it is reaching a path above the base the
+    /// operator fixed, which the base exists to prevent.
+    #[test]
+    fn percent_encoded_traversal_is_refused_in_any_case() {
+        for hostile in [
+            "%2e%2e/admin",
+            "%2E%2E/admin",
+            "messages/%2e%2e/%2e%2e/admin",
+            "%2e%2E/admin",
+        ] {
+            assert!(
+                spec().url_for(hostile).is_none(),
+                "{hostile:?} decodes to traversal at an upstream that decodes first"
+            );
+        }
+    }
+
+    /// **The join is what makes protocol-relative paths harmless**, and the
+    /// docs say so — so this pins it rather than leaving the claim unchecked.
+    ///
+    /// `url_for` deliberately does NOT test for a leading `//`, because
+    /// trimming leading `/` from the path already puts it under the base. If
+    /// the concatenation ever changes so a leading `//` survives, the doc
+    /// comment silently becomes false; this test fails at that moment instead.
+    #[test]
+    fn a_protocol_relative_path_stays_under_the_base() {
+        let url = spec()
+            .url_for("//attacker.invalid/steal")
+            .expect("not refused — it is neutralised by the join, not rejected");
+        assert_eq!(url, "https://upstream.invalid/v1/attacker.invalid/steal");
+        assert!(
+            url.starts_with("https://upstream.invalid/v1/"),
+            "a protocol-relative path escaped the base: {url}"
+        );
+    }
+
+    /// A base with a trailing slash must not produce a doubled separator, and
+    /// more importantly must not produce `https://host//x` — which some proxies
+    /// and origin servers do not treat as `https://host/x`.
+    #[test]
+    fn a_trailing_slash_on_the_base_does_not_double_the_separator() {
+        let mut s = spec();
+        s.upstream = "https://upstream.invalid/v1/".into();
+        assert_eq!(
+            s.url_for("messages").as_deref(),
+            Some("https://upstream.invalid/v1/messages")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -624,7 +1091,7 @@ mod tests {
     fn test_credentials_spec_debug_redacts_values() {
         let creds = CredentialsSpec::new()
             .with_env("LLM_API_TOKEN", "super-secret-token-12345")
-            .with_env("GITHUB_TOKEN", "ghp_abcdefghijklmnop");
+            .with_env("REGISTRY_TOKEN", "test-registry-token-abc");
 
         let debug_output = format!("{:?}", creds);
 
@@ -635,8 +1102,8 @@ mod tests {
             debug_output
         );
         assert!(
-            !debug_output.contains("ghp_abcdefghijklmnop"),
-            "Debug output must not contain GitHub token: {}",
+            !debug_output.contains("test-registry-token-abc"),
+            "Debug output must not contain registry token: {}",
             debug_output
         );
 
@@ -647,7 +1114,7 @@ mod tests {
             debug_output
         );
         assert!(
-            debug_output.contains("GITHUB_TOKEN"),
+            debug_output.contains("REGISTRY_TOKEN"),
             "Debug output should show key names: {}",
             debug_output
         );
@@ -708,6 +1175,191 @@ mod tests {
         assert!(yaml.contains("LLM_API_TOKEN"));
     }
 
+    fn sample_workload_identity() -> WorkloadIdentitySpec {
+        WorkloadIdentitySpec {
+            name: "example-provider".to_string(),
+            audience: "https://oidc.example.com".to_string(),
+            env_var: "LLM_IDENTITY_TOKEN_FILE".to_string(),
+            token_path: PathBuf::from("/var/run/secrets/llm/token"),
+            refresh: RefreshPolicy::default(),
+            source: IdentitySource::default(),
+        }
+    }
+
+    #[test]
+    fn test_workload_identity_default_refresh_is_half_lifetime() {
+        match RefreshPolicy::default() {
+            RefreshPolicy::LifetimeFraction { basis_points } => {
+                assert_eq!(basis_points, 5000, "default should be 50% of lifetime");
+            }
+            other => panic!("expected LifetimeFraction default, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_workload_identity_default_source_is_spiffe() {
+        match IdentitySource::default() {
+            IdentitySource::Spiffe { socket_path } => {
+                assert!(
+                    socket_path.is_none(),
+                    "default SPIFFE source should defer socket resolution to runtime"
+                );
+            }
+            other => panic!("expected Spiffe default, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_credentials_spec_with_workload_identity_not_empty() {
+        let creds = CredentialsSpec::new().with_workload_identity(sample_workload_identity());
+        assert!(
+            !creds.is_empty(),
+            "spec with workload identity must not be empty"
+        );
+        assert_eq!(creds.workload_identity.len(), 1);
+        assert_eq!(creds.workload_identity[0].name, "example-provider");
+    }
+
+    #[test]
+    fn test_credentials_spec_workload_identity_yaml_roundtrip() {
+        let creds = CredentialsSpec::new().with_workload_identity(sample_workload_identity());
+
+        let yaml = serde_yaml::to_string(&creds).expect("should serialize");
+        let parsed: CredentialsSpec = serde_yaml::from_str(&yaml).expect("should parse");
+
+        assert_eq!(parsed.workload_identity.len(), 1);
+        assert_eq!(parsed.workload_identity[0], sample_workload_identity());
+    }
+
+    #[test]
+    fn test_credentials_spec_workload_identity_omitted_when_empty() {
+        // Backwards compat: existing CredentialsSpec YAML without
+        // workload_identity should serialize without the field.
+        let creds = CredentialsSpec::new().with_env("LLM_API_TOKEN", "x");
+        let yaml = serde_yaml::to_string(&creds).expect("should serialize");
+        assert!(
+            !yaml.contains("workload_identity"),
+            "empty workload_identity should be skipped: {yaml}"
+        );
+    }
+
+    #[test]
+    fn test_credentials_spec_legacy_yaml_still_parses() {
+        // YAML written before this field existed must continue to parse.
+        let yaml = "env:\n  LLM_API_TOKEN: secret\n";
+        let creds: CredentialsSpec = serde_yaml::from_str(yaml).expect("legacy YAML must parse");
+        assert_eq!(creds.env.get("LLM_API_TOKEN"), Some(&"secret".to_string()));
+        assert!(creds.workload_identity.is_empty());
+    }
+
+    #[test]
+    fn test_pod_spec_with_workload_identity_parses() {
+        let yaml = r#"
+apiVersion: nucleus/v1
+kind: Pod
+metadata:
+  name: test-pod
+spec:
+  work_dir: /tmp
+  timeout_seconds: 300
+  policy:
+    type: profile
+    name: default
+  credentials:
+    workload_identity:
+      - name: llm-provider
+        audience: https://oidc.example.com
+        env_var: LLM_IDENTITY_TOKEN_FILE
+        token_path: /var/run/secrets/llm/token
+        source:
+          type: spiffe
+"#;
+
+        let spec: PodSpec = serde_yaml::from_str(yaml).expect("should parse");
+        let creds = spec
+            .spec
+            .credentials
+            .expect("credentials should be present");
+        assert_eq!(creds.workload_identity.len(), 1);
+        let wi = &creds.workload_identity[0];
+        assert_eq!(wi.name, "llm-provider");
+        assert_eq!(wi.audience, "https://oidc.example.com");
+        assert_eq!(wi.env_var, "LLM_IDENTITY_TOKEN_FILE");
+        assert_eq!(wi.token_path, PathBuf::from("/var/run/secrets/llm/token"));
+        assert!(matches!(wi.source, IdentitySource::Spiffe { .. }));
+    }
+
+    #[test]
+    fn test_workload_identity_kubernetes_projected_source_parses() {
+        let yaml = r#"
+name: oidc
+audience: https://oidc.example.com
+env_var: LLM_IDENTITY_TOKEN_FILE
+token_path: /var/run/secrets/llm/token
+source:
+  type: kubernetes_projected
+  kubelet_audience: sts.amazonaws.com
+  expiration_seconds: 3600
+"#;
+        let wi: WorkloadIdentitySpec = serde_yaml::from_str(yaml).expect("should parse");
+        match wi.source {
+            IdentitySource::KubernetesProjected {
+                kubelet_audience,
+                expiration_seconds,
+            } => {
+                assert_eq!(kubelet_audience, "sts.amazonaws.com");
+                assert_eq!(expiration_seconds, 3600);
+            }
+            other => panic!("expected KubernetesProjected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_workload_identity_static_file_source_parses() {
+        let yaml = r#"
+name: testing
+audience: https://oidc.example.com
+env_var: LLM_IDENTITY_TOKEN_FILE
+token_path: /var/run/secrets/llm/token
+source:
+  type: static_file
+  path: /etc/test/jwt
+"#;
+        let wi: WorkloadIdentitySpec = serde_yaml::from_str(yaml).expect("should parse");
+        match wi.source {
+            IdentitySource::StaticFile { path } => {
+                assert_eq!(path, PathBuf::from("/etc/test/jwt"));
+            }
+            other => panic!("expected StaticFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_workload_identity_does_not_leak_secrets_in_debug() {
+        // Tokens live on disk, not in the spec — but the spec's debug output
+        // must remain free of any path that could be confused with a secret.
+        // This test pins behavior: WorkloadIdentitySpec contains no field
+        // that requires redaction, so its Debug is allowed to show audience
+        // and paths verbatim. If a secret-bearing field is ever added, this
+        // test should be updated to assert redaction.
+        let wi = sample_workload_identity();
+        let dbg = format!("{:?}", wi);
+        assert!(dbg.contains("example-provider"));
+        assert!(dbg.contains("https://oidc.example.com"));
+    }
+
+    #[test]
+    fn test_credentials_spec_debug_includes_workload_identity_summary() {
+        let creds = CredentialsSpec::new()
+            .with_env("LLM_API_TOKEN", "supersecret")
+            .with_workload_identity(sample_workload_identity());
+        let dbg = format!("{:?}", creds);
+        assert!(!dbg.contains("supersecret"), "env values must be redacted");
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(dbg.contains("workload_identity"));
+        assert!(dbg.contains("example-provider"));
+    }
+
     #[test]
     fn test_pod_spec_with_credentials_parses() {
         let yaml = r#"
@@ -724,7 +1376,7 @@ spec:
   credentials:
     env:
       LLM_API_TOKEN: "secret-token-12345"
-      GITHUB_TOKEN: "ghp_test"
+      REGISTRY_TOKEN: "test-registry-token"
 "#;
 
         let spec: PodSpec = serde_yaml::from_str(yaml).expect("should parse");
@@ -736,7 +1388,10 @@ spec:
             creds.env.get("LLM_API_TOKEN"),
             Some(&"secret-token-12345".to_string())
         );
-        assert_eq!(creds.env.get("GITHUB_TOKEN"), Some(&"ghp_test".to_string()));
+        assert_eq!(
+            creds.env.get("REGISTRY_TOKEN"),
+            Some(&"test-registry-token".to_string())
+        );
     }
 
     #[test]
@@ -775,7 +1430,7 @@ spec:
   credentials:
     env:
       LLM_API_TOKEN: "sk-secret-12345-abcdef"
-      GITHUB_TOKEN: "ghp_supersecret"
+      REGISTRY_TOKEN: "test-registry-supersecret"
 "#;
 
         let spec: PodSpec = serde_yaml::from_str(yaml).expect("should parse");
@@ -790,8 +1445,8 @@ spec:
             debug_output
         );
         assert!(
-            !debug_output.contains("ghp_supersecret"),
-            "PodSpec debug must not leak GITHUB_TOKEN: {}",
+            !debug_output.contains("test-registry-supersecret"),
+            "PodSpec debug must not leak REGISTRY_TOKEN: {}",
             debug_output
         );
 
@@ -934,12 +1589,12 @@ spec:
             "should allow pypi"
         );
         assert!(
-            spec.dns_allow.contains(&"api.github.com".to_string()),
-            "should allow GitHub API"
+            spec.dns_allow.contains(&"api.github.com".to_string()), // vendor-allow: asserts load-bearing default egress host
+            "should allow source-host API"
         );
         assert!(
-            spec.dns_allow.contains(&"api.anthropic.com".to_string()),
-            "should allow Anthropic API"
+            spec.dns_allow.contains(&"api.anthropic.com".to_string()), // vendor-allow: asserts load-bearing default egress host
+            "should allow LLM provider API"
         );
     }
 

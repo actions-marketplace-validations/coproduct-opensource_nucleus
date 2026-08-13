@@ -67,9 +67,9 @@ pub fn print_scan_report(report: &ScanReport) {
     }
     println!();
 
-    // --- Claude settings summary ---
-    if let Some(cs) = &report.claude_settings_summary {
-        println!("── Claude Code Settings ────────────────────────────────────────");
+    // --- Agent settings summary ---
+    if let Some(cs) = &report.agent_settings_summary {
+        println!("── Agent Tool Settings ─────────────────────────────────────────");
         println!("  Allow rules:       {}", cs.total_allow_rules);
         println!("  Deny rules:        {}", cs.total_deny_rules);
         println!("  Ask rules:         {}", cs.total_ask_rules);
@@ -177,6 +177,16 @@ pub fn print_scan_report(report: &ScanReport) {
         "PASS"
     };
     println!("══ Verdict: {} ══", verdict);
+
+    // PLG funnel: point users to enforcement after showing findings
+    if critical_count > 0 || high_count > 0 {
+        println!();
+        println!("  Enforce these rules on every PR:");
+        println!("    https://github.com/apps/mergeconstitution");
+        println!();
+        println!("  Generate a remediation profile:");
+        println!("    nucleus-audit scan --auto --suggest-profile > policy.yaml");
+    }
 }
 
 pub fn textwrap(s: &str, width: usize) -> Vec<String> {

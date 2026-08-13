@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Executable Specification for the Kernel Decision Engine
 //!
 //! This module defines the kernel's intended behavior as a **reference model**
@@ -43,13 +44,15 @@ fn spec_classify(op: Operation) -> Option<ExposureLabel> {
             Some(ExposureLabel::PrivateData)
         }
         Operation::WebFetch | Operation::WebSearch => Some(ExposureLabel::UntrustedContent),
-        Operation::RunBash | Operation::GitPush | Operation::CreatePr => {
-            Some(ExposureLabel::ExfilVector)
-        }
-        Operation::WriteFiles
+        // Local sinks are exfil legs too (most-paranoid #4).
+        Operation::RunBash
+        | Operation::GitPush
+        | Operation::CreatePr
+        | Operation::SpawnAgent
+        | Operation::WriteFiles
         | Operation::EditFiles
         | Operation::GitCommit
-        | Operation::ManagePods => None,
+        | Operation::ManagePods => Some(ExposureLabel::ExfilVector),
     }
 }
 
@@ -57,7 +60,7 @@ fn spec_classify(op: Operation) -> Option<ExposureLabel> {
 fn spec_is_exfil(op: Operation) -> bool {
     matches!(
         op,
-        Operation::RunBash | Operation::GitPush | Operation::CreatePr
+        Operation::RunBash | Operation::GitPush | Operation::CreatePr | Operation::SpawnAgent
     )
 }
 
@@ -109,26 +112,30 @@ fn arb_operation() -> impl Strategy<Value = Operation> {
         Just(Operation::GitPush),
         Just(Operation::CreatePr),
         Just(Operation::ManagePods),
+        Just(Operation::SpawnAgent),
     ]
 }
 
 fn arb_capability_lattice() -> impl Strategy<Value = CapabilityLattice> {
     (
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
-        arb_capability_level(),
+        (
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+            arb_capability_level(),
+        ),
         arb_capability_level(),
     )
-        .prop_map(
-            |(rf, wf, ef, rb, gs, grs, ws, wfe, gc, gp, cp, mp)| CapabilityLattice {
+        .prop_map(|((rf, wf, ef, rb, gs, grs, ws, wfe, gc, gp, cp, mp), sa)| {
+            CapabilityLattice {
                 read_files: rf,
                 write_files: wf,
                 edit_files: ef,
@@ -141,9 +148,10 @@ fn arb_capability_lattice() -> impl Strategy<Value = CapabilityLattice> {
                 git_push: gp,
                 create_pr: cp,
                 manage_pods: mp,
+                spawn_agent: sa,
                 extensions: std::collections::BTreeMap::new(),
-            },
-        )
+            }
+        })
 }
 
 /// Generate a sequence of operations (3..12 operations per session).
@@ -210,7 +218,7 @@ proptest! {
         let mut prev_exposure_count = kernel.exposure().count();
 
         for op in ops {
-            let d = kernel.decide(op, "test-subject");
+            let (d, _token) = kernel.decide(op, "test-subject");
 
             // Exposure count must never decrease
             let new_count = kernel.exposure().count();
@@ -261,7 +269,7 @@ proptest! {
         let mut kernel = Kernel::new(perms);
 
         for (i, op) in ops.iter().enumerate() {
-            let d = kernel.decide(*op, "test-subject");
+            let (d, _token) = kernel.decide(*op, "test-subject");
 
             // Must produce a definitive verdict
             prop_assert!(
@@ -310,7 +318,7 @@ proptest! {
             let projected = spec_project_exposure(&ref_exposure, op);
             let would_complete = !pre_uninhabitable && projected.is_uninhabitable();
 
-            let d = kernel.decide(op, "test-subject");
+            let (d, _token) = kernel.decide(op, "test-subject");
 
             // If dynamic gate should fire: uninhabitable_state would newly complete AND op is exfil
             if would_complete && spec_is_exfil(op) {
@@ -355,7 +363,7 @@ proptest! {
 
         for op in ops {
             let pre_count = kernel.exposure().count();
-            let d = kernel.decide(op, "test-subject");
+            let (d, _token) = kernel.decide(op, "test-subject");
             let post_count = kernel.exposure().count();
 
             if d.verdict.is_denied() || matches!(d.verdict, Verdict::RequiresApproval) {
@@ -482,7 +490,7 @@ proptest! {
         let mut kernel = Kernel::new(perms);
 
         for op in ops {
-            let d = kernel.decide(op, "test-subject");
+            let (d, _token) = kernel.decide(op, "test-subject");
             let expected_label = spec_classify(op);
             prop_assert_eq!(
                 d.exposure_transition.contributed_label, expected_label,
@@ -517,21 +525,25 @@ fn spec_clinejection_blocked() {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            spawn_agent: CapabilityLevel::Never,
             extensions: std::collections::BTreeMap::new(),
         })
         .commands(CommandLattice::permissive())
         .build();
     perms.obligations = Obligations::default();
 
-    let mut kernel = Kernel::new(perms);
+    // Use capability_only() to isolate exposure gating from flow control.
+    // (With Kernel::new(), flow control blocks this attack even earlier
+    // via FlowViolation — this test specifically validates exposure gating.)
+    let mut kernel = Kernel::capability_only(perms);
 
     // Step 1: WebFetch injects untrusted content
-    let d = kernel.decide(Operation::WebFetch, "https://attacker.com/payload.js");
+    let (d, _token) = kernel.decide(Operation::WebFetch, "https://attacker.com/payload.js");
     assert!(d.verdict.is_allowed());
     assert!(kernel.exposure().contains(ExposureLabel::UntrustedContent));
 
     // Step 2: RunBash (npm install with preinstall hook) → dynamic gate
-    let d = kernel.decide(Operation::RunBash, "npm install");
+    let (d, _token) = kernel.decide(Operation::RunBash, "npm install");
     assert!(
         matches!(d.verdict, Verdict::RequiresApproval),
         "Clinejection: RunBash after WebFetch MUST be gated, got {:?}",
@@ -560,24 +572,26 @@ fn spec_toxic_agent_flow_blocked() {
             git_push: CapabilityLevel::Always,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            spawn_agent: CapabilityLevel::Never,
             extensions: std::collections::BTreeMap::new(),
         })
         .commands(CommandLattice::permissive())
         .build();
     perms.obligations = Obligations::default();
 
-    let mut kernel = Kernel::new(perms);
+    // Use capability_only() to isolate exposure gating from flow control.
+    let mut kernel = Kernel::capability_only(perms);
 
     // Step 1: Read private data
-    let d = kernel.decide(Operation::ReadFiles, "/etc/passwd");
+    let (d, _token) = kernel.decide(Operation::ReadFiles, "/etc/passwd");
     assert!(d.verdict.is_allowed());
 
     // Step 2: Fetch untrusted content (attacker's payload)
-    let d = kernel.decide(Operation::WebFetch, "https://evil.com/instructions");
+    let (d, _token) = kernel.decide(Operation::WebFetch, "https://evil.com/instructions");
     assert!(d.verdict.is_allowed());
 
     // Step 3: GitPush → uninhabitable_state completes → dynamic gate
-    let d = kernel.decide(Operation::GitPush, "origin/main");
+    let (d, _token) = kernel.decide(Operation::GitPush, "origin/main");
     assert!(
         matches!(d.verdict, Verdict::RequiresApproval),
         "Toxic Agent Flow: GitPush after ReadFiles+WebFetch MUST be gated, got {:?}",
@@ -604,13 +618,15 @@ fn spec_pre_approval_consumed_exactly() {
             git_push: CapabilityLevel::Always,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Never,
+            spawn_agent: CapabilityLevel::Never,
             extensions: std::collections::BTreeMap::new(),
         })
         .commands(CommandLattice::permissive())
         .build();
     perms.obligations = Obligations::default();
 
-    let mut kernel = Kernel::new(perms);
+    // Use capability_only() to isolate exposure gating from flow control.
+    let mut kernel = Kernel::capability_only(perms);
 
     // Pre-grant exactly 2 GitPush approvals
     kernel.grant_approval(Operation::GitPush, 2);
@@ -620,15 +636,15 @@ fn spec_pre_approval_consumed_exactly() {
     kernel.decide(Operation::WebFetch, "https://evil.com");
 
     // First push: approved (consumes 1 approval)
-    let d = kernel.decide(Operation::GitPush, "origin/feat-1");
+    let (d, _token) = kernel.decide(Operation::GitPush, "origin/feat-1");
     assert!(d.verdict.is_allowed(), "1st push should be pre-approved");
 
     // Second push: approved (consumes last approval)
-    let d = kernel.decide(Operation::GitPush, "origin/feat-2");
+    let (d, _token) = kernel.decide(Operation::GitPush, "origin/feat-2");
     assert!(d.verdict.is_allowed(), "2nd push should be pre-approved");
 
     // Third push: no approvals left → RequiresApproval
-    let d = kernel.decide(Operation::GitPush, "origin/feat-3");
+    let (d, _token) = kernel.decide(Operation::GitPush, "origin/feat-3");
     assert!(
         matches!(d.verdict, Verdict::RequiresApproval),
         "3rd push should require approval (exhausted), got {:?}",
@@ -636,9 +652,11 @@ fn spec_pre_approval_consumed_exactly() {
     );
 }
 
-/// Spec: neutral operations don't trigger dynamic gate even at high exposure.
+/// Spec: local-sink operations are exfil legs and DO trigger the dynamic gate at
+/// high exposure (most-paranoid #4) — writing/committing tainted secrets is an
+/// exfiltration channel that completes the uninhabitable trifecta.
 #[test]
-fn spec_neutral_ops_unaffected_by_exposure() {
+fn spec_local_sinks_gated_at_high_exposure() {
     let mut perms = PermissionLattice::builder()
         .description("neutral-test")
         .capabilities(CapabilityLattice {
@@ -654,38 +672,99 @@ fn spec_neutral_ops_unaffected_by_exposure() {
             git_push: CapabilityLevel::Never,
             create_pr: CapabilityLevel::Never,
             manage_pods: CapabilityLevel::Always,
+            spawn_agent: CapabilityLevel::Never,
             extensions: std::collections::BTreeMap::new(),
         })
         .commands(CommandLattice::permissive())
         .build();
     perms.obligations = Obligations::default();
 
-    let mut kernel = Kernel::new(perms);
+    // Use capability_only() to isolate exposure gating from flow control.
+    let mut kernel = Kernel::capability_only(perms);
 
     // Build up 2 exposure legs
     kernel.decide(Operation::ReadFiles, "/workspace/main.rs");
     kernel.decide(Operation::WebFetch, "https://docs.example.com");
     assert_eq!(kernel.exposure().count(), 2);
 
-    // Neutral operations should be allowed regardless of exposure
-    let neutral_ops = [
+    // Local-sink operations are exfil legs now: each completes the uninhabitable
+    // trifecta (private data + untrusted content + exfil vector) and is gated.
+    let exfil_local_ops = [
         Operation::WriteFiles,
         Operation::EditFiles,
         Operation::GitCommit,
         Operation::ManagePods,
     ];
-    for op in neutral_ops {
-        let d = kernel.decide(op, "test-subject");
+    for op in exfil_local_ops {
+        let (d, _token) = kernel.decide(op, "test-subject");
         assert!(
-            d.verdict.is_allowed(),
-            "neutral op {:?} should be allowed at exposure count 2, got {:?}",
+            !d.verdict.is_allowed(),
+            "local-sink exfil op {:?} should be gated at exposure count 2, got {:?}",
             op,
             d.verdict,
         );
         assert!(
-            !d.exposure_transition.dynamic_gate_applied,
-            "neutral op {:?} should not trigger dynamic gate",
+            d.exposure_transition.dynamic_gate_applied,
+            "local-sink exfil op {:?} should trigger the dynamic gate",
             op,
         );
     }
+}
+
+/// Adversarial gap #10: Deny is never followed by Allow for the same
+/// operation in the same session (without intervening approval grant).
+///
+/// The kernel's monotonicity invariant means: if an operation is denied
+/// due to InsufficientCapability (level=Never), no subsequent call with
+/// the same operation can return Allow — because permissions only tighten.
+#[test]
+fn prop_deny_never_followed_by_allow_same_op() {
+    // Use a profile where some ops are denied
+    let perms = PermissionLattice::read_only();
+    let mut kernel = Kernel::new(perms);
+
+    // Collect denied operations
+    let mut denied_ops: Vec<Operation> = Vec::new();
+    for &op in &Operation::ALL {
+        let (d, _token) = kernel.decide(op, "test-subject");
+        if matches!(d.verdict, Verdict::Deny(DenyReason::InsufficientCapability)) {
+            denied_ops.push(op);
+        }
+    }
+
+    // Verify: calling the same denied ops again still denies them
+    assert!(!denied_ops.is_empty(), "read_only should deny some ops");
+    for &op in &denied_ops {
+        let (d, _token) = kernel.decide(op, "test-subject-retry");
+        assert!(
+            matches!(d.verdict, Verdict::Deny(DenyReason::InsufficientCapability)),
+            "op {:?} was denied, then allowed on retry — monotonicity violated",
+            op,
+        );
+    }
+
+    // Verify with a permissive profile that attenuating never widens
+    let permissive = PermissionLattice::permissive();
+    let mut kernel2 = Kernel::new(permissive);
+
+    // Allow everything first
+    for &op in &Operation::ALL {
+        let (d, _token) = kernel2.decide(op, "allowed");
+        // Some ops may require approval, but none should be InsufficientCapability
+        assert!(
+            !matches!(d.verdict, Verdict::Deny(DenyReason::InsufficientCapability)),
+            "permissive profile should not deny {:?} for capability",
+            op,
+        );
+    }
+
+    // Attenuate to restrictive
+    let _ = kernel2.attenuate(&PermissionLattice::restrictive());
+
+    // Now the same ops that were allowed should be denied
+    let (d, _token) = kernel2.decide(Operation::RunBash, "after-attenuate");
+    assert!(
+        matches!(d.verdict, Verdict::Deny(DenyReason::InsufficientCapability)),
+        "RunBash should be denied after attenuating to restrictive",
+    );
 }

@@ -85,6 +85,18 @@ pub struct PermissionLattice {
     /// This field is ALWAYS set to `true` upon deserialization, regardless of
     /// the value in the serialized data. Use `with_uninhabitable_disabled()` in
     /// code if you explicitly need to disable the constraint (e.g., for testing).
+    ///
+    /// Uninhabitable state constraint enforcement.
+    ///
+    /// **Private in production builds.** Use [`is_uninhabitable_enforced()`]
+    /// to read, [`as_ceiling()`] for delegation ceilings.
+    ///
+    /// With the `testing` feature, the field is `pub` for adversarial tests
+    /// that need to verify constraint bypass is detected.
+    #[cfg(not(feature = "testing"))]
+    pub(crate) uninhabitable_constraint: bool,
+    /// See non-testing docs. Public only with `testing` feature for adversarial tests.
+    #[cfg(feature = "testing")]
     pub uninhabitable_constraint: bool,
 
     /// Minimum isolation level required to use this policy.
@@ -106,12 +118,54 @@ pub struct PermissionLattice {
     pub created_by: String,
 }
 
+/// Parse a UUID from a string WITHOUT risking a panic on hostile input.
+///
+/// The `uuid` crate's own `Deserialize`/error path panics (it slices the
+/// offending string at a non-char-boundary while formatting its
+/// `InvalidUuid` message) when handed a **non-ASCII** string. Because
+/// `PermissionLattice` is deserialized from untrusted config — and is a
+/// libFuzzer target (`fuzz/fuzz_targets/permission_serde.rs`) — that crash
+/// is reachable from arbitrary bytes. A valid UUID is always ASCII, so we
+/// reject non-ASCII up front and return a clean error instead of letting it
+/// reach uuid's panicking formatter. (No upstream fix as of uuid 1.23.2.)
+#[cfg(feature = "serde")]
+fn parse_uuid_guarded(s: &str) -> Result<Uuid, String> {
+    if !s.is_ascii() {
+        return Err("invalid UUID: contains non-ASCII characters".to_string());
+    }
+    Uuid::try_parse(s).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "serde")]
+fn de_uuid<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    parse_uuid_guarded(&s).map_err(serde::de::Error::custom)
+}
+
+#[cfg(feature = "serde")]
+fn de_opt_uuid<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<String>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(s) => parse_uuid_guarded(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 /// Raw deserialization helper that preserves all fields.
 #[cfg(feature = "serde")]
 #[derive(Deserialize)]
 struct RawPermissionLattice {
+    #[serde(deserialize_with = "de_uuid")]
     id: Uuid,
     description: String,
+    #[serde(default, deserialize_with = "de_opt_uuid")]
     derived_from: Option<Uuid>,
     capabilities: CapabilityLattice,
     #[serde(default)]
@@ -161,6 +215,7 @@ impl<'de> Deserialize<'de> for PermissionLattice {
     }
 }
 
+#[cfg(feature = "serde")]
 fn default_uninhabitable_constraint() -> bool {
     true
 }
@@ -240,6 +295,15 @@ impl std::fmt::Display for DelegationError {
 impl std::error::Error for DelegationError {}
 
 impl PermissionLattice {
+    /// Whether the uninhabitable state constraint is enforced.
+    ///
+    /// When `true` (the default and strongly recommended), lethal capability
+    /// combinations (private data + untrusted content + exfiltration) trigger
+    /// mandatory approval obligations.
+    pub fn is_uninhabitable_enforced(&self) -> bool {
+        self.uninhabitable_constraint
+    }
+
     /// Create a new permission lattice with the given description.
     pub fn new(description: impl Into<String>) -> Self {
         let lattice = Self {
@@ -256,17 +320,35 @@ impl PermissionLattice {
         PermissionLatticeBuilder::default()
     }
 
-    /// Create a version with uninhabitable_state constraint explicitly disabled.
+    /// Convert to a delegation ceiling.
     ///
-    /// # Security Warning
-    /// Disable uninhabitable_state constraint enforcement.
+    /// Disables the uninhabitable state constraint on this lattice. Use this
+    /// when the lattice represents a **capability ceiling** for delegation,
+    /// not a directly enforced policy. The delegated (child) lattice will
+    /// have its own constraint enforcement via `normalize()`.
+    ///
+    /// This is the only production-available way to disable the constraint.
+    /// The intent is explicit: "this is a ceiling, not a policy."
+    /// Convert to a delegation ceiling.
+    ///
+    /// Disables the uninhabitable state constraint on this lattice. Use this
+    /// when the lattice represents a **capability ceiling** for delegation,
+    /// not a directly enforced policy. The delegated (child) lattice will
+    /// have its own constraint enforcement via `normalize()`.
+    pub fn as_ceiling(mut self) -> Self {
+        self.uninhabitable_constraint = false;
+        self
+    }
+
+    /// Create a version with uninhabitable_state constraint explicitly disabled.
     ///
     /// # Security Warning
     ///
     /// This method disables the core security invariant of this crate.
     /// Only available with the `testing` feature enabled.
     ///
-    /// **DO NOT** use in production code.
+    /// **DO NOT** use in production code. Use `as_ceiling()` if you need
+    /// a constraint-free lattice for delegation ceilings.
     #[cfg(feature = "testing")]
     pub fn with_uninhabitable_disabled(mut self) -> Self {
         self.uninhabitable_constraint = false;
@@ -339,14 +421,18 @@ impl PermissionLattice {
     /// Join operation: least upper bound of two permission lattices.
     ///
     /// This returns the most permissive combination of both inputs.
-    /// The uninhabitable_state constraint is applied if BOTH inputs enforce it.
+    /// The uninhabitable_state constraint is applied if EITHER input enforces it.
+    /// This ensures the safety constraint is monotonically preserved upward —
+    /// an attacker cannot disable the uninhabitable check by joining with a
+    /// permissive lattice that has `uninhabitable_constraint = false`.
     pub fn join(&self, other: &Self) -> Self {
         let base_caps = self.capabilities.join(&other.capabilities);
 
         let base_obligations = self.obligations.intersection(&other.obligations);
 
-        // Apply uninhabitable_state constraint only if BOTH inputs enforce it
-        let enforce_uninhabitable = self.uninhabitable_constraint && other.uninhabitable_constraint;
+        // Apply uninhabitable_state constraint if EITHER input enforces it (OR-semantics).
+        // This prevents an attacker from weakening the safety check via join.
+        let enforce_uninhabitable = self.uninhabitable_constraint || other.uninhabitable_constraint;
         let obligations = if enforce_uninhabitable {
             let constraint = IncompatibilityConstraint::enforcing();
             base_obligations.union(&constraint.obligations_for(&base_caps))
@@ -394,6 +480,28 @@ impl PermissionLattice {
     /// Check if an operation requires approval.
     pub fn requires_approval(&self, op: Operation) -> bool {
         self.obligations.requires(op)
+    }
+
+    /// The operations this policy actually permits — every core [`Operation`]
+    /// whose capability level is **strictly above** [`CapabilityLevel::Never`].
+    ///
+    /// This is **the trust choke point** for minting a session capability
+    /// token: a [`TokenScope`](crate) built from `granted_operations()` is a
+    /// subset of the policy *by construction*, because an operation is present
+    /// here **iff** `level_for(op) > Never`. Equivalently, every op excluded
+    /// here is exactly one with `level_for(op) == Never` (fully denied), so the
+    /// minted scope can never grant an operation the policy denies.
+    ///
+    /// Enumeration is over [`Operation::ALL`] (the 13 statically-known core
+    /// operations), so the ordering is **deterministic** — it follows the
+    /// enum's declaration order. `ExtensionOperation`s are intentionally
+    /// excluded: they are string-keyed, out of the formally-verified core, and
+    /// not part of the token vocabulary.
+    pub fn granted_operations(&self) -> Vec<Operation> {
+        Operation::ALL
+            .into_iter()
+            .filter(|&op| self.capabilities.level_for(op) > CapabilityLevel::Never)
+            .collect()
     }
 
     /// Delegate permissions to a subagent.
@@ -487,7 +595,11 @@ impl PermissionLattice {
         let data = serde_json::to_string(self).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(data.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     }
 
     /// Compute a checksum for integrity verification (non-serde version).
@@ -496,7 +608,11 @@ impl PermissionLattice {
         let data = format!("{:?}", self);
         let mut hasher = Sha256::new();
         hasher.update(data.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     }
 
     /// Create a permissive permission set (for trusted contexts).
@@ -554,11 +670,30 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
             obligations: Obligations::default(),
             commands: CommandLattice::restrictive(),
+            paths: PathLattice {
+                allowed: std::collections::HashSet::new(), // empty = all readable
+                blocked: [
+                    // Defense-in-depth: block sensitive paths even though write
+                    // capabilities are Never. Belt-and-suspenders for lockdown.
+                    "**/.env",
+                    "**/.env.*",
+                    "**/secrets/**",
+                    "**/.ssh/**",
+                    "**/.gnupg/**",
+                    "**/.aws/**",
+                    "**/credentials*",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+                work_dir: None,
+            },
             ..Default::default()
         };
 
@@ -590,6 +725,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -620,6 +756,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -652,6 +789,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -681,6 +819,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -711,6 +850,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -749,6 +889,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::LowRisk,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::LowRisk,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -793,6 +934,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::LowRisk,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -828,6 +970,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::LowRisk,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Always,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -867,6 +1010,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -924,6 +1068,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::LowRisk,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -966,6 +1111,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -1005,6 +1151,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -1045,6 +1192,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::LowRisk,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Never,
+                spawn_agent: CapabilityLevel::Never,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -1089,6 +1237,7 @@ impl PermissionLattice {
                 git_push: CapabilityLevel::Never,
                 create_pr: CapabilityLevel::Never,
                 manage_pods: CapabilityLevel::Always,
+                spawn_agent: CapabilityLevel::Always,
                 #[cfg(not(kani))]
                 extensions: std::collections::BTreeMap::new(),
             },
@@ -1206,6 +1355,35 @@ impl PermissionLatticeBuilder {
 
         lattice.normalize()
     }
+
+    /// Build without normalization — for delegation ceilings that must
+    /// remain as pure top elements without obligation injection.
+    ///
+    /// Use `build()` for normal policies. Use this only when constructing
+    /// a ceiling lattice for Galois connection properties.
+    pub fn build_unnormalized(self) -> PermissionLattice {
+        PermissionLattice {
+            id: Uuid::new_v4(),
+            description: self
+                .description
+                .unwrap_or_else(|| "Custom permissions".to_string()),
+            derived_from: None,
+            capabilities: self.capabilities.unwrap_or_default(),
+            obligations: self.obligations.unwrap_or_default(),
+            paths: self.paths.unwrap_or_default(),
+            budget: self.budget.unwrap_or_default(),
+            // Use empty() not default() — default has a pre-populated allowlist
+            // which is MORE restrictive. For ceilings we want all-allowed (empty).
+            commands: self
+                .commands
+                .unwrap_or_else(crate::command::CommandLattice::empty),
+            time: self.time.unwrap_or_default(),
+            uninhabitable_constraint: self.uninhabitable_constraint.unwrap_or(true),
+            minimum_isolation: self.minimum_isolation,
+            created_at: Utc::now(),
+            created_by: self.created_by.unwrap_or_else(|| "builder".to_string()),
+        }
+    }
 }
 
 /// Effective permissions for a work assignment.
@@ -1264,6 +1442,166 @@ impl Default for EffectivePermissions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a non-ASCII `id` used to PANIC uuid's error formatter
+    /// (slice at a non-char-boundary) while deserializing `PermissionLattice`
+    /// — a libFuzzer-reachable crash via `permission_serde`. It must now
+    /// return a clean `Err`, never panic. Exercises the exact fuzz path
+    /// (`serde_json::from_str::<PermissionLattice>`).
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialize_rejects_hostile_uuid_without_panicking() {
+        let base = serde_json::to_value(PermissionLattice::default()).unwrap();
+
+        // Non-ASCII id (the crashing class): U+2028 is multi-byte.
+        let mut bad = base.clone();
+        bad["id"] = serde_json::Value::String("\u{2028}-not-a-uuid".to_string());
+        let s = serde_json::to_string(&bad).unwrap();
+        assert!(
+            serde_json::from_str::<PermissionLattice>(&s).is_err(),
+            "non-ASCII id must error cleanly, not panic"
+        );
+
+        // ASCII-but-invalid id: still a clean error.
+        let mut bad2 = base.clone();
+        bad2["id"] = serde_json::Value::String("definitely-not-a-uuid".to_string());
+        assert!(
+            serde_json::from_str::<PermissionLattice>(&serde_json::to_string(&bad2).unwrap())
+                .is_err()
+        );
+
+        // A non-ASCII derived_from is also rejected cleanly (Option path).
+        let mut bad3 = base.clone();
+        bad3["derived_from"] = serde_json::Value::String("é-bad".to_string());
+        assert!(
+            serde_json::from_str::<PermissionLattice>(&serde_json::to_string(&bad3).unwrap())
+                .is_err()
+        );
+
+        // A valid uuid still round-trips successfully.
+        let mut good = base;
+        good["id"] = serde_json::Value::String("00000000-0000-0000-0000-000000000001".to_string());
+        assert!(
+            serde_json::from_str::<PermissionLattice>(&serde_json::to_string(&good).unwrap())
+                .is_ok()
+        );
+    }
+
+    /// LOAD-BEARING (live-path mint brick, acceptance (a)): for EVERY policy
+    /// profile, `granted_operations()` is exactly the set of operations whose
+    /// capability level is strictly above `Never`. Concretely:
+    ///
+    /// 1. no granted op is `Never` (a minted scope never grants a denied op);
+    /// 2. every op with `level_for(op) == Never` is excluded;
+    /// 3. the granted set == the `> Never` set (nothing dropped either way);
+    /// 4. ordering is deterministic (follows `Operation::ALL`).
+    ///
+    /// This is the by-construction guarantee that a token scope minted from
+    /// `granted_operations()` is a subset of the policy.
+    #[test]
+    fn granted_operations_excludes_every_never_op_for_all_profiles() {
+        let profiles: Vec<(&str, PermissionLattice)> = vec![
+            ("default", PermissionLattice::default()),
+            ("permissive", PermissionLattice::permissive()),
+            ("restrictive", PermissionLattice::restrictive()),
+            ("read_only", PermissionLattice::read_only()),
+            (
+                "filesystem_readonly",
+                PermissionLattice::filesystem_readonly(),
+            ),
+            ("network_only", PermissionLattice::network_only()),
+            ("web_research", PermissionLattice::web_research()),
+            ("code_review", PermissionLattice::code_review()),
+            ("edit_only", PermissionLattice::edit_only()),
+            ("local_dev", PermissionLattice::local_dev()),
+            ("fix_issue", PermissionLattice::fix_issue()),
+            ("safe_pr_fixer", PermissionLattice::safe_pr_fixer()),
+            ("release", PermissionLattice::release()),
+            ("database_client", PermissionLattice::database_client()),
+            ("demo", PermissionLattice::demo()),
+            ("pr_review", PermissionLattice::pr_review()),
+            ("codegen", PermissionLattice::codegen()),
+            ("pr_approve", PermissionLattice::pr_approve()),
+            ("orchestrator", PermissionLattice::orchestrator()),
+        ];
+
+        for (name, policy) in &profiles {
+            let granted = policy.granted_operations();
+
+            // (1)+(2)+(3): granted == { op | level_for(op) > Never }.
+            let expected: Vec<Operation> = Operation::ALL
+                .into_iter()
+                .filter(|&op| policy.capabilities.level_for(op) > CapabilityLevel::Never)
+                .collect();
+            assert_eq!(
+                granted, expected,
+                "profile {name}: granted_operations must equal the >Never set"
+            );
+
+            // (1) restated as a direct denial check: no granted op is Never.
+            for op in &granted {
+                assert_ne!(
+                    policy.capabilities.level_for(*op),
+                    CapabilityLevel::Never,
+                    "profile {name}: granted op {op:?} must not be Never"
+                );
+            }
+            // (2) restated: every Never op is absent from the granted set.
+            for op in Operation::ALL {
+                if policy.capabilities.level_for(op) == CapabilityLevel::Never {
+                    assert!(
+                        !granted.contains(&op),
+                        "profile {name}: denied (Never) op {op:?} leaked into granted set"
+                    );
+                }
+            }
+
+            // (4) deterministic ordering: granted is a subsequence of ALL.
+            let mut all_iter = Operation::ALL.into_iter();
+            for op in &granted {
+                assert!(
+                    all_iter.by_ref().any(|a| a == *op),
+                    "profile {name}: granted ops must follow Operation::ALL order"
+                );
+            }
+        }
+    }
+
+    /// A fully-locked-down policy (every capability `Never`) grants NO
+    /// operations — an empty scope, not a wildcard. In particular `RunBash` is
+    /// absent, so a token minted from it later DENIES bash (acceptance (b)).
+    #[test]
+    fn granted_operations_empty_for_all_never_policy() {
+        // read_only already has run_bash = Never; build a stricter one where
+        // every capability is Never to prove the empty-scope case exactly.
+        let mut locked = PermissionLattice::read_only();
+        locked.capabilities = CapabilityLattice {
+            read_files: CapabilityLevel::Never,
+            write_files: CapabilityLevel::Never,
+            edit_files: CapabilityLevel::Never,
+            run_bash: CapabilityLevel::Never,
+            glob_search: CapabilityLevel::Never,
+            grep_search: CapabilityLevel::Never,
+            web_search: CapabilityLevel::Never,
+            web_fetch: CapabilityLevel::Never,
+            git_commit: CapabilityLevel::Never,
+            git_push: CapabilityLevel::Never,
+            create_pr: CapabilityLevel::Never,
+            manage_pods: CapabilityLevel::Never,
+            spawn_agent: CapabilityLevel::Never,
+            #[cfg(not(kani))]
+            extensions: std::collections::BTreeMap::new(),
+        };
+        let granted = locked.granted_operations();
+        assert!(
+            granted.is_empty(),
+            "an all-Never policy must grant an EMPTY operation set, got {granted:?}"
+        );
+        assert!(
+            !granted.contains(&Operation::RunBash),
+            "RunBash must never appear in an all-Never policy's granted ops"
+        );
+    }
 
     #[test]
     fn test_meet_is_commutative() {
@@ -1382,6 +1720,47 @@ mod tests {
         // Join should take the more permissive values
         assert!(result.budget.max_cost_usd >= a.budget.max_cost_usd);
         assert!(result.budget.max_cost_usd >= b.budget.max_cost_usd);
+    }
+
+    #[test]
+    fn test_join_preserves_uninhabitable_constraint_or_semantics() {
+        // Regression: join() previously used AND for uninhabitable_constraint,
+        // meaning an attacker who controlled one input could disable the safety
+        // check by providing uninhabitable_constraint=false.
+        let constrained = PermissionLattice {
+            uninhabitable_constraint: true,
+            ..Default::default()
+        };
+
+        // Simulate attacker-controlled input with constraint disabled.
+        // In practice this is only reachable via programmatic construction
+        // (deserialization always forces true), but join must be safe regardless.
+        let unconstrained = PermissionLattice {
+            uninhabitable_constraint: false,
+            ..Default::default()
+        };
+
+        // join(true, false) must be true (OR-semantics)
+        let result = constrained.join(&unconstrained);
+        assert!(
+            result.uninhabitable_constraint,
+            "join must preserve uninhabitable_constraint via OR-semantics"
+        );
+
+        // Commutative: join(false, true) must also be true
+        let result_rev = unconstrained.join(&constrained);
+        assert!(
+            result_rev.uninhabitable_constraint,
+            "join must be commutative for uninhabitable_constraint"
+        );
+
+        // join(true, true) = true
+        let both = constrained.join(&constrained);
+        assert!(both.uninhabitable_constraint);
+
+        // join(false, false) = false (both inputs opted out — no constraint to preserve)
+        let neither = unconstrained.join(&unconstrained);
+        assert!(!neither.uninhabitable_constraint);
     }
 
     #[cfg(feature = "serde")]

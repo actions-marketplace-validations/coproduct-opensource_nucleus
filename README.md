@@ -1,526 +1,469 @@
 # Nucleus
 
+### Don't trust the agent. Verify it.
+
+*Signed identity, declared guarantees, receipts anyone can check.*
+
 [![CI](https://github.com/coproduct-opensource/nucleus/actions/workflows/ci.yml/badge.svg)](https://github.com/coproduct-opensource/nucleus/actions/workflows/ci.yml)
 [![Security Audit](https://github.com/coproduct-opensource/nucleus/actions/workflows/audit.yml/badge.svg)](https://github.com/coproduct-opensource/nucleus/actions/workflows/audit.yml)
-[![Cargo Deny](https://github.com/coproduct-opensource/nucleus/actions/workflows/deny.yml/badge.svg)](https://github.com/coproduct-opensource/nucleus/actions/workflows/deny.yml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/coproduct-opensource/nucleus/badge)](https://securityscorecards.dev/viewer/?uri=github.com/coproduct-opensource/nucleus)
-[![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://coproduct-opensource.github.io/nucleus/)
 
-**A formally verified permission lattice and security runtime for AI agents.**
+**Nucleus is a vendor-agnostic secure runtime for AI agents: it enforces what an agent may do, proves the enforcement boundary is sound, attests how every result was produced, and federates identity and trust — without a single long-lived secret.**
 
-Nucleus is a security framework for AI agents that combines a mathematically verified permission algebra with a Firecracker-based enforcement runtime. The permission lattice has 297 SMT verification conditions checked by Z3 plus 32 bounded model checking proofs via Kani. The GitHub Action works end-to-end today. This README tries to be honest about what's real and what isn't.
+> **Assume the agent is compromised. Constrain what it can do anyway. Prove the constraints hold.**
 
-> **Versioning note:** v1.0 means the **interface contract is stable** (see [`STABILITY.md`](STABILITY.md)), not that the system is "production-secure by default." The lattice is heavily verified; the runtime is tested but not yet battle-hardened in production traffic.
+At its core is a small, dependency-free information-flow algebra. Two primitives — `join` and `flows_to` — enforce information-flow control under four algebraic laws. Once untrusted web content enters a session **through a mediated ingest channel**, it cannot silently reach a privileged sink like `git push`. That property is [machine-checked](FORMAL_METHODS.md), not hoped.
 
-## Start Here: Scan Your Agent Config
+The qualifier is load-bearing, so it is stated here rather than in a footnote: the guarantee covers content the runtime *observes*. Fetches through `web_fetch`/`web_search`, file reads, and memory recalls are observed. Bytes an agent obtains by running a command — `curl` inside `run` — are observed only when `NUCLEUS_PARANOID_TOOL_IO=1`, because the runtime cannot tell `curl` from `ls` in a command's output and tainting all of it makes a session "one privileged action then locked". That is an operator's policy call, and until it is made, command output is an unmediated ingest channel.
 
-This works today. No runtime required. Pre-built binaries ship with every [release](https://github.com/coproduct-opensource/nucleus/releases).
+This is the **[lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/)** — private data + untrusted content + an exfiltration sink — made safe by **non-interference**: attacker-tainted data cannot reach a consequential action, so a compromised agent cannot be turned into a *confused deputy*. We don't *detect* the prompt injection; we make its consequence impossible — and prove it. (Detection-based guardrails are probabilistic; this is a structural guarantee.)
+
+```rust
+let mut state = FlowState::bottom();           // clean session
+state.join_operation(Operation::WebFetch);     // tainted by web content
+assert!(!state.flows_to(SinkClass::GitPush));  // can't push tainted data
+```
+
+On top of that core, Nucleus adds three newer pillars — a **Constitutional Kernel** (policy may only tighten, never widen), **verifiable keyless identity & trust federation** (OIDC → SPIFFE, "Let's Encrypt for agents"), and **provenance envelopes with an independent verifier** (signed, portable bundles re-checkable in Rust, WASM/JS, or Python).
+
+---
+
+## See it in 90 seconds
+
+Two runnable hooks, nothing to configure ([`just`](https://github.com/casey/just), or run the commands directly):
+
+```sh
+just demo     # 30s, in your terminal — information-flow control, 4 scenarios
+just vault    # play "The Vault" in your browser
+```
+
+**`just demo`** (`cargo run -p nucleus-ifc --example ifc_demo`) — a prompt-injection write is **denied by adversarial *ancestry***, not by a classifier guessing at strings; a clean flow is allowed; a compartment transition clears taint; a deterministic bind excludes the model from the trust decision:
+
+```
+─ Scenario 1: Web injection blocked ─
+  ModelPlan inherits Adversarial from WebContent
+  ✗ Write DENIED — adversarial ancestry detected
+─ Scenario 2: Clean workflow allowed ─
+  ✓ Write ALLOWED — clean ancestry
+```
+
+**`just vault`** launches [**The Vault**](crates/ctf-engine/README.md) — a browser CTF where you try to exfiltrate a secret past a formally-verified permission lattice (Lean 4 + Kani-backed verdicts). Hosted at **https://nucleus-ctf.fly.dev**; point an LLM at its JSON/MCP API and watch it fail too.
+
+---
+
+## Quick Start
 
 ```bash
-# From source
-cargo install --git https://github.com/coproduct-opensource/nucleus nucleus-audit
-
-# Or download a pre-built binary from GitHub Releases
-
-# Auto-discover and scan all agent configs in the current repo
-nucleus-audit scan --auto
-
-# Or specify paths explicitly
-nucleus-audit scan --pod-spec your-agent.yaml
-nucleus-audit scan --claude-settings .claude/settings.json
-nucleus-audit scan --mcp-config .mcp.json
-
-# Scan everything at once — findings are merged, deduplicated, and source-attributed
-nucleus-audit scan --pod-spec agent.yaml --claude-settings settings.json --mcp-config .mcp.json
-```
-
-**Supported formats:**
-
-| Format | File | What It Checks |
-|--------|------|----------------|
-| PodSpec | `*.yaml` | Uninhabitable state, credentials, network, isolation, timeout, permissions |
-| Claude Code settings | `settings.json` |  Uninhabitable state via allow/deny rules, Bash capability propagation, exfil patterns, safety bypasses, inline credentials, hooks |
-| MCP config | `.mcp.json` | Well-known server classification, `npx -y` supply chain risk, external HTTP servers, plaintext credentials, auth headers, dangerous commands |
-
-The Claude Code scanner projects `allow`/`deny` rules onto the portcullis `CapabilityLattice` and runs the same uninhabitable state analysis used for PodSpecs. **Unrestricted Bash implies all capabilities** — `cat` reads files, `curl` fetches web content, `grep` searches — so `["Edit", "Write", "Bash"]` correctly triggers a CRITICAL uninhabitable state even without explicit `Read` or `WebFetch` rules. Patterned Bash (e.g., `Bash(curl *)`) propagates only the relevant capability legs. A deny rule like `"Bash"` (bare, no pattern) demotes the exfiltration leg back to `Never`, breaking the uninhabitable state.
-
-The MCP scanner classifies well-known server packages (database, filesystem, VCS, cloud, communication, browser) and flags `npx -y` with non-official packages as a supply chain risk.
-
-Exit code is non-zero when critical or high findings exist — drop it into CI and block unsafe deployments.
-
-```bash
-# JSON output for CI pipelines
-nucleus-audit scan --pod-spec agent.yaml --format json
-
-# Verify hash-chained audit logs
-nucleus-audit verify --audit-log /var/log/nucleus/agent.jsonl
-```
-
-### Example: The Hidden Uninhabitable state
-
-A common config that *looks* safe — only Edit, Write, and Bash — but unrestricted Bash implies `cat` (read), `curl` (web), and `git push` (exfil):
-
-```json
-{ "permissions": { "allow": ["Edit", "Write", "Bash"], "deny": [] } }
-```
-
-```
-$ nucleus-audit scan --claude-settings settings.json
-
-  !! [CRITICAL] Lethal uninhabitable state in Claude Code settings
-       The allow rules grant private data access (Read/Glob/Grep)
-       + untrusted content (WebFetch/WebSearch) + exfiltration (Bash)
-       without sufficient deny rules to break the uninhabitable state.
-
-  !  [HIGH] Unrestricted Bash access
-       Bash is allowed without pattern restrictions and no deny rules
-       limit it.
-
-  ══ Verdict: FAIL — critical issues must be resolved ══
-```
-
-Compare with a hardened config that restricts Bash to specific commands and denies exfil patterns:
-
-```json
-{ "permissions": {
-    "allow": ["Read", "Bash(cargo *)", "Bash(git status)", "Bash(git diff *)"],
-    "deny":  ["Bash(curl *)", "Bash(wget *)", "Read(.env)", "Read(*secret*)"],
-    "ask":   ["Write", "Edit", "Bash(git push *)"]
-} }
-```
-
-```
-$ nucleus-audit scan --claude-settings settings.json
-  ══ Verdict: PASS with advisories ══
-```
-
-### Example: MCP Server Classification
-
-The scanner classifies well-known MCP server packages and flags `npx -y` supply chain risk:
-
-```
-$ nucleus-audit scan --mcp-config .mcp.json
-
-  ~  [MEDIUM] Database access via MCP server 'postgres'
-  ~  [MEDIUM] Filesystem access via MCP server 'filesystem'
-  ~  [MEDIUM] Vcs access via MCP server 'github'
-       This server provides BOTH private data access and
-       exfiltration capability — two exposure legs in one server.
-  ~  [MEDIUM] Auto-install unknown package in 'custom-tool': some-random-mcp-server
-       This executes arbitrary code from npm on every invocation.
-  -  [LOW] Auto-install official MCP package in 'postgres'
-       Pinning to a specific version is recommended.
-
-  ══ Verdict: PASS with advisories ══
-```
-
-See [`examples/`](examples/) for more configs: [Claude Code settings](examples/claude-settings/), [MCP configs](examples/mcp-configs/), [PodSpecs](examples/podspecs/).
-
-## Interactive Shell: Run Claude Code Under Nucleus
-
-Launch an interactive Claude Code session where **every tool call flows through the nucleus permission lattice**. Built-in tools (Bash, Read, Write, etc.) are replaced by sandboxed equivalents enforced by the tool-proxy.
-
-```bash
-# Install nucleus CLI (includes shell, audit, profiles, token commands)
 cargo install --git https://github.com/coproduct-opensource/nucleus nucleus-cli
 
-# Launch with the default codegen profile
-nucleus shell
-
-# Use a specific profile and working directory
-nucleus shell --profile safe_pr_fixer --dir ~/projects/my-repo
-
-# Set a budget cap
-nucleus shell --profile local_dev --max-cost 5.00
-
-# Pass credentials as environment variables
-nucleus shell --env LLM_API_TOKEN=your-token --env DATABASE_URL=postgres://...
-
-# Record a kernel decision trace for post-hoc analysis
-nucleus shell --profile codegen --kernel-trace ./trace.jsonl
+nucleus audit [PATH]                # Tier 0: scan agent configs, no runtime (CI exit codes)
+nucleus run --local "your task"     # Tier 1: run with enforced permissions (process-level, no VM)
 ```
 
-**What happens under the hood:**
-1. Nucleus spawns `nucleus-tool-proxy` with your chosen permission profile
-2. An MCP config is generated that routes all tools through the proxy
-3. Claude Code launches with only the sandboxed MCP tools visible — built-in tools are disabled
-4. Every side effect (file read/write, bash, git, web fetch) is checked against the permission lattice in real-time
-5. When the session ends, an audit summary shows all operations and any denials
+### Tier 2 — real microVM isolation (macOS)
 
-```
-$ nucleus shell --profile code_review
-nucleus shell | profile=code_review budget=$5.00 timeout=7200s
-  tools: read, glob, grep, web_fetch
-  audit: /tmp/nucleus-shell-abc123/audit.log
+Tier 1 is process-level. For kernel-level isolation you need a Linux VM with
+**nested virtualization**, because Firecracker is a KVM-based VMM — without
+`/dev/kvm` it does not run slowly, it does not run at all.
 
-> claude starts in interactive mode...
-
---- nucleus audit summary ---
-  total entries: 47
-  read_file: 32
-  glob: 8
-  grep: 7
-  log: /tmp/nucleus-shell-abc123/audit.log
+```bash
+nucleus setup --install-deps   # installs Lima if missing, provisions the VM,
+                               # installs Firecracker + kernel + rootfs + node
+                               # from pinned digests, then BOOTS A REAL NUCLEUS
+                               # POD and asserts what the guest did
 ```
 
-Use `--print-config` to inspect the generated MCP config without launching Claude (useful for custom integrations).
+Guest artifacts come from the pinned release **v2.1.0**, the first one able to
+boot a pod at all — everything up to 2.0.2 ships a rootfs with no CA bundle, on
+which the guest panics as PID 1, and `tier2_artifacts::GUEST_RELEASE_FLOOR`
+refuses those rather than installing one. **Measured 48.7 s** from a deleted VM to
+a booted pod, with Sigstore build provenance verified on every downloaded
+artifact.
 
-See [`nucleus profiles`](#permission-profiles) for the full list of available profiles.
+`--install-deps` is opt-in — without it, setup prints the one command to run
+(`brew install lima`) rather than installing software unasked. Setup ends with
+`nucleus verify --tier2`; if that fails, setup fails, because every other check
+only verifies a precondition. `--skip-verify` opts out and says so.
 
-## The Uninhabitable State
+The check is a **real nucleus pod**, not a stock rootfs. It asserts the guest
+reached sandbox-proof **tier 2 (`spiffe-identity`)**, that an allowed operation
+is served from inside the sandbox and a forbidden one is refused **by policy**,
+and that the guest fetched its SVID and its session task token over vsock. It
+drives the tool-proxy directly rather than `nucleus run`, which would pull in a
+specific vendor's assistant CLI.
 
-The core security primitive. When an agent has all three capabilities at autonomous levels, prompt injection becomes data exfiltration:
+Requires Apple Silicon **M3 or newer** and **macOS 15+**. There is no emulation
+fallback: without nested virtualisation there is no `/dev/kvm`, and Firecracker
+does not run slowly — it does not run. `nucleus doctor` reads `/dev/kvm` directly
+rather than inferring from the chip name.
 
-```
-  Private Data Access    +    Untrusted Content    +    Exfiltration Vector
-  ─────────────────────       ──────────────────        ────────────────────
-  read_files ≥ LowRisk       web_fetch ≥ LowRisk      git_push ≥ LowRisk
-  read_env                    web_search ≥ LowRisk     create_pr ≥ LowRisk
-  database access             user input processing    run_bash (curl, etc)
-```
+<details>
+<summary>Verified on Apple M5 Pro / macOS 26.6 (what a working setup looks like)</summary>
 
-Nucleus detects this combination statically (via `nucleus-audit scan`) and enforces it at runtime (via `portcullis`). When the uninhabitable state is complete, exfiltration operations require **explicit human approval** — the agent cannot bypass this.
-
-The uninhabitable state guard's monotonicity is formally proven: once an operation is denied, it stays denied for the rest of the session (proofs E1-E3 in `portcullis-verified`).
-
-## What Nucleus Provides
-
-Three layers, at different levels of maturity:
-
-1. **Scan** (usable today) — Static analysis of agent PodSpecs, Claude Code `settings.json`, and MCP configs. Catches dangerous permission combinations before deployment. Works as a standalone CLI tool and GitHub Action.
-
-2. **Enforce** (working in CI, not production-hardened) — Runtime permission envelopes. The tool proxy intercepts every agent side effect and checks it against the permission lattice. Both HTTP and MCP paths share identical security controls (MIME gating, DNS/URL allowlists, redirect verification). The `--local` path works end-to-end in GitHub Actions. The Firecracker path works on Linux+KVM but has no production deployment.
-
-3. **Audit** (implemented, not production-tested) — Hash-chained, HMAC-signed logs of every agent action with optional S3 append-only remote sink and drand cryptographic time anchoring. Node-side lifecycle events ensure all pods (including direct-task containers) have audit entries. Execution receipts capture workspace hash, audit chain tail, and token usage. Local verification tool works on generated test logs. S3 sink compiles into production binaries but has no integration test against real S3.
-
-## Current Status
-
-| Component | Maturity | Evidence |
-|-----------|----------|----------|
-| **Permission lattice** (portcullis) | Verified | 58K LOC, 942 tests, 297 Verus VCs, 32 Kani BMC proofs, 3 fuzz targets |
-| ** Uninhabitable state detection** | Verified | Static scan + runtime guard, monotonicity proven (E1-E3, Kani B1-B9) |
-| **Attenuation tokens** | Verified | Compact delegation credentials with Kani-proven invariants (D1-D7) |
-| **Delegation chains** | Tested | Monotone attenuation with `meet_with_justification`, audit-reconstructable chains |
-| **Unicode injection defense** | Tested | 8-category invisible character detection (bidi, tags, ZWJ); warn/strip/deny policy |
-| **Execution receipts** | Tested | Cryptographic pod execution proof with token usage and cost tracking |
-| **Permission market** | Tested | Lagrangian pricing oracle for multi-dimensional capability constraints |
-| **Web fetch security** | Tested | Unified MCP+HTTP path: MIME gating, DNS/URL allowlist, redirect verification, IPv6 |
-| **Audit log verification** | Tested | HMAC-SHA256 + SHA-256 chain; optional S3 append-only sink; node-side lifecycle events |
-| **PodSpec scanner** | Tested | Uninhabitable state, credentials, network, isolation, timeout checks |
-| **Claude Code scanner** | Tested |  Uninhabitable state via allow/deny projection, Bash capability propagation, exfil patterns, safety bypasses, credentials |
-| **MCP config scanner** | Tested | Well-known server classification (15 packages), `npx -y` supply chain detection, HTTP servers, credentials |
-| **Permission profiles** | Tested | 14 named profiles backed by lattice constructors |
-| **Tool proxy** (MCP enforcement) | Tested | 149 tests; enforces agent sessions in GitHub Actions |
-| **Firecracker isolation** | Tested | Real jailer invocation + iptables; Linux+KVM only |
-| **Network enforcement** | Tested | Default-deny egress, DNS allowlisting, drift detection |
-| **CI hardening** | Tested | 16 required status checks; mutation testing blocks surviving mutants |
-| **Budget tracking** | Partial | AtomicBudget exists; pre-exec reservation works, post-exec accounting incomplete |
-| **SPIFFE identity** | Implemented | mTLS + cert management code exists; no SPIRE deployment |
-| **Command exfiltration detection** | Partial | Program-name matching; `bash -c` bypasses documented |
-| **Lean 4 model** | Not started | Planned: Aeneas translation for deeper mathematical verification |
-
-**Maturity key:** *Verified* = SMT proofs + tests. *Tested* = compiles, has passing tests, never deployed. *Partial* = works for some cases, known gaps. *Implemented* = code exists, minimal testing. *Not started* = in roadmap only.
-
-## Permission Lattice
-
-Permissions compose predictably via a mathematical lattice. This is the most mature part of Nucleus — 58K lines of Rust with 297 SMT verification conditions (Verus/Z3) and 32 bounded model checking proofs (Kani/CaDiCaL).
-
-| Structure | What It Gives You | Status |
-|-----------|-------------------|--------|
-| **Quotient Lattice** |  Uninhabitable state detection as a structural nucleus operator | Verified (Verus) |
-| **Heyting Algebra** | Conditional permissions with formal semantics | Verified (Verus) |
-| **Galois Connections** | Policy translation across trust domains | Verified (Verus) |
-| **Graded Monad** | Risk accumulation through computation chains | Verified (Verus) |
-| **Attenuation Tokens** | Compact delegation credentials for wire transport | Verified (Kani D1-D7) |
-| **Exposure Invariants** | Exposure-set monotonicity, uninhabitable state iff count==3 | Verified (Kani B1-B9) |
-| **Modal Operators** | Distinguish "guaranteed safe" (□) from "might be safe" (◇) | Tested |
-| **Delegation Chains** | Monotone attenuation with justification trails | Tested |
-
-For the theory: [docs/THEORY.md](docs/THEORY.md).
-
-## Formal Verification
-
-Nucleus uses two complementary verification tools:
-- [Verus](https://verus-lang.github.io/verus/) (SMT-based, SOSP 2025 Best Paper) — 297 verification conditions checked by Z3
-- [Kani](https://model-checking.github.io/kani/) (bounded model checking) — 32 proofs checked by CaDiCaL SAT solver
-
-**What's proven (297 Verus VCs + 32 Kani proofs):**
-
-*Verus (SMT):*
-- Lattice laws: idempotent, commutative, associative, absorptive for all 12 capability dimensions
-- Nucleus operator: idempotent, deflationary, monotone, meet-preserving
-- Heyting adjunction: a ∧ b ≤ c ⟺ a ≤ b → c
-- Galois connection: adjunction, closure/kernel properties, monotonicity
-- Graded monad: identity, associativity, composition laws
-- Exposure guard: monotonicity (E1), trace monotonicity (E2), denial monotonicity (E3)
-- Uninhabitable state: completeness detection, risk classification, session safety
-- Delegation: transitivity, ceiling theorem, chain composition
-
-*Kani (BMC):*
-- B-series (9 proofs): Exposure set monoid identity/associativity, monotonicity, uninhabitable state-iff-count-equals-3, isolation lattice meet/join properties
-- D-series (7 proofs): Attenuation token invariants — token ≤ parent, token ≤ requested cap, chained attenuation, delegation ceiling preservation
-- E-series (3 proofs): Guard denial soundness, Clinejection defense, apply_record monotonicity
-- Structural (13 proofs): Lattice distributivity, frame law, budget monotonicity, capability level ordering
-
-**What's tested but not formally verified:**
-- Modal operators (necessity/possibility, S4 axioms) — 16 property tests
-- Weakening cost model — 15 property tests
-- Full PermissionLattice composition — 130 proptest invariants
-- Adversarial inputs — 70 OWASP-inspired attack scenarios
-
-**What's planned but not started:**
-- Lean 4 mathematical model via Aeneas (Phase 1)
-- Full enforcement boundary verification (Phase 2 — started with E1-E3)
-- Differential testing: Rust engine vs Lean model (Phase 3)
-- Extended TCB verification: sandbox, credentials, tool proxy (Phase 4)
-
-See the full roadmap: [docs/north-star.md](docs/north-star.md).
-
-Both proof counts are ratcheted in CI — they can only go up, never down (`.verus-minimum-proofs`, `.kani-minimum-proofs`). Merging to `main` requires 16 status checks to pass, including security audit, cargo deny, clippy, fmt, fuzz, mutation testing, and per-crate test suites.
-
-## v1.0 Contract Surface
-
-The v1.0 interfaces are designed for 15 years of growth. See [`STABILITY.md`](STABILITY.md) for the full frozen/open contract table.
-
-**Frozen at v1.0** (breaking changes require v2.0):
-- 12 core `Operation` variants + exposure classifications
-- 3 core `ExposureLabel` variants + uninhabitable state predicate
-- `CapabilityLevel` enum (`Never`, `LowRisk`, `Always`)
-- gRPC `NodeService` RPCs (8 RPCs including streaming), HMAC signing protocol, audit hash chain
-- `ExecutionReceipt` fields 1-8 (v1.0 frozen), with `v1_content_hash` for forward compatibility
-
-**Open for extension** (no version bump needed):
-- New operations via `ExtensionOperation` on `CapabilityLattice` (fail-closed: unknown ops default to `Never`)
-- New exposure labels via `ExtensionExposureLabel` on `ExposureSet` (don't affect core uninhabitable state)
-- New dangerous combinations via `ConstraintNucleus` (uninhabitable state always slot 0, can't be removed)
-- Versioned `ExecutionReceipt` with `v1_content_hash` for forward-compatible verification
-- `WorkspaceGuard` trait for multi-agent shared exposure (interface only in v1.0)
-
-Proofs survive extensions by construction: products of lattices are lattices (universal property in **Lat**), powersets preserve join-semilattice laws, and composition of deflationary endomorphisms is deflationary. No Verus re-verification needed.
-
-## Runtime Architecture
+**51 seconds** from `limactl delete nucleus` to a booted, identity-proving pod:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Your Agent                               │
-├─────────────────────────────────────────────────────────────────┤
-│  nucleus-cli / nucleus-audit scan                               │
-│  (enforce at runtime / catch misconfigs before deploy)          │
-├─────────────────────────────────────────────────────────────────┤
-│                         nucleus                                 │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │   Sandbox    │  │   Executor   │  │   AtomicBudget       │  │
-│  │  (cap-std)   │  │  (process)   │  │   (lock-free)        │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-├─────────────────────────────────────────────────────────────────┤
-│                      portcullis                                 │
-│   Capabilities × Obligations × Paths × Commands × Budget × Time │
-│   + Heyting Algebra + Galois + Graded Monad + Attenuation Tokens│
-├─────────────────────────────────────────────────────────────────┤
-│                    nucleus-identity                             │
-│           SPIFFE workload identity + mTLS + cert rotation       │
-├─────────────────────────────────────────────────────────────────┤
-│           Firecracker microVM / seccomp / netns                 │
-│           (Linux + KVM required; not available on macOS)        │
-└─────────────────────────────────────────────────────────────────┘
+  [OK] pod created in 7620 ms, tool-proxy at http://127.0.0.1:42149
+  [OK] guest proved itself to its proxy: tier 2 (spiffe-identity)
+  [OK] allowed operation served from the guest sandbox
+  [OK] forbidden operation denied by policy (kind=kernel_denied)
+  [OK] SPIFFE identity fetched
+  [OK] task token fetched over vsock
+  [OK] Firecracker is running under a seccomp filter
 ```
 
-The enforcement path: Agent → MCP → tool-proxy (inside VM) → portcullis check → OS operation. Every side effect goes through the proxy. The proxy is the only process in the guest. Network egress is default-deny with iptables rules applied *before* the VM starts.
+Firecracker + jailer 1.16.1, kernel digest-pinned against a compiled-in constant.
+</details>
+
+### Linux, or just want the checks
+
+You do not need a VM for most development. A privileged Linux container gives
+network namespaces and `iptables`, which is enough to run the egress
+conformance check (`scripts/egress-conformance.sh`) and to compile the
+Linux-only code paths. Only the VMM work needs KVM.
+
+Every tool call flows through the permission kernel. `nucleus run` tracks data provenance and blocks dangerous combinations — like writing code derived from untrusted web content.
+
+> **Vendor neutrality.** The core library and the generic `credentials.env` / `PodSpec` interface are *intended* to be vendor-agnostic, but the surface is not fully clean today. Two things break it: (1) the *reference agent runner* shipped with `nucleus run`/`shell` is coupled to one specific assistant CLI (binary name, default model string, permission-bypass flag), and (2) `nucleus-spec` still hardcodes specific LLM-vendor hostnames and workload-identity defaults (see [Known Gaps](#known-gaps)). A PreToolUse hook for AI coding assistants lives in the external private orchestrator [nucleus-code](https://github.com/coproduct-opensource/nucleus-code), built on this runtime. Treat the runner as an integration *example*, not a vendor-agnostic component.
+
+---
+
+## What Gets Proved
+
+| Claim | What it means for you | Evidence | Known gap |
+|-------|----------------------|----------|-----------|
+| Taint is monotone | Once web content contaminates a session, the agent cannot silently regain trusted status | [Lean 4 + Kani](docs/verified-claims.md#2-taint-is-monotone-no-silent-cleansing) | Depends on correct labeling at integration boundaries |
+| Adversarial integrity absorbs | One drop of adversarial input contaminates the entire result — no dilution | [Lean 4](docs/verified-claims.md#3-adversarial-integrity-is-absorbing) | Content must be labeled adversarial at source |
+| Unpoliced I/O is unconstructible | File/shell/git effects can only be obtained via `production_effects(policy)` — there is no policy-free constructor | [Sealed effect traits](docs/verified-claims.md#6-obligation-bypass-is-a-type-error) | Web fetch/search and agent-spawn effects are stubs; capability gate is coarse (`!= Never`) |
+| Permissions are a Heyting algebra | Restricting permissions always produces a valid, less-permissive result | [Kani + Lean](docs/verified-claims.md#5-capability-lattice-is-a-distributive-heyting-algebra) | 13 dimensions may not cover every use case |
+| Secret data cannot flow to public sinks | Session-level confidentiality ceiling prevents laundering through intermediaries | [Unit tests + compile-fail](docs/verified-claims.md#7-confidentiality-downflow-is-enforced) | Mislabeled data bypasses the check |
+| Self-amendments may only tighten | An agent's policy manifest can drop, but never add, authority/IO/budget — escalations are rejected | [Kani BMC + tests](docs/verified-claims.md) | Constitutional kernel is a library; not yet wired into the live runtime |
+| Provenance is independently re-verifiable | Forged provenance bundles are rejected by the same verifier you can run yourself | [CI-gated adversarial corpus](docs/verified-claims.md) | A green verify proves lineage is authentic + intact, **not** that the agent behaved well |
+
+### Formal assurance, recounted (June 2026)
+
+| Tool | Real count | Scope | CI gate |
+|------|-----------|-------|---------|
+| **Lean 4 + Mathlib** (kernel-checked) | ~277 theorems in the security core (more, incl. research formalizations) | Capability Heyting algebra, IFC semilattice, taint monotonicity, exposure monoid, delegation, **integrity noninterference over Aeneas-extracted Rust** | `portcullis-core-proven-lean.yml` `lake build`s the whole proven tier and fails on any `sorry`/`admit` outside the research manifest (`crates/portcullis-core/lean/CONJECTURES.md`); `aeneas-ifc-scoped.yml` asserts a clean axiom set for the extracted integrity-noninterference theorem (`IntegrityNoninterferenceExtracted.lean`) |
+| **Kani** (bounded model checking) | 114 harnesses repo-wide (portcullis 64, portcullis-core 31, ck-kernel 17, +2) | DecisionToken linearity, lattice adjunction, flow-graph isolation, constitutional-kernel admission contract | `kani-nightly.yml` runs `cargo kani -p portcullis` (64) + `-p ck-kernel` (17) |
+| **Tests** | ~4,400 (`#[test]` / `#[tokio::test]`) + ~47 `proptest` suites | Workspace-wide | `ci.yml` |
+| **Code** | ~165K LOC Rust | — | — |
+
+**Honest scope.** The Lean *security* core (lattice, IFC, exposure, noninterference) is `sorry`-free. As of June 2026 the `portcullis-core-proven-lean.yml` gate `lake build`s the proven tier (24 libraries) and fails if any proof-hole `sorry`/`admit` appears in a file **not** listed as research-tier in `crates/portcullis-core/lean/CONJECTURES.md` — so a real proof can no longer silently regress; `aeneas-ifc-scoped.yml` additionally asserts a clean axiom set for the one extracted integrity-noninterference theorem. (Two previously-orphaned files — `CategoryProofs.lean`, `LabeledTypeProofs.lean` — were found to no longer compile under the pinned toolchain when the gate was introduced; they are quarantined as Tier 3 "STALE" in CONJECTURES.md, not cited as proven, pending repair.) The exploratory alignment-tax / cohomology / braid formalizations are research-tier, are **not** discharged (**40 open `sorry` proof holes across 11 files**; ~100 raw `sorry` occurrences tree-wide are mostly doc comments), and are clearly separated from the core and labeled `CONJECTURE` in-file. Some research files are `sorry`-free but rely on `native_decide`, which trusts the native compiler (`Lean.ofReduceBool`) and is **not** pure-kernel-checked — disclosed, not hidden. Aeneas mechanically translates the core capability *types* from Rust to Lean so proofs run over generated code; ExposureSet/IFC use hand-written Lean models with structural correspondence tests, and exact function-level Rust↔Lean correspondence (that the Rust `meet` equals the Lean `meet`) is **not yet** proven. Kani is bounded — complete over the finite lattice state space, an approximation for string/path checks.
+
+**No Verus.** Earlier docs cited "297 Verus VCs." Verus has been **removed** from the workspace; its guarantees are folded into the Lean 4 + Kani stack. A `proptest`-based conformance suite (`verus_conformance.rs`) is the surviving artifact — property tests, not SMT proofs.
+
+[Verified Claims](docs/verified-claims.md) · [Formal Methods](FORMAL_METHODS.md) · [Production Delta](docs/production-delta.md)
+
+---
+
+## The Flow Algebra
+
+| Law | What it means | What it enables |
+|-----|---------------|-----------------|
+| `a ⊔ b = b ⊔ a` | Join is commutative | Safe parallel execution |
+| `a ⊔ (b ⊔ c) = (a ⊔ b) ⊔ c` | Join is associative | Order-independent ratchet |
+| `a ⊔ a = a` | Join is idempotent | Provably safe caching |
+| `a ≤ a ⊔ b` | Join is monotone | Taint never decreases |
+
+Each of these four laws is backed by a named, passing test, and the four-valued Belnap policy bilattice that composes decisions (`Allow`/`Deny`/`Unknown`/`Conflict`) has kernel-checked, sorry-free Lean proofs.
+
+### The information-flow core, precisely
+
+Nucleus is built on a vendor-agnostic algebraic core (`portcullis-core`, dependency-free):
+
+- **Capability lattice** — a Heyting algebra over **13** operation dimensions (read/write/exec/web/git/spawn/…), each a 3-level chain `Never < LowRisk < Always`, with pointwise `meet`/`join`/`implies`, a least-privilege builder, and work-type profiles (`read-only`, `research`, `codegen`, `review`). No LLM-vendor concepts appear in the core.
+- **Bidirectional information-flow control** — a **6-dimension** `IFCLabel` (confidentiality, integrity, authority, provenance, freshness, derivation) implementing BLP down-flow containment **and** Biba up-flow taint. A causal-DAG `FlowTracker` joins labels across operations and **fails closed on unknown nodes**, with monotonic per-session taint and confidentiality ceilings.
+- **Policy enforced by the type system** — I/O goes through sealed effect traits (`FileEffect`, `ShellEffect`, `GitEffect`); the only constructor for a real handler is `production_effects(policy)`, so unpoliced file/shell/git I/O is unconstructible. (Web fetch/search and agent-spawn effects on the real handler return `NotImplemented` and delegate to other crates.)
+- **Governed memory** — a key-value store with per-entry IFC labels, authority classes, provenance flags, TTL, and `poisoned_entries()` detection for memory-poisoning attack classes.
+
+This cluster carries **over a thousand passing library unit tests** (`portcullis-core` ~1081, `portcullis-effects` 69, `nucleus-spec` 32, `nucleus-memory` 17, `nucleus-ifc` 14, `portcullis-profiles` 4 — roughly **~1217** in total) plus ~95 Kani harnesses.
+
+---
+
+## The Three New Pillars
+
+The sections below cover three large subsystems that landed after the original docs and were previously under-described. Each carries an honest status note.
+
+### 1. Constitutional Kernel — policy that can only tighten
+
+A self-contained library trio (`ck-types`, `ck-policy`, `ck-kernel`) that decides whether a proposed change to an agent's *own* policy manifest is allowed to ship. Its governing rule is **monotonicity**: a self-amendment may only *tighten* authority, never widen it. The admission engine rejects any change that adds a capability, widens the I/O surface, raises a resource budget, or drops a required proof obligation — and reports exactly which invariant was violated. Constitutional (kernel-adjacent) changes can never be self-merged; they require a threshold of distinct, cryptographically-verified human signatures. Every accepted amendment is content-addressed (BLAKE3), carries an Ed25519-signed witness bundle (`ring`), and is appended to a replayable lineage.
+
+Documented adversarial defenses pass with tests: patch laundering, witness replay, lineage tampering, sandbox relaxation, and `policy_before` forgery are all rejected.
+
+| Component | What it does | Status |
+|---|---|---|
+| `ck-policy` monotonicity checker | Pure function: rejects capability / IO / budget escalation and proof-requirement weakening | Working (tested) |
+| `ck-kernel` admission engine + lineage | Validates parent/witness/signatures/monotonicity, appends signed lineage; constitutional path needs multi-sig human approval | Working (tested) |
+| Ed25519 witness signatures | Real `ring` verification, fail-closed when no trusted keys configured | Working; enforcement **opt-in** (defaults to test-skip mode) |
+| Kani proofs of the contract | 17 symbolic harnesses proving escalations are always rejected | Working; full run nightly, per-PR runs a count-regression gate |
+| PR-gate integration | Enforce monotonicity on every PR touching the constitution | **Working** — in-repo `ck-admit.yml` runs `ck-kernel::admit` (Preflight) |
+| Runtime integration | Enforce an admitted policy on live execution | **Roadmap** — gate is CI-side only |
+
+> **Status:** ~75 passing unit/integration tests; 17 Kani harnesses. The kernel is now **invoked by an in-repo PR gate** (`cargo xtask policy-gate`, workflow `ck-admit.yml`): every PR touching `PolicyManifest.toml` or a `may_not_modify` protected file is run through `ck-kernel::admit`, and a non-monotone amendment fails the build — replacing reliance on the external/closed "Constitutional Gate" app. Signature verification now **defaults to fail-closed** outside test builds (an empty `Enforced` verifier rejects every witness until you install trusted keys via `.with_signature_verifier()`). Still roadmap: full *Admit* mode with real signed witnesses + committed trust roots (the CI gate currently runs *Preflight* — authoritative on monotonicity + `may_not_modify`, signatures skipped), and live-runtime (non-CI) enforcement of an admitted policy.
+
+### 2. Verifiable Identity & Trust Federation — keyless, vendor-neutral
+
+A SPIFFE workload-identity and federation stack that turns a CI/runtime OIDC token into a SPIFFE id with **no long-lived secret**.
+
+- **Keyless GitHub Actions OIDC → SPIFFE (`nucleus-github-oidc`) is proven live end-to-end.** A real GitHub OIDC token (mintable only inside a job with `id-token: write`) is validated against GitHub's real JWKS (RS256 sig, issuer/audience/exp, repo+org allowlist, replay), and the SPIFFE id is derived from the *verified* `repository` claim — never from `sub` — with a green CI run on record. A Fly.io Machine validator (`nucleus-fly-oidc`) implements the same pattern (synthetic-fixture-tested; no live demo yet). Shared primitives (`nucleus-oidc-core`) provide RFC 7517/8037 JWKS, OIDC discovery, and replay defense, with a CI gate (`ci/no-vendor-strings.sh`) enforcing vendor neutrality on every PR.
+- **OIDC provider (`nucleus-oidc-provider`).** A stateless OP that mints EdDSA JWT-SVIDs with key rotation + grace windows, publishes RFC 8414 discovery + JWKS, and performs RFC 8693 token exchange — verifying the inbound `subject_token`'s Ed25519 signature and enforcing declarative federation rules.
+- **Trust registry — "Let's Encrypt for agents" (`nucleus-trust-registry`).** A **non-custodial** (never a CA, never a keyholder) registry for SPIFFE *federation enrollment*: a fail-closed PR gate verifies a GitHub OIDC proof-of-control (pinning the **numeric org id** to defeat rename-squatting) and appends each trust-root binding to an append-only, witness-cosigned transparency log.
+- **Witness & split-trust (`nucleus-witness`).** A C2SP `tlog-witness` server minting Ed25519 cosignatures under the full spec status matrix, with RFC 6962 consistency and rollback protection. Run your own **k-of-n witnesses across failure domains** so no single region, cloud account, or key store can forge or roll back your log — useful even to a single operator with zero counterparties.
+- **Verify-before-you-act (`nucleus-agent-card`).** Secret-free, WASM-capable verification of signed agent cards that, by design, refuses to trust any key embedded in the card itself.
+
+| Component | Status |
+|---|---|
+| Keyless GitHub Actions OIDC → SPIFFE | Working (proven **live E2E**) |
+| OIDC core primitives (JWKS, discovery, replay) | Working |
+| Agent cards (verify-before-you-act) | Working |
+| SPIFFE identity + mTLS + did:web | Working |
+| OIDC provider (mint + RFC 8693 exchange) | Alpha (static trust bundle; live SPIRE-Agent validation stubbed) |
+| Trust registry (enrollment + transparency log) | Alpha (single maintainer + single witness; proves **org control**, not trust-domain ownership) |
+| C2SP tlog-witness / Sigsum k-of-n | Alpha (in-memory store; **not** yet persistent) |
+| Fly machine OIDC → SPIFFE | Alpha (no live-E2E demo) |
+
+> **Status & honesty notes.** (1) The OIDC provider verifies inbound `subject_token` signatures only against a statically-configured trust bundle; live SPIRE-Agent-mediated validation (Workload API over UNIX socket) is **stubbed**. (2) The trust registry's OIDC proof establishes GitHub-**org** control of the enrolling repo, **not** ownership of the SPIFFE trust-domain name (a DNS-01-style proof is v2); the MVP trust base is a single maintainer + single witness — no threshold key ceremony. (3) The witness store is in-memory; a restart resets last-cosigned positions, so production requires durable storage. (4) Paid-tier/metering seams are documented-only — **no billing feature exists**.
+
+### 3. Provenance Envelopes & the Public Verifier — signed, portable, independently checkable
+
+Every agent session can be packaged as a **provenance bundle** — the agent's payload plus a signed lineage envelope proving how it was produced. Each lineage edge (one per tool call, LLM call, or derived artifact) carries a child SPIFFE id encoding its derivation, an Ed25519 signature, and a `prev_hash` link; the whole log is committed to an RFC 9162 Merkle tree with signed tree heads, inclusion/consistency proofs, and optional external-witness cosignatures (Nucleus + C2SP `tlog-witness`).
+
+The point is **independent verification**. `verify_bundle` re-checks the entire bundle — per-edge signatures, hash chain, session membership, Merkle inclusion, cosignature thresholds, and payload binding — against a **trust anchor you supply out-of-band**. The bundle's own embedded keys are deliberately ignored. The same audited Rust verifier ships three ways:
+
+| Surface | What it is | Status |
+|---|---|---|
+| `nucleus-envelope` (Rust) | Core `verify_bundle` + bundle builder | Working — 36 integration tests (73 total incl. unit tests) |
+| `@coproduct/verify` (WASM/JS) | `verify(receipt, anchor)` one-liner; runs in browser/Node with zero service trust | Builds + smoke-tested; **npm publish gated** |
+| `nucleus-verifier` (Python) | PyO3 backend binding | Builds; **no in-repo tests yet** |
+| `nucleus-verifier-service` (HTTP) | Optional convenience verifier + transparency log | Deploy-ready (`fly.toml`; 26 integration / 70 total tests); **not yet hosted** |
+
+A **CI-gated adversarial corpus** of 8 forged bundles (tampered edges, swapped signatures, truncation, attacker JWKS, unknown kid, foreign parent, non-pod root) **must** be rejected on every merge — `every_corpus_case_is_rejected` passes today. This is the security promise, not a slogan. For replication, `nucleus-bundle-cas` fetches bundles by BLAKE3 root over bao-verified `iroh-blobs` QUIC so a peer can't substitute or truncate bytes (alpha; single-operator split-trust, no discovery/mesh, pins pre-1.0 `iroh`).
+
+> **Honest scope.** A green verification proves the lineage is *authentic and intact*. It does **not** prove the agent behaved well, that information-flow policy held, or that any computation was correct — those are separate guarantees. Issuing/signing identities is **demo-only** in this repo (`dev`-feature-gated `LocalIssuer`); production needs an external SPIFFE issuer and witness. The public verifier service is **not** live (no hosted endpoint resolves today); it is self-hostable and deploy-ready. The `@coproduct/verify` npm package and in-browser tamper demo are publish-gated; the compiled `.wasm` is a build product, not committed.
+
+---
+
+## How Nucleus Stops Real Exploits
+
+| CVE / class | Attack | Why it worked | Nucleus defense |
+|-----|--------|---------------|-----------------|
+| [CVE-2025-53773](https://embracethered.com/blog/posts/2025/github-copilot-remote-code-execution-via-prompt-injection/) | Coding-assistant RCE via prompt injection | Security was a JSON config flag the agent could edit | Security is compiled types and sealed effect traits, not config |
+| [CVE-2025-32711](https://www.hackthebox.com/blog/cve-2025-32711-echoleak-copilot-vulnerability) | EchoLeak — zero-click exfiltration via hidden prompt in a document | No concept of "internal data cannot leave" | [Bidirectional IFC](docs/verified-claims.md#7-confidentiality-downflow-is-enforced) blocks internal→public flow |
+| [MCP Tool Poisoning](https://arxiv.org/html/2509.10540v1) | Malicious MCP server injects hidden instructions | Tool responses treated as trusted | MCP responses labeled `Adversarial` at the type level |
+| Memory poisoning (MINJA / MemoryGraft) | Injected memories steer later behavior | Persistent stores treated as trusted | `GovernedMemory` labels each entry; `poisoned_entries()` surfaces contamination |
+
+---
+
+## Deployment Tiers
+
+| Tier | What | Isolation | Platform | Status |
+|------|------|-----------|----------|--------|
+| **0 — Scan** | `nucleus audit [PATH]` in CI | Static analysis of PodSpec / MCP / settings configs; CI exit codes | any | Usable today (92 tests) |
+| **1 — Enforce** | `nucleus run --local` / agent PreToolUse hook | Local tool-proxy routes every call through the lattice; **process-level** env + command isolation (no VM) | any host | Alpha |
+| **2 — Isolate** | `nucleus run` via `nucleus-node` | Firecracker microVM + network namespace + default-deny egress + seccomp | **Linux + KVM only** | Alpha |
+
+> Tier 1 is process-level (env-clear isolation, `cap-std`, command allowlist) — it is **not** kernel/container isolation and does not prevent kernel escapes or network exfiltration when `bash` is allowed. The agent PreToolUse-hook variant of Tier 1 (`nucleus run --hook`, `nucleus guard`) is **not** runnable from this repo: it shells out to a `nucleus-claude-hook` binary that lives in the external private orchestrator, and the in-repo install hint (`cargo install --path crates/nucleus-claude-hook`) is stale — that crate does not exist here. Tier 2 isolation requires Linux with `/dev/kvm`; on macOS the node returns an explicit "firecracker requires Linux" error, and the macOS test suite exercises config/allocation logic, not a live VM boot.
+
+---
+
+## Architecture
+
+```
+Agent → MCP → tool-proxy (inside VM) → portcullis check → OS operation
+                  │
+                  └─ emits signed lineage edges ─► provenance bundle ─► verify_bundle (Rust / WASM / Py)
+```
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  nucleus-cli  ·  nucleus audit [PATH]  ·  control-plane API    │  user-facing
+├───────────────────────────────────────────────────────────────┤
+│  ck-kernel / ck-policy / ck-types   (constitutional kernel)    │  policy admission
+│   monotonic self-amendment · signed witness · lineage          │   (library, not yet runtime-wired)
+├───────────────────────────────────────────────────────────────┤
+│  nucleus (Sandbox + Executor + AtomicBudget + MonotonicGuard)  │  enforcement runtime
+├───────────────────────────────────────────────────────────────┤
+│  portcullis / portcullis-core / portcullis-effects             │  IFC core
+│   13-dim Heyting capability lattice × 6-dim IFCLabel            │
+│   sealed effect traits · FlowTracker · Belnap bilattice        │
+├───────────────────────────────────────────────────────────────┤
+│  identity & trust federation                                   │  keyless identity
+│   oidc-core · github-oidc · fly-oidc · oidc-provider           │
+│   trust-registry ("LE for agents") · witness (C2SP) · cards    │
+├───────────────────────────────────────────────────────────────┤
+│  provenance                                                    │  attestation
+│   nucleus-lineage · nucleus-envelope · bundle-cas              │
+│   verifier-service · verifier-js (WASM) · verifier-py          │
+├───────────────────────────────────────────────────────────────┤
+│  Firecracker microVM / seccomp / netns  (Linux + KVM)          │  isolation substrate
+└───────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Crates
 
-| Crate | Purpose | Tests |
-|-------|---------|-------|
-| **portcullis** | Permission lattice: 12 algebraic modules + attenuation tokens | 942 |
-| **portcullis-verified** | Verus SMT proofs for portcullis | 297 VCs |
-| **nucleus-audit** | `scan` PodSpecs, Claude Code settings, MCP configs; `verify` audit logs | 45 |
-| **nucleus** | Enforcement: sandbox, executor, budget | 39 |
-| **nucleus-node** | Node daemon managing Firecracker microVMs + containers | 39 |
-| **nucleus-tool-proxy** | MCP tool proxy running inside pods (+ unicode audit, exit reports) | 149 |
-| **nucleus-mcp** | MCP server bridging to tool-proxy | 4 |
-| **nucleus-identity** | SPIFFE workload identity, mTLS, certs | 296 |
-| **nucleus-spec** | PodSpec definitions (policy, network, creds, execution receipts) | 21 |
-| **nucleus-proto** | Generated gRPC/Protobuf types for nucleus-node | — |
-| **nucleus-permission-market** | Lagrangian pricing oracle for capability constraints | 28 |
-| **nucleus-cli** | CLI for running tasks with enforced permissions | 12 |
-| **nucleus-sdk** | Rust SDK for building sandboxed AI agents | 3 |
-| **nucleus-client** | Client signing utilities + drand anchoring | 8 |
-| **nucleus-guest-init** | Guest init for Firecracker rootfs | 2 |
-| **nucleus-net-probe** | TCP probe for network policy tests | 2 |
-| **exposure-playground** | Interactive TUI for exploring the lattice | — |
+The workspace contains **~47 crates** (42 workspace members + 5 excluded build targets), plus one orphan crate dir (`nucleus-policy`) not yet wired into the workspace. They are grouped below by function. Status reflects the most recent subsystem survey.
 
-Total: ~1,700 test functions across the workspace (103K LOC Rust). Proptest invariants each generate 256 random cases. 32 Kani BMC proofs run in CI alongside 297 Verus VCs.
+<details>
+<summary><strong>User-facing tools</strong></summary>
 
-## Permission Profiles
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| [**nucleus-cli**](crates/nucleus-cli/) | Run agents under enforced permissions; ships the `nucleus` binary (`audit` / `run --local` / `run`) | Mixed — Tier 0 working; runner vendor-coupled; `--hook`/`guard` need an external binary |
+| [**nucleus-audit**](crates/nucleus-audit/) | Scan configs; verify HMAC tool-proxy logs + SHA-256 receipt chains; provenance / SLSA / C2PA subcommands | Mixed — config scan + tool-proxy-log HMAC verification real; receipt-chain verifier checks hash chain, not yet Ed25519 sig |
+| [**nucleus-sdk**](crates/nucleus-sdk/) | Rust client: tool-proxy + node clients, intent profiles, HMAC/mTLS | Working library (unit-tested) |
+| [**exposure-playground**](crates/exposure-playground/) / **exposure-web** | TUI / WASM visualizer of the capability lattice | Demo — currently does **not** compile on this branch (portcullis feature-gate bug) |
 
-```bash
-nucleus profiles
+</details>
 
-# Available profiles:
-#   restrictive        Minimal permissions (default)
-#   read_only          File reading and search only
-#   code_review        Read + limited search
-#   edit_only          Write + edit, no execution
-#   fix_issue          Write + bash + git commit (no push/PR)
-#   safe_pr_fixer      Write + bash + commit + web fetch (no push/PR/search)
-#   local_dev          Full local development, no network
-#   web_research       Read + web access, no writes
-#   network_only       Network access, no filesystem
-#   release            Full pipeline including push + PR
-#   full               Everything (uninhabitable state gates still enforced!)
-#   + 3 more domain-specific profiles
-```
+<details>
+<summary><strong>IFC core (the verified heart)</strong></summary>
 
-## Custom Permissions
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| [**portcullis-core**](crates/portcullis-core/) | 13-dim Heyting capability lattice, 6-dim IFCLabel, FlowTracker, governed memory, Belnap bilattice, Aeneas→Lean pipeline | Working (~1081 tests + ~31 Kani harnesses; fn-level Lean bridge in progress) |
+| [**portcullis**](crates/portcullis/) | Higher-level permission planes: attenuation tokens, egress policy, DPI, kernel | Working |
+| [**portcullis-effects**](crates/portcullis-effects/) | Sealed effect traits (`FileEffect`/`ShellEffect`/`GitEffect`/…) gated by `production_effects(policy)` | Alpha — file/shell/git do real I/O; web/spawn stubbed |
+| [**portcullis-profiles**](crates/portcullis-profiles/) | Work-type presets (CodeReview/BugFix/DocsEdit/Research), vendor-neutral | Working |
+| [**portcullis-python**](crates/portcullis-python/) | PyO3/maturin native bindings exposing the portcullis core to Python | Excluded build target (native bindings) |
+| [**portcullis-zkvm-guest**](crates/portcullis-zkvm-guest/) | RISC-V zkVM guest (risc0-build) — proving target for core checks | Excluded build target (zkVM guest) |
+| [**nucleus-ifc**](crates/nucleus-ifc/) | Standalone IFC API (re-export of the core FlowTracker) | Working |
+| [**nucleus-memory**](crates/nucleus-memory/) | Governed memory with per-entry IFC labels + poisoning detection | Working |
+| [**nucleus-spec**](crates/nucleus-spec/) | `PodSpec`, generic `credentials.env`, network/resource/seccomp specs, draft `workload_identity` | Alpha — `workload_identity` is a draft RFC with no runtime consumer; **still hardcodes specific LLM-vendor hostnames + workload-identity defaults** (see Known Gaps) |
 
-```toml
-[capabilities]
-read_files = "always"
-write_files = "low_risk"
-edit_files = "low_risk"
-run_bash = "low_risk"
-git_commit = "low_risk"
-git_push = "never"        # Blocked entirely
-web_fetch = "never"       # No untrusted content
+</details>
 
-[obligations]
-approvals = ["run_bash"]  # Requires approval token
+<details>
+<summary><strong>Constitutional kernel</strong></summary>
 
-[budget]
-max_cost_usd = 2.0
-max_input_tokens = 50000
-max_output_tokens = 5000
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| [**ck-types**](crates/ck-types/) | Manifest schema, BLAKE3 digests, Ed25519 witness bundles, subset/escalation order | Working (tested) |
+| [**ck-policy**](crates/ck-policy/) | Pure `check_monotonicity(parent, child)` with per-axis diff report | Working (tested) |
+| [**ck-kernel**](crates/ck-kernel/) | Admission engine + append-only lineage; 17 Kani harnesses | Working library — **not yet wired into the runtime** |
+| [**nucleus-policy**](crates/nucleus-policy/) | Policy DSL for zero-permission-prompt agent authorization | Orphan — has a Cargo.toml but is **not** a workspace member; undescribed/unwired |
 
-[time]
-valid_hours = 1           # Expires after 1 hour
-```
+</details>
 
-## Example Configs
+<details>
+<summary><strong>Enforcement runtime & node</strong></summary>
 
-See [`examples/`](examples/) for scannable configurations across all three formats:
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| [**nucleus**](crates/nucleus/) | `cap-std` sandbox, `AtomicBudget`, `MonotonicGuard`, env-clear `Executor` | Working (cross-platform, `#![deny(unsafe_code)]`) |
+| [**nucleus-tool-proxy**](crates/nucleus-tool-proxy/) | Permission gateway: mTLS, SPIFFE policy, HMAC requests, tamper-evident JSONL audit | Working (~187 tests) |
+| [**nucleus-mcp**](crates/nucleus-mcp/) | stdio MCP server bridging tool calls to the proxy with decision tracing | Working |
+| [**nucleus-node**](crates/nucleus-node/) | kubelet-analogue daemon: pod lifecycle, netns, iptables, cgroups, seccomp, vsock | Alpha — Tier 2 paths Linux + KVM only |
+| [**nucleus-guest-init**](crates/nucleus-guest-init/) | Firecracker guest init (mounts, net, secrets, exec proxy) | Alpha — Linux-only by design |
+| [**nucleus-net-probe**](crates/nucleus-net-probe/) | Tiny TCP probe for network-policy integration tests | Working (test helper) |
+| [**nucleus-otel-bootstrap**](crates/nucleus-otel-bootstrap/) | Shared OpenTelemetry OTLP bootstrap for server binaries (distributed tracing) | Working (shared infra) |
 
-**PodSpecs** ([`examples/podspecs/`](examples/podspecs/)):
-- **`safe-pr-fixer.yaml`** — CI issue fixer: write + bash + commit, no push/PR (the GitHub Action profile)
-- **`airgapped-review.yaml`** — Code review in a fully airgapped Firecracker VM with seccomp
-- **`secure-codegen.yaml`** — Code generation with filtered network (crates.io, npm, GitHub only)
-- **`permissive-danger.yaml`** — Intentionally insecure config for testing `nucleus-audit scan`
+</details>
 
-**Claude Code settings** ([`examples/claude-settings/`](examples/claude-settings/)):
-- **`safe-restrictive.json`** — Scoped Bash patterns, deny rules for exfil, sandbox enabled
-- **`hidden-uninhabitable state.json`** — The `["Edit", "Write", "Bash"]` trap: CRITICAL uninhabitable state via Bash propagation
-- **`permissive-danger.json`** — Everything allowed, safety bypasses, plaintext credentials
+<details>
+<summary><strong>Identity & trust federation</strong></summary>
 
-**MCP configs** ([`examples/mcp-configs/`](examples/mcp-configs/)):
-- **`safe-local.json`** — Single local filesystem server, no credentials
-- **`typical-dev-stack.json`** — Postgres + filesystem + GitHub + unknown packages (shows server classification + supply chain warnings)
-- **`permissive-danger.json`** — External HTTP server, plaintext credentials, dangerous commands
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| [**nucleus-oidc-core**](crates/nucleus-oidc-core/) | Provider-agnostic OIDC primitives: JWKS, discovery, replay cache, federation dispatch | Working |
+| [**nucleus-github-oidc**](crates/nucleus-github-oidc/) | Keyless GitHub Actions OIDC → SPIFFE | Working (proven **live E2E**) |
+| [**nucleus-fly-oidc**](crates/nucleus-fly-oidc/) | Fly.io Machine OIDC → SPIFFE (validation half) | Alpha (no live-E2E demo) |
+| [**nucleus-oidc-provider**](crates/nucleus-oidc-provider/) | OP: mints EdDSA JWT-SVIDs, RFC 8414 discovery, RFC 8693 token exchange | Alpha (static bundle; live SPIRE stubbed) |
+| [**nucleus-trust-registry**](crates/nucleus-trust-registry/) | "Let's Encrypt for agents" — PR-rooted, OIDC-attested, transparency-logged enrollment | Alpha (single maintainer/witness; org-control, not domain-ownership) |
+| [**nucleus-witness**](crates/nucleus-witness/) | C2SP `tlog-witness`, Sigsum k-of-n cosignatures | Alpha (in-memory store) |
+| [**nucleus-agent-card**](crates/nucleus-agent-card/) | Sign/verify A2A-style agent cards; secret-free, WASM-usable verify | Working |
+| [**nucleus-identity**](crates/nucleus-identity/) | SPIFFE IDs, mTLS, P-256 CSR/X.509, did:web, DPoP, SPIRE client | Working (SPIRE/resolver feature-gated) |
 
-## GitHub Actions
+</details>
 
-### Deterministic Scan (no LLM, no API key)
+<details>
+<summary><strong>Provenance & verification</strong></summary>
 
-Add to any CI pipeline — blocks PRs with unsafe agent configs:
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| [**nucleus-lineage**](crates/nucleus-lineage/) | Per-call SPIFFE DAG, signed hash-chained edges, RFC 9162 Merkle log, C2SP witness client | Working (note: crate README is stale and *under*-claims) |
+| [**nucleus-envelope**](crates/nucleus-envelope/) | Signed provenance bundle + `verify_bundle` (sigs, Merkle, cosignatures, payload binding) | Working (36 integration / 73 total tests) |
+| [**nucleus-envelope-adversarial-corpus**](crates/nucleus-envelope-adversarial-corpus/) | 8 forged bundles that `verify_bundle` MUST reject — CI-gated | Working |
+| [**nucleus-bundle-cas**](crates/nucleus-bundle-cas/) | BLAKE3 content-addressing + bao-verified `iroh-blobs` transport | Alpha (no discovery/mesh; pre-1.0 iroh) |
+| [**nucleus-verifier-service**](crates/nucleus-verifier-service/) | Public verifier-as-a-service: `/v1/verify`, signed STH, RFC 9162 proofs | Alpha — deploy-ready (26 integration / 70 total tests), **not hosted** |
+| **verifier-js** / [`@coproduct/verify`](sdks/verifier-js/) | WASM verifier + one-line `verify(receipt, anchor)` facade | Alpha — npm publish gated |
+| [**verifier-py**](sdks/verifier-py/) | PyO3 `verify_bundle` binding | Alpha — no in-repo tests yet |
 
-```yaml
-# Auto-discover all agent configs in the repo
-- uses: coproduct-opensource/nucleus/scan@v1
-  with:
-    auto: true
+</details>
 
-# Or specify paths explicitly
-- uses: coproduct-opensource/nucleus/scan@v1
-  with:
-    claude-settings: .claude/settings.json
-    mcp-config: .mcp.json
-    # pod-spec: path/to/podspec.yaml
-    # format: text          # or json
-```
+<details>
+<summary><strong>Control plane, market & demos</strong></summary>
 
-Use `auto: true` to discover configs automatically, or provide explicit paths. Outputs `verdict` (PASS/WARN/FAIL) and `findings-json`. Non-zero exit code on critical or high findings.
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| [**nucleus-control-plane**](crates/nucleus-control-plane/) | `JobSpec` → agent → signed verifiable `Bundle` orchestrator (ships only `MockJobRunner`) | Working (real drivers live downstream) |
+| [**nucleus-control-plane-server**](crates/nucleus-control-plane-server/) | REST + gRPC + SSE API with SPIFFE JWT-SVID auth, idempotency, HMAC webhooks | Working |
+| [**nucleus-permission-market**](crates/nucleus-permission-market/) | Lagrangian capability-pricing oracle, wired into the tool-proxy | Working (27 tests, verified invariants) |
+| [**nucleus-proto**](crates/nucleus-proto/) / [**nucleus-client**](crates/nucleus-client/) | Generated gRPC/Protobuf types; client signing + drand anchoring | Working |
+| **ctf-engine / ctf-server / ctf-mcp** | "The Vault" agent-exfil CTF over the **real** portcullis lattice (simulated tool I/O) | Demo — currently does **not** compile on this branch (same portcullis feature-gate bug) |
 
-### Safe PR Fixer (LLM-powered, lattice-enforced)
+</details>
 
-Drop this into any repo to get nucleus-enforced issue fixes:
+Python: `sdk/python/nucleus` ships a self-contained information-flow kernel (taint propagation, exposure accumulation; 168 passing tests). Native PyO3 bindings to the Rust core live in `portcullis-python` and `verifier-py`. The companion `nucleus_sdk` proxy client is self-labeled **pre-alpha / draft** (v0.0.0, "API will change").
 
-```yaml
-- uses: coproduct-opensource/nucleus@v1
-  with:
-    issue-number: "123"
-    api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-    profile: safe_pr_fixer     # write + bash + commit + web fetch, no push/PR
-    timeout: "600"
-    # model: "claude-sonnet-4-20250514"   # default
-    # github-token: ${{ secrets.GH_PAT }}  # optional: override GITHUB_TOKEN for PR creation
-```
-
-**How it works:**
-1. Installs `nucleus-cli`, `nucleus-tool-proxy`, and `nucleus-mcp` from [GitHub Releases](https://github.com/coproduct-opensource/nucleus/releases)
-2. Installs Claude Code CLI
-3. Builds a prompt from the issue body
-4. Runs `nucleus run --local --profile safe_pr_fixer` — the tool-proxy enforces the permission lattice on every agent side effect
-5. If the agent produced commits, a trusted CI script pushes the branch and opens a PR
-
-The agent **cannot push or create PRs** — only the trusted CI wrapper does that. The `safe_pr_fixer` profile blocks `git_push`, `create_pr`, and `web_search`.
-
-**Trust ladder:**
-| Tier | What | Isolation |
-|------|------|-----------|
-| **Tier 0** | `nucleus-audit scan` in CI | Static analysis (PodSpec, Claude settings, MCP), no runtime |
-| **Tier 1** | `nucleus run --local` (GitHub Action) | Tool-proxy lattice enforcement, no VM |
-| **Tier 2** | `nucleus run` with Firecracker | microVM + netns + default-deny egress |
-
-The GitHub Action uses Tier 1 (`--local`). Network enforcement relies on the permission lattice, not default-deny iptables. For full containment, use Tier 2 with Firecracker on Linux+KVM.
+---
 
 ## Known Gaps
 
-Documented in detail in [`SECURITY_TODO.md`](SECURITY_TODO.md). Key items:
+Documented in [`SECURITY_TODO.md`](SECURITY_TODO.md) and [`docs/production-delta.md`](docs/production-delta.md). Key items, stated plainly:
 
-- **Command exfiltration detection is program-name only.** `bash -c 'curl ...'` can bypass uninhabitable state detection at the command lattice level. The Firecracker network policy is the real defense (default-deny egress), but the command-level check has known bypasses.
-- **Path sandboxing is string-based.** Unicode normalization and symlink race conditions are not exhaustively tested. `cap-std` capability handles provide defense-in-depth. Invisible Unicode character injection (Rules File Backdoor) is detected at the tool-proxy gateway layer with configurable policy (warn/strip/deny).
-- **Budget enforcement is partial.** Pre-execution reservation works when timeouts are set. Post-execution cost accounting (output tokens, refunds) is not implemented.
-- **Formal verification covers the lattice algebra, not the full runtime.** The 297 Verus VCs verify portcullis properties. The tool proxy, network enforcement, and Firecracker integration are tested, not verified.
-- **S3 audit sink is fire-and-forget.** Upload failures are logged but don't block the agent. No integration test against real S3 exists. Append-only semantics use `if_none_match("*")` PutObject preconditions — untested against eventual consistency.
-- **Redirect following is reqwest default (10 hops).** The final URL is checked against DNS/URL allowlists after all redirects complete, but intermediate hops are not validated. An allowlisted domain with an open redirect to a non-allowlisted domain will be caught, but the request still reaches the intermediate servers.
-- **`--local` mode has weaker isolation than Firecracker.** The tool-proxy enforces lattice permissions, but there is no VM boundary or default-deny network. Use Tier 2 (Firecracker) for high-security workloads.
+- **The reference agent runner is not vendor-agnostic.** `nucleus run`/`shell` is currently hardcoded to one specific assistant CLI (binary name, default model string, and a permission-bypass flag), and some audit/MCP identifiers are named for that vendor. Only the core library and the generic `credentials.env` / `PodSpec` interface are vendor-agnostic today.
+- **The agent PreToolUse-hook path is not runnable in this repo.** `nucleus run --hook` and `nucleus guard` shell out to a `nucleus-claude-hook` binary that is **not built here** (it moved to the external private orchestrator), and the in-repo install hint (`cargo install --path crates/nucleus-claude-hook`) is stale — that crate directory does not exist.
+- **`nucleus-spec` still embeds specific LLM-vendor strings.** `package_registries()` hardcodes `api.anthropic.com`; the default `workload_identity` is `name: "anthropic"` / `audience: "https://api.anthropic.com"`; and doc-comment examples reference `https://api.openai.com` and an `openai-prod` logical name. All of these violate vendor neutrality and need generalizing (e.g. `api.example-llm.invalid` / `LLM_API_HOST` / a generic logical name) before the top-line "vendor-agnostic" claim is fully defensible.
+- **`nucleus-policy` is an orphan crate.** It has a full Cargo.toml but is not a workspace member and is not wired into anything — it must be integrated or documented as a stub.
+- **The constitutional kernel is a library, not yet runtime-wired.** It decides admissibility in isolation; it does not yet gate the live sandbox, and signature enforcement is opt-in.
+- **The public verifier service is not hosted.** It is self-hostable and deploy-ready (`fly.toml`; 26 integration / 70 total tests); no hosted endpoint resolves today. The `@coproduct/verify` npm package and `/verify/` demo are publish-gated.
+- **Tier 2 isolation needs KVM.** A macOS host reaches it through a Lima VM with nested virtualisation (M3+/macOS 15+); a passing `cargo test` on macOS does not imply a live VM boot, which is what `nucleus verify --tier2` is for. CI boots a real pod on **x86_64** only — GitHub has no hosted arm64 runner with `/dev/kvm` — so the aarch64 boot is verified by hand before a release.
+- **`bash -c` bypasses command-level checks.** Firecracker network policy is the real defense.
+- **`verify-receipts` checks the hash chain, not yet the Ed25519 signature.** Tool-proxy-log HMAC verification *is* real; C2PA verification is feature-gated.
+- **Issuance/signing of identities is demo-only.** `LocalIssuer` is `dev`-feature-gated; there is no SPIRE-backed JWT-SVID issuer in this repo.
+- **The research-tier Lean formalizations are not discharged.** 40 open `sorry` proof holes remain across 11 exploratory alignment-tax / cohomology / braid files (each labeled `CONJECTURE`; manifest at `crates/portcullis-core/lean/CONJECTURES.md`); only the security core is `sorry`-free and CI-gated against regression.
+- **Some crate-level READMEs are stale** (`nucleus-lineage` under-claims; a few doc comments lag the code). The code/tests are the source of truth.
+
+---
 
 ## Threat Model
 
-**Protects against:**
-- Prompt injection attempting side effects outside the permission envelope
-- Invisible Unicode injection / Rules File Backdoor attacks (detected at gateway)
-- Misconfigured tool permissions (enforced at runtime, not advisory)
-- Network policy drift inside the runtime (fail-closed)
-- Budget exhaustion attacks (atomic tracking, with caveats above)
-- Privilege escalation via delegation (ceiling theorem + attenuation tokens)
-- Trust domain confusion (Galois connections)
-- Audit log tampering (hash chain verification + execution receipts)
+**Protects against:** prompt-injection side effects, invisible Unicode injection, misconfigured permissions, network policy drift, budget exhaustion, privilege escalation via delegation, audit-log tampering, memory poisoning, substitution/truncation of provenance bundles, and silent policy widening (constitutional kernel).
 
-**Does not protect against:**
-- Compromised host or kernel (enforcement stack is trusted)
-- Malicious human approvals (social engineering)
-- Side-channel attacks
-- Kernel escapes from the microVM
-- `bash -c` indirection at the command parsing level (network policy is the backstop)
+**Does not protect against:** compromised host/kernel, malicious human approvals, side-channel attacks, VM kernel escapes — nor does a green provenance verification imply the agent *behaved well* or that any computation was *correct*.
+
+**Unmediated by default:** bytes an agent obtains by running a command (`curl` inside `run`) are not observed as an ingest unless `NUCLEUS_PARANOID_TOOL_IO=1`, so they do not taint the session and the information-flow guarantee above does not cover them. Setting that variable closes the channel on both the HTTP and MCP transports at the cost of a session becoming "one privileged action then locked".
+
+> **Versioning:** v1.0 means the **interface contract is stable** (see [`STABILITY.md`](STABILITY.md)), not "production-secure by default." The lattice is heavily verified; the runtime is tested but not yet battle-hardened.
+
+---
 
 ## Development
 
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo run -p exposure-playground  # Interactive lattice explorer
+make demo              # taint → block → receipt → compartment switch
 ```
 
-Requires Rust stable. Firecracker features require Linux with KVM. macOS development works for everything except VM isolation.
+---
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+Licensed under either of **Apache License, Version 2.0** or the **MIT license** at your option.
+
+---
 
 ## References
 
 - [The Uninhabitable State](https://simonwillison.net/2025/Jun/16/the-uninhabitable-state/) — Simon Willison
-- [Container Hardening Against Agentic AI](https://securitytheatre.substack.com/p/container-hardening-against-agentic)
 - [Lattice-based Access Control](https://en.wikipedia.org/wiki/Lattice-based_access_control) — Denning 1976, Sandhu 1993
-- [Verus: Verified Rust for Systems Code](https://verus-lang.github.io/verus/) — SOSP 2025 Best Paper
-- [AWS Cedar Formal Verification](https://www.amazon.science/blog/how-we-built-cedar-with-automated-reasoning-and-differential-testing)
-- [cap-std](https://github.com/bytecodealliance/cap-std) — Capability-based filesystem
+- [SPIFFE — Secure Production Identity Framework for Everyone](https://spiffe.io/)
+- [RFC 8693 — OAuth 2.0 Token Exchange](https://www.rfc-editor.org/rfc/rfc8693)
+- [RFC 9162 — Certificate Transparency Version 2.0](https://www.rfc-editor.org/rfc/rfc9162)
+- [C2SP — Community Cryptography Specification Project](https://github.com/C2SP/C2SP) (`tlog-witness`)
+- [Aeneas — A Verification Toolchain for Rust](https://github.com/AeneasVerif/aeneas)
+- [verify-rust-std](https://github.com/model-checking/verify-rust-std) — AWS's verification density benchmark

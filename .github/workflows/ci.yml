@@ -4,46 +4,449 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
 
 jobs:
+  changed-crates:
+    name: Detect changed crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      all: ${{ steps.detect.outputs.all }}
+      crates: ${{ steps.detect.outputs.crates }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Determine changed crates
+        id: detect
+        # Pass event/base data via env (never interpolate ${{ }} directly into
+        # the run script — zizmor template-injection / code-injection
+        # hardening, matching ck-admit.yml).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          all=false
+          changed=""
+
+          if [ "$EVENT_NAME" = "merge_group" ] || [ "$EVENT_NAME" = "push" ]; then
+            all=true
+          else
+            git fetch origin "$BASE" || true
+            changed="$(git diff --name-only "origin/$BASE...HEAD")"
+            if printf '%s\n' "$changed" | grep -qE '^Cargo\.toml$|^Cargo\.lock$|^\.github/'; then
+              all=true
+            fi
+          fi
+
+          crates=""
+          if [ -n "$changed" ]; then
+            crates="$(printf '%s\n' "$changed" | grep -oE '^crates/[^/]+' | sed 's#^crates/##' | sort -u | paste -sd' ' - || true)"
+          fi
+
+          echo "all=$all" >> "$GITHUB_OUTPUT"
+          echo "crates=$crates" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Changed-crate detection"
+            echo ""
+            echo "- Event: \`$EVENT_NAME\`"
+            echo "- Full run forced: \`$all\`"
+            if [ -n "$crates" ]; then
+              echo "- Changed crates: \`$crates\`"
+            else
+              echo "- Changed crates: (none)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: rustfmt
           cache: true
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+  verify-strict:
+    name: Ed25519 verify_strict gate (M-3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Forbid non-strict dalek .verify(...) on trust paths
+        run: scripts/check-verify-strict.sh
+
+  sandbox-trusted-base-gate:
+    name: Sandbox trusted-base gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Every pin names a real test; the unpinned set may only shrink
+        run: scripts/check-sandbox-trusted-base.sh
+
+  failclosed-verifier-gate:
+    name: Fail-closed verifier gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Forbid a verifier that reports success where it cannot check
+        run: scripts/check-failclosed-verifiers.sh
+
+  mediation-gate:
+    name: Mediation backstop gate (North Star)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Forbid raw agent-path effect primitives outside the discharge-gated API
+        run: scripts/check-mediation.sh
+
+  # `discharge::test_helpers::bundle_for` mints a DischargedBundle with no
+  # preflight. It is gated behind a `test-helpers` feature that only
+  # [dev-dependencies] enable — and Cargo unifies features per build, so one line
+  # moving to [dependencies] makes the proof mintable from production code with
+  # every test still green, because tests already have the feature on.
+  #
+  # This needs cargo (it reads the resolved no-dev feature graph rather than
+  # grepping manifests, which would miss transitive enabling), so it gets a
+  # toolchain rather than riding along with the grep-only gates above.
+  test-helpers-seal:
+    name: test-helpers is not reachable from a shipping build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: true
+      - name: The discharge seal is not reachable from any shipping build
+        shell: bash
+        run: scripts/check-test-helpers-not-in-production.sh
+
+  # A `lean_lib` that no workflow builds is a theorem statement nothing
+  # elaborates — it can be false, ill-typed, or carry a `sorry`, and
+  # `#print axioms` cannot report it because the constant never comes into
+  # existence. #2162 fixed the two such libraries that had been noticed; this
+  # asks for the whole set instead of a list someone maintains by hand.
+  #
+  # Pure grep over lakefiles and workflows, so no toolchain and no Lean build.
+  lean-lib-coverage:
+    name: Every lean_lib is type-checked by something
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: No lean_lib is built by nothing
+        shell: bash
+        run: scripts/check-lean-libs-built.sh
+
+  # The declassification token path is now LIVE (POST /v1/declassify). Two gates
+  # replace the former dormancy gate:
+  #
+  #  1. sink-scope ENFORCED — a token clears its node for the sinks it signed and
+  #     ONLY those, at most once (the property the dormancy gate deferred).
+  #  2. governor keys SEALED — set_trusted_keys is unreachable from any request
+  #     handler, so the workload cannot enroll its own key (robust declassification
+  #     at the *who* dimension).
+  declassify-sink-scope-enforced:
+    name: Declassify sink scope is enforced
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: true
+      - name: A token clears its node for its signed sinks and only those
+        shell: bash
+        run: scripts/check-declassify-sink-scope-enforced.sh
+
+  # C4 ("a governor deliberately released with a single-use token") and C5
+  # ("cannot steer which value that is") are PROVED only if the value-binding,
+  # single-use, and Deny->Pass flip all hold on the graph egress reads, and the
+  # #2235 re-home (endpoint applies on state.flow_graph, not the orphan kernel
+  # graph) is not silently reverted. This gate runs the value-binding + four-run
+  # + flip-back + one-shot tests and asserts the endpoint wiring by inspection.
+  declassify-value-bound:
+    name: Declassification is value-bound, single-use, and live
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: true
+      - name: A token releases only the committed value, once, on the live graph
+        shell: bash
+        run: scripts/check-declassify-value-bound.sh
+
+  declassify-governor-keys-sealed:
+    name: Governor trusted-key set is not workload-writable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: set_trusted_keys has no caller outside kernel construction
+        shell: bash
+        run: scripts/check-declassify-governor-keys-sealed.sh
+
+  # C1 ("cannot learn the secrets Nucleus holds on its behalf") is proven over
+  # the seven inbound channels in Lean, but the RUNTIME must withhold for that to
+  # hold on the live path. This gate runs the conformance the re-promotion rests
+  # on: the workload always runs as a distinct unprivileged uid (never the
+  # runtime's — /proc/<pid>/environ fence B), any unclassified NUCLEUS_* key is
+  # refused at admission (fail-closed classifier fence D), and no per-pod secret
+  # rides the guest cmdline. Reverting fence B or D reds this.
+  c1-inbound-fences-enforced:
+    name: C1 inbound fences are enforced
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: true
+      - name: uid distinctness, reserved-namespace, and cmdline fences hold
+        shell: bash
+        run: scripts/check-c1-inbound-fences.sh
+
+  # The North Star doc's status table is the project's public claim of what is
+  # PROVED, TESTED, and NOT-YET. It drifted once: a row claimed "tested on the
+  # live path" for the declassification token while the dormancy gate above —
+  # in this same file — asserted that path has no production caller. This gate
+  # makes the table a ledger: every row covers a verbatim clause of the
+  # sentence, resolves an evidence handle, names its falsifier, and may not
+  # contradict any in-tree dormancy declaration. Row and NOT-YET counts are
+  # pinned, so deletions and demotions are visible events.
+  north-star-ledger:
+    name: The North Star status table cannot outrun its wiring
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Every status row is earned, evidenced, and uncontradicted
+        shell: bash
+        run: scripts/check-north-star-ledger.sh
+
+  # C8 — the Aeneas-extracted predicates carry the flagship theorems; this
+  # asserts each manifest-covered predicate still has a LIVE production call site
+  # (production region, test blocks excluded), so a theorem cannot silently
+  # become a proof about dead code. Runs on every PR (no path filter), so it
+  # covers the live-path crates (nucleus-tool-proxy spawn path, portcullis
+  # kernel) that the scoped Aeneas proof job's trigger does not.
+  extracted-callsites:
+    name: Extracted predicates have live call sites (C8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Every extracted predicate's enforcement is still wired
+        shell: bash
+        run: scripts/check-extracted-callsites.sh
+
+  # C2 — the node records pod lineage on the LIVE path. Boots the real
+  # nucleus-node with the KVM-free local-driver (so no Firecracker/KVM is needed),
+  # creates two sibling pods and a child through the real signed POST /v1/pods,
+  # and asserts the listing serves the recorded parent_pod_id — the input the
+  # cross-pod scoping filter reads. The scoped filter itself is function-tested
+  # (pod_api ownership tests); this covers the lineage it depends on, end to end.
+  cross-pod-lineage:
+    name: The node records pod lineage on the live path (C2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: true
+      - name: Build node (local-driver) + cli + tool-proxy
+        run: cargo build -p nucleus-node --features local-driver -p nucleus-cli -p nucleus-tool-proxy
+      - name: The create API records lineage the listing serves
+        run: |
+          NUCLEUS_NODE_BIN=target/debug/nucleus-node \
+          NUCLEUS_CLI_BIN=target/debug/nucleus \
+          NUCLEUS_TOOL_PROXY_BIN=target/debug/nucleus-tool-proxy \
+            scripts/cross-pod-lineage-check.sh
+      - name: A pod's own scoped listing excludes a non-lineage sibling (C2)
+        run: |
+          NUCLEUS_NODE_BIN=target/debug/nucleus-node \
+          NUCLEUS_CLI_BIN=target/debug/nucleus \
+          NUCLEUS_TOOL_PROXY_BIN=target/debug/nucleus-tool-proxy \
+            scripts/cross-pod-scoped-check.sh
+
+  # Every gate above is a claim that something is checked. This checks the claim.
+  #
+  # It needs full history and a clean tree because it PERTURBS real files and
+  # restores them, so it runs as its own job rather than sharing a checkout with
+  # a job that might have written into the tree.
+  gates-can-fail:
+    name: Gates must fail on their own subject
+    runs-on: ubuntu-24.04
+    # 30 min (was 10): check-declassify-sink-scope-enforced.sh runs cargo tests,
+    # and the meta-gate runs each probed gate twice (perturbed + restored), so
+    # this job now compiles portcullis. The Rust cache below amortizes it.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: true
+      - name: Every gate REDs on a real violation and GREENs when restored
+        shell: bash
+        run: scripts/check-gates-can-fail.sh
+
+  ingest-hash-gate:
+    name: No-unwitnessed-ingest gate (InputsAuthorized)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Forbid non-hashing agent-path ingest observes (content-address every input)
+        run: scripts/check-ingest-hashed.sh
+
+  sealed-home-gate:
+    name: Sealed-home integrity gate (North Star)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Forbid raw effect primitives outside the sealed RealEffects home
+        run: scripts/check-sealed-home.sh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
           cache: true
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build wasm SDK (vendored into verifier-service via include_bytes!)
+        run: wasm-pack build sdks/verifier-js --target web --release
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Doctests, split out of `test` because they were 82% of its wall clock.
+  #
+  # WHY THIS JOB IS REQUIRED, NOT OPTIONAL
+  #
+  # Splitting a slow check into its own job is one edit away from dropping it:
+  # make it `continue-on-error`, or forget to add it to the required set, and the
+  # documented examples stop being verified while the board stays green. This
+  # repo has already produced that exact shape — two Lean proofs that appeared in
+  # a workflow's `paths:` triggers and were compiled by no job at all (#2162).
+  #
+  # Doctests are the ONLY thing checking that the examples in this codebase's
+  # documentation still compile, and the documentation is where most of its
+  # reasoning lives. They must fail the build.
+  doctests:
+    name: Doctests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: changed-crates
+    if: ${{ needs.changed-crates.outputs.all == 'true' || needs.changed-crates.outputs.crates != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          targets: wasm32-unknown-unknown
+          cache: true
+      # PREREQUISITE, not boilerplate. `nucleus-verifier-service` vendors the
+      # wasm SDK with `include_str!`/`include_bytes!` on sdks/verifier-js/pkg/*,
+      # which only `wasm-pack build` produces. Without these two steps the whole
+      # workspace fails to compile and the doctest job REDs for a reason that has
+      # nothing to do with doctests.
+      #
+      # CI found this: splitting a job means carrying its PREREQUISITES, not just
+      # its command, and I moved the command alone.
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build wasm SDK (vendored into verifier-service via include_bytes!)
+        run: wasm-pack build sdks/verifier-js --target web --release
+      - name: cargo test --doc
+        run: cargo test --all-features --doc
 
   test:
     name: Tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: changed-crates
+    if: ${{ needs.changed-crates.outputs.all == 'true' || needs.changed-crates.outputs.crates != '' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
+          targets: wasm32-unknown-unknown
           cache: true
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build wasm SDK (vendored into verifier-service via include_bytes!)
+        run: wasm-pack build sdks/verifier-js --target web --release
+      # `--lib --bins --tests` EXCLUDES doctests, which run in the `doctests` job
+      # below. Measured on this workspace, warm cache:
+      #
+      #   --lib --bins --tests   152s
+      #   --doc                  702s   <- 82% of the time
+      #
+      # Every doctest is a separate rustc invocation linking the whole crate
+      # against 927 resolved packages, so ~113 doc code blocks cost ~8s each.
+      # That is not pathological, it is what doctests cost at this size — but it
+      # is not per-iteration work, and it was being paid on every run.
+      #
+      # SPLIT, NOT DROPPED. The doctests job below is required; see its comment
+      # for why that distinction is load-bearing.
+      - name: cargo test (lib, bins, tests — doctests run separately)
+        run: cargo test --all-features --lib --bins --tests
+      # Node tests run the WASM bindings against the cross-language golden seal
+      # (settlement + commons) and the accept/reject smoke fixtures — per-PR, not
+      # just on publish, so a binding-layer drift from the proven kernels is caught
+      # here. Node is preinstalled on the ubuntu runner.
+      - name: Node tests (golden seal + smoke) against built wasm
+        working-directory: sdks/verifier-js
+        run: npm test
+
+  a2a-example:
+    name: A2A example server (examples/a2a-server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # examples/a2a-server is its own workspace (root Cargo.toml `exclude`), so
+    # the root-level fmt/clippy/test jobs never touch it. This job is NOT
+    # path-filtered on purpose: the example path-depends on
+    # crates/nucleus-{agent-card,verify-commerce,envelope,lineage}, so a change
+    # anywhere in those crates can break the example's receipt pre-image and
+    # version-negotiation invariants without touching examples/**.
+    defaults:
+      run:
+        working-directory: examples/a2a-server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          components: rustfmt, clippy
+          cache: true
+          cache-workspaces: examples/a2a-server
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: cargo test
         run: cargo test --all-features
 
@@ -51,29 +454,89 @@ jobs:
     name: OWASP LLM Security Gauntlet
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: changed-crates
+    if: ${{ needs.changed-crates.outputs.all == 'true' || needs.changed-crates.outputs.crates != '' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           cache: true
       - name: Run OWASP LLM Top 10 security tests
         run: cargo test -p portcullis --test owasp_llm_gauntlet --all-features
 
+  policy-kernel-parity:
+    name: Policy-kernel model↔Rust parity (K4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The model↔Rust contract, as a FIRST-CLASS named check. The K4 proof
+    # `governance_monotone_iff` (proven axiom-clean in the Portcullis-Core Proven
+    # Lean workflow) is a statement ABOUT the Lean model; it only transfers to the
+    # shipped Rust `decide`/`governance_monotone`/`representative_requests` via the
+    # `nucleus-policy-kernel` `tests/model_parity.rs` proptest, which pins the two
+    # semantics declaration-for-declaration. That parity pin already runs
+    # transitively under the whole-workspace `cargo test --all-features` above, but
+    # this dedicated job selects the crate EXPLICITLY (`-p nucleus-policy-kernel`)
+    # so the contract is a required-able status check that cannot be silently
+    # dropped if the umbrella `test` job is ever path-filtered or refactored —
+    # closing the enforcement loop the Lean-side gate already documents.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: true
+      - name: cargo test -p nucleus-policy-kernel (parity pin)
+        run: cargo test -p nucleus-policy-kernel
+
+  musl-check:
+    name: musl type-check (nucleus-node, nucleus-tool-proxy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The release pipeline builds static musl binaries, but every other job here
+    # compiles against glibc — so glibc-only code (v2.0.1: __rlimit_resource_t in
+    # hardening.rs) sails through PR CI and only explodes at release time. This
+    # job type-checks the two shipped binaries against the musl target on every
+    # PR to close that gap. musl-tools provides musl-gcc, which C-dependency
+    # build scripts (e.g. ring) need to cross-compile.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          targets: x86_64-unknown-linux-musl
+          cache: true
+      - name: Install musl-gcc
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Ensure musl target (cache-safe)
+        # setup-rust-toolchain's `targets:` is skipped on a toolchain cache hit,
+        # so the target can be absent despite being declared → E0463. This
+        # explicit add always runs and is a no-op when already present.
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: cargo check (musl)
+        run: cargo check -p nucleus-node -p nucleus-tool-proxy --target x86_64-unknown-linux-musl
+
   fuzz:
     name: Fuzz
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: changed-crates
+    if: ${{ needs.changed-crates.outputs.all == 'true' || needs.changed-crates.outputs.crates != '' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: nightly
           cache: true
       - name: install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # Pin version, but DROP --locked so cargo resolves a rustix newer
+        # than the 0.36.5 cargo-fuzz bundles (0.36.5 uses rustc-internal
+        # attributes that current nightly rejects). Every cargo-fuzz from
+        # 0.11.x through 0.13.1 ships the same broken rustix pin in its
+        # Cargo.lock, so bumping version alone is insufficient — we have
+        # to let cargo do fresh resolution.
+        run: cargo install cargo-fuzz --version 0.13.1
       - name: run fuzz targets
         run: |
           cd fuzz
           cargo fuzz run command_can_execute -- -max_total_time=30
           cargo fuzz run path_can_access -- -max_total_time=30
           cargo fuzz run permission_serde -- -max_total_time=30
+          cargo fuzz run workload_api_command -- -max_total_time=30

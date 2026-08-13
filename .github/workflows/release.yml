@@ -25,10 +25,12 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No cache restore here: this job publishes release binaries, so it must
+      # build from scratch to avoid cache-poisoning of trust-bearing artifacts.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache: true
+          cache: false
       - name: Add cross-compilation target
         if: matrix.target == 'x86_64-apple-darwin'
         run: rustup target add x86_64-apple-darwin
@@ -46,7 +48,7 @@ jobs:
           tar -C "$RELEASE_DIR" -czf "dist/nucleus-mcp-${VERSION}-${{ matrix.target }}.tar.gz" nucleus-mcp
           tar -C "$RELEASE_DIR" -czf "dist/nucleus-audit-${VERSION}-${{ matrix.target }}.tar.gz" nucleus-audit
       - name: Upload artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nucleus-node-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -64,10 +66,12 @@ jobs:
           - arch: x86_64
             target: x86_64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No cache restore here: this job publishes release binaries/rootfs, so it
+      # must build from scratch to avoid cache-poisoning of trust-bearing artifacts.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache: true
+          cache: false
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross
       - name: Build nucleus-node (musl)
@@ -77,7 +81,7 @@ jobs:
           cross build -p nucleus-guest-init --release --target ${{ matrix.target }}
           cross build -p nucleus-tool-proxy --release --features remote-audit --target ${{ matrix.target }}
           cross build -p nucleus-net-probe --release --target ${{ matrix.target }}
-      - name: Build CLI + MCP + Audit (musl)
+      - name: Build CLI + MCP + Audit + Hook (musl)
         run: |
           cross build -p nucleus-cli --release --target ${{ matrix.target }}
           cross build -p nucleus-mcp --release --target ${{ matrix.target }}
@@ -94,12 +98,12 @@ jobs:
           tar -C target/${{ matrix.target }}/release -czf "dist/nucleus-audit-${VERSION}-${{ matrix.target }}.tar.gz" nucleus-audit
           tar -C target/${{ matrix.target }}/release -czf "dist/nucleus-tool-proxy-${VERSION}-${{ matrix.target }}.tar.gz" nucleus-tool-proxy
       - name: Upload packaged artifacts
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nucleus-binaries-${{ matrix.target }}
           path: dist/*.tar.gz
       - name: Upload guest binaries for rootfs build
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: guest-binaries-${{ matrix.arch }}
           path: |
@@ -123,9 +127,9 @@ jobs:
             target: x86_64-unknown-linux-musl
             debian_image: debian:bookworm-slim
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download guest binaries
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: guest-binaries-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release
@@ -136,7 +140,7 @@ jobs:
           chmod +x target/${{ matrix.target }}/release/nucleus-net-probe
       - name: Set up QEMU
         if: matrix.arch == 'aarch64'
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         with:
           platforms: arm64
       - name: Build rootfs
@@ -151,7 +155,7 @@ jobs:
           mkdir -p dist
           gzip -9 -c build/firecracker/${{ matrix.arch }}/rootfs.ext4 > "dist/nucleus-rootfs-${VERSION}-${{ matrix.arch }}.ext4.gz"
       - name: Upload rootfs artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: rootfs-${{ matrix.arch }}
           path: dist/*.ext4.gz
@@ -161,7 +165,7 @@ jobs:
     name: Upload Lima Templates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Package Lima templates
         run: |
           TAG="${GITHUB_REF_NAME}"
@@ -171,7 +175,7 @@ jobs:
           cp scripts/lima/nucleus-aarch64.yaml "dist/nucleus-lima-${VERSION}-aarch64.yaml"
           cp scripts/lima/nucleus-x86_64.yaml "dist/nucleus-lima-${VERSION}-x86_64.yaml"
       - name: Upload Lima templates
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: lima-templates
           path: dist/*.yaml
@@ -186,7 +190,8 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
       - name: Collect assets
@@ -195,16 +200,31 @@ jobs:
           find dist -type f \( -name "*.tar.gz" -o -name "*.ext4.gz" -o -name "*.yaml" \) -exec mv {} release/ \;
           ls -lah release
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: release/*
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v2
         with:
           files: release/*
-      - name: Update floating v1 tag
+          # A tag containing `-` is a prerelease (`v2.1.0-rc.1`). Marking it
+          # matters beyond cosmetics: GitHub's `/releases/latest` EXCLUDES
+          # prereleases, and `scripts/install.sh` resolves the version from
+          # exactly that endpoint — so without this an RC becomes the default
+          # download for every one-line installer user.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+      # Move the floating major tag (`v2`) only for a real release.
+      #
+      # This repo's root `action.yml` is a composite Action, so anyone pinning
+      # `coproduct-opensource/nucleus@v2` follows this tag. Pointing it at a
+      # release CANDIDATE would ship unfinished code to those consumers under a
+      # reference they have every reason to treat as stable. (The step was also
+      # still named "v1" while computing `v2` from the tag.)
+      - name: Update floating major tag
+        if: ${{ !contains(github.ref_name, '-') }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           MAJOR="${GITHUB_REF_NAME%%.*}"
           git tag -fa "${MAJOR}" -m "Release ${MAJOR}"
           git push origin "${MAJOR}" --force
@@ -224,14 +244,21 @@ jobs:
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ steps.publish_gate.outputs.enabled == 'true' }}
-      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      # No cache restore here: this job publishes to crates.io, so it must
+      # build from scratch to avoid cache-poisoning of trust-bearing artifacts.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         if: ${{ steps.publish_gate.outputs.enabled == 'true' }}
         with:
-          cache: true
+          cache: false
+      # Never from a prerelease tag. A crates.io publish cannot be undone (only
+      # yanked), and `nucleus-node` has not had its first publish yet — so an RC
+      # tag would make a release candidate the permanent first version of the
+      # crate. The token gate alone is not enough: it protects against having no
+      # credentials, not against publishing the wrong thing.
       - name: Publish nucleus-node
-        if: ${{ steps.publish_gate.outputs.enabled == 'true' }}
+        if: ${{ steps.publish_gate.outputs.enabled == 'true' && !contains(github.ref_name, '-') }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p nucleus-node --locked
@@ -252,7 +279,7 @@ jobs:
         env:
           HOMEBREW_TAP: ${{ secrets.HOMEBREW_TAP }}
           HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
-      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         if: ${{ steps.brew_gate.outputs.enabled == 'true' }}
         with:
           path: dist
@@ -278,16 +305,18 @@ jobs:
           echo "mac_arm_sha=$(sha256sum release/${MAC_ARM} | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Checkout tap
         if: ${{ steps.brew_gate.outputs.enabled == 'true' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ secrets.HOMEBREW_TAP }}
           token: ${{ secrets.HOMEBREW_TOKEN }}
           path: tap
       - name: Write formula
         if: ${{ steps.brew_gate.outputs.enabled == 'true' }}
+        env:
+          VERSION: ${{ steps.shas.outputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${{ steps.shas.outputs.version }}"
-          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${REF_NAME}"
           FORMULA_PATH="tap/Formula/nucleus-node.rb"
           cat > "${FORMULA_PATH}" <<EOF
           class NucleusNode < Formula

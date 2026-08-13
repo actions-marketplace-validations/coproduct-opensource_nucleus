@@ -45,3 +45,15 @@ LOOPS.md
 .verus/verus-arm64-macos/
 .verus/verus-x86-linux/
 .verus/*.zip
+.claude/worktrees/
+portcullis_core.llbc
+nucleus_ifc_kernel.llbc
+
+# Firecracker rootfs staging + images. `build-rootfs.sh` defaults ROOTFS_DIR
+# here, so a run from the repo root leaves a partial Debian tree in the tree —
+# thousands of files that `git add -A` will happily sweep up. It did.
+/build/
+
+# Scratch build scripts for the Firecracker boot harness (staged into the repo
+# root so a container mount can see them). Not part of the build.
+/.fc*.sh

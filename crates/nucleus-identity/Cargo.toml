@@ -15,6 +15,11 @@ categories = ["cryptography", "network-programming"]
 default = []
 # Enable SPIRE integration for production deployments
 spire = ["dep:spiffe", "dep:futures-util"]
+# Enable the TPM 2.0 DevID residency verifier (pure-Rust verify path; opt-in until
+# wired to issuance). Uses only in-tree crypto (ring + sha2) — no libtss2 in the TCB.
+# The AK↔EK credential-activation binder (Inc 3 brick 2) additionally needs raw
+# AES-128-CFB (the one primitive ring does not expose); pulled in only here.
+tpm-devid = ["dep:aes", "dep:cfb-mode"]
 # Enable HTTP-based did:web resolution (requires network)
 resolver = ["dep:reqwest"]
 
@@ -24,6 +29,10 @@ rcgen = "0.14"
 rustls = { workspace = true }
 x509-parser = { workspace = true }
 ring = "0.17"
+# AES-128-CFB for TPM credential activation (Inc 3 brick 2) — feature-gated behind
+# `tpm-devid`, the one symmetric primitive not available through ring.
+aes = { version = "0.8", optional = true }
+cfb-mode = { version = "0.8", optional = true }
 
 # Async
 tokio = { workspace = true, features = ["sync", "time", "io-util", "net", "rt", "macros", "fs"] }
@@ -38,12 +47,15 @@ serde_json = { workspace = true }
 # Certificate validation
 webpki = { package = "rustls-webpki", version = "0.103" }
 
+# IFC label encoding for X.509 extensions
+portcullis-core = { path = "../portcullis-core" }
+
 # Utils
 chrono = { workspace = true, features = ["serde"] }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
-pem = "3"
+pem = "4"
 time = "0.3"
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -52,7 +64,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-no-provider", "json"], optional = true }
 
 # SPIRE integration (optional)
-spiffe = { version = "0.12", optional = true, features = ["workload-api-x509"] }
+spiffe = { version = "0.16", optional = true, features = ["workload-api-x509"] }
 futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
