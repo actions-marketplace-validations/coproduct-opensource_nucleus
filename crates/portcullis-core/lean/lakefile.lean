@@ -137,6 +137,27 @@ lean_lib «ChannelAdmissionExtracted» where
 lean_lib «ConfidentialityNoninterferenceExtracted» where
   roots := #[`ConfidentialityNoninterferenceExtracted]
 
+-- Authority-axis noninterference over the extracted core (twin of integrity;
+-- builds once aeneas-ifc-scoped extracts the ifc_authority functions). Proves
+-- the AUTHORITY half of the anti-prompt-injection guarantee: web content
+-- (NoAuthority) can never direct a Directive-privileged action.
+lean_lib «AuthorityNoninterferenceExtracted» where
+  roots := #[`AuthorityNoninterferenceExtracted]
+
+-- Derivation-axis noninterference over the extracted core (the determinism-
+-- provenance lattice; builds once aeneas-ifc-scoped extracts the ifc_derivation
+-- functions). Proves AI-derived / opaque data can never reach a sink that
+-- requires Deterministic (reproducible) provenance.
+lean_lib «DerivationNoninterferenceExtracted» where
+  roots := #[`DerivationNoninterferenceExtracted]
+
+-- Provenance-axis noninterference over the extracted core (the source-set
+-- powerset lattice; builds once aeneas-ifc-scoped extracts the ifc_provenance
+-- functions). The FIFTH and final flows_to conjunct: a datum carrying a source
+-- the sink does not accept can never be admitted over any op sequence.
+lean_lib «ProvenanceNoninterferenceExtracted» where
+  roots := #[`ProvenanceNoninterferenceExtracted]
+
 -- Exposure tracker proofs (uninhabitable state detector)
 lean_lib «ExposureProofs» where
   roots := #[`ExposureProofs]

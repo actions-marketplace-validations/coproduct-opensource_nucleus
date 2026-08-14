@@ -155,6 +155,21 @@ fn run() -> Result<(), String> {
             Err(err) => eprintln!("no broker capability over vsock: {err}"),
         }
 
+        // The mediation signing key, fetched with the same before-`exec_proxy`
+        // ordering: the host serves it once, before any workload exists, so the
+        // key that signs this pod's MediationReceipts is out of the workload's
+        // reach. Absent ⇒ no receipts (additive forensics), never a boot failure.
+        // The key VALUE is never logged — only its presence.
+        match identity::fetch_mediation_key(port) {
+            Ok(Some(mk)) => {
+                std::env::set_var("NUCLEUS_MEDIATION_SIGNING_KEY", &mk.signing_key);
+                std::env::set_var("NUCLEUS_MEDIATION_SPIFFE_ID", &mk.spiffe_id);
+                eprintln!("fetched mediation signing key over vsock (receipts enabled)");
+            }
+            Ok(None) => eprintln!("no mediation key provisioned — receipts disabled"),
+            Err(err) => eprintln!("no mediation key over vsock (receipts disabled): {err}"),
+        }
+
         // The S3 audit-sink credentials, fetched with the same before-
         // `exec_proxy` ordering as the broker capability (the host serves them
         // once; arriving before any workload exists is the property). They
@@ -616,7 +631,19 @@ fn is_writable(dir: &str) -> bool {
 }
 
 fn exec_proxy(spec_path: &str) {
-    let err = Command::new(PROXY_BIN).arg("--spec").arg(spec_path).exec();
+    // Article 12 record-keeping ON for the live path (EU AI Act Art. 12): every
+    // mediation verdict is recorded, and — when a mediator key was delivered
+    // (`fetch_mediation_key` above) — signed into a MediationReceipt. The log
+    // lives on the `/run` tmpfs: writable, root-owned before the uid drop (so the
+    // workload cannot tamper), and NOT under the agent workspace (which the
+    // proxy's own path check would refuse). The chain is session-derived when no
+    // audit secret is configured — weaker than an operator secret, but present.
+    let err = Command::new(PROXY_BIN)
+        .arg("--spec")
+        .arg(spec_path)
+        .arg("--art12-log")
+        .arg("/run/nucleus/art12.jsonl")
+        .exec();
     eprintln!("failed to exec {PROXY_BIN}: {err}");
 }
 
