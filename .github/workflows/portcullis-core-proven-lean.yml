@@ -293,6 +293,35 @@ jobs:
           #print axioms GkatKleene.WF_derivAut
           #print axioms GkatKleene.Nested_derivAut
           #print axioms GkatKleene.fig3_not_nested
+          #print axioms GkatKleene.autLang_eq_of_gbisim
+          #print axioms GkatKleene.den_foldr_ite
+          #print axioms GkatKleene.loopAut_solves
+          #print axioms GkatKleene.sem_solves_autLang
+          #print axioms GkatKleene.solves_autLang
+          #print axioms GkatKleene.semSolves_derivAut
+          #print axioms GkatKleene.buildSol_solves
+          #print axioms GkatKleene.acyclic_expressible
+          #print axioms GkatKleene.selfLoop_solves
+          #print axioms GkatKleene.loopExitAut_solves
+          #print axioms GkatKleene.loopExitAut_expressible
+          #print axioms GkatKleene.wnSol_solves
+          #print axioms GkatKleene.wn_expressible
+          #print axioms GkatKleene.AutMutReach.trans
+          #print axioms GkatKleene.AutBelow.trans
+          #print axioms GkatKleene.AutBelow.congr_left
+          #print axioms GkatKleene.reachCount_lt_of_below
+          #print axioms GkatKleene.reachCount_eq_of_mutReach
+          #print axioms GkatKleene.reachCount_step_le
+          #print axioms GkatKleene.reachCount_lt_of_step_not_mutReach
+          #print axioms GkatKleene.autBelow_wf
+          #print axioms GkatKleene.firstMatch_eq_of_mem_det
+          #print axioms GkatKleene.acyclic_flat_expressible
+          #print axioms GkatKleene.flat_selfloop_expressible
+          #print axioms GkatKleene.wnSolE_solves
+          #print axioms GkatKleene.loopChain_solves
+          #print axioms GkatKleene.loop2Aut_semsolves
+          #print axioms GkatKleene.loop2Aut_expressible
+          #print axioms GkatKleene.loopAut_expressible
           #print axioms IntegrityNoninterferenceExtracted.web_tainted_never_git_pushes
           #print axioms CapabilityResiduatedQuantaleProofs.residuation_adjunction
           #print axioms Nucleus.Assurance.suite_not_full
