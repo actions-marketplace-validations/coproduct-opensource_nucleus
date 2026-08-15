@@ -232,6 +232,42 @@ lean_lib «SessionCeilingProofs» where
 lean_lib «GkatSyntaxProofs» where
   roots := #[`GkatSyntaxProofs]
 
+lean_lib «GkatGuardedStringProofs» where
+  roots := #[`GkatGuardedStringProofs]
+
+lean_lib «GkatInexpressibleProofs» where
+  roots := #[`GkatInexpressibleProofs]
+
+lean_lib «GkatUniquenessFrontierProofs» where
+  roots := #[`GkatUniquenessFrontierProofs]
+
+lean_lib «GkatExistenceFrontierProofs» where
+  roots := #[`GkatExistenceFrontierProofs]
+
+lean_lib «GkatDerivativeProofs» where
+  roots := #[`GkatDerivativeProofs]
+
+lean_lib «GkatBisimulationProofs» where
+  roots := #[`GkatBisimulationProofs]
+
+lean_lib «GkatCompletenessProofs» where
+  roots := #[`GkatCompletenessProofs]
+
+lean_lib «GkatDerivativeFiniteProofs» where
+  roots := #[`GkatDerivativeFiniteProofs]
+
+lean_lib «GkatDecisionProofs» where
+  roots := #[`GkatDecisionProofs]
+
+lean_lib «GkatBehaviorProofs» where
+  roots := #[`GkatBehaviorProofs]
+
+lean_lib «GkatInexpressibilityProofs» where
+  roots := #[`GkatInexpressibilityProofs]
+
+lean_lib «GkatFaithfulnessProofs» where
+  roots := #[`GkatFaithfulnessProofs]
+
 -- Snapshot clone-safety: the cmdline key classification is disjoint, the
 -- snapshot_safety guard is sound+complete, and unsafety is fail-closed (monotone).
 -- Lifts the Rust test-gates #2300/#2301; bound to production by the snapshot.rs
