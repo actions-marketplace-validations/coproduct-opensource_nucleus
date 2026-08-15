@@ -106,6 +106,7 @@ jobs:
             ExposureLoopFixpointProofs \
             GkatGuardedLoopBridge \
             GkatWhileStep \
+            GkatOrderedProofs \
             SnapshotCloneSafetyProofs \
             DerivationCascadeAdmissible \
             ReceiptChainProofs \
