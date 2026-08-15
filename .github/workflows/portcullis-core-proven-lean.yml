@@ -97,6 +97,7 @@ jobs:
             GkatDecisionProofs \
             GkatBehaviorProofs \
             GkatInexpressibilityProofs \
+            GkatCoequationProofs \
             GkatFaithfulnessProofs \
             ExposureLoopFixpointProofs \
             GkatGuardedLoopBridge \
@@ -236,6 +237,7 @@ jobs:
           import GkatDecisionProofs
           import GkatBehaviorProofs
           import GkatInexpressibilityProofs
+          import GkatCoequationProofs
           import GkatFaithfulnessProofs
           import SnapshotCloneSafetyProofs
           import DerivationCascadeAdmissible
@@ -268,6 +270,19 @@ jobs:
           #print axioms GkatDeriv.selfCyclic_loopActive
           #print axioms GkatDeriv.cycle_common_bound
           #print axioms GkatDeriv.no_mutreach_complementary
+          #print axioms GkatDeriv.list_pigeonhole
+          #print axioms GkatDeriv.fig3_inexpressible
+          #print axioms GkatCoequation.W_den_test
+          #print axioms GkatCoequation.W_den_act
+          #print axioms GkatCoequation.W_den_seq
+          #print axioms GkatCoequation.W_derivs_seq
+          #print axioms GkatCoequation.W_derivs_ite
+          #print axioms GkatCoequation.W_derivs_wh
+          #print axioms GkatCoequation.den_mem_W
+          #print axioms GkatCoequation.W_not_subset_den
+          #print axioms GkatCoequation.localDet_den
+          #print axioms GkatCoequation.deterministic_den
+          #print axioms GkatCoequation.halt_not_bexp_not_den
           #print axioms GkatFaithful.left_distrib_not_ba_theorem
           #print axioms GkatFaithful.two_state_uniqueness_nonvacuous
           #print axioms GkatFaithful.loop_is_union_of_iterations
