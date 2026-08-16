@@ -36,10 +36,10 @@ mod grpc_tls;
 mod identity;
 mod lockdown;
 mod mediation;
+mod mediation_receipt_collector;
 mod oidc;
 mod pod_api;
 mod pod_caller_identity;
-
 mod workload_api_protocol;
 mod workload_api_vsock;
 use auth::{AuthConfig, AuthError};
@@ -611,8 +611,7 @@ async fn main() -> Result<(), ApiError> {
     }
     if args.proxy_approval_secret.trim().is_empty() {
         return Err(ApiError::Driver(
-            "proxy approval secret is required (set NUCLEUS_NODE_PROXY_APPROVAL_SECRET)"
-                .to_string(),
+            "proxy approval secret required (set NUCLEUS_NODE_PROXY_APPROVAL_SECRET)".to_string(),
         ));
     }
 
@@ -620,7 +619,8 @@ async fn main() -> Result<(), ApiError> {
     let identity_manager = if let Some(ref socket_path) = args.identity_workload_api_socket {
         let cert_ttl = Duration::from_secs(args.identity_cert_ttl_secs);
         let manager = identity::IdentityManager::new(&args.identity_trust_domain, cert_ttl)
-            .map_err(|e| ApiError::Driver(format!("failed to create identity manager: {e}")))?;
+            .map_err(|e| ApiError::Driver(format!("failed to create identity manager: {e}")))?
+            .with_mediation_binding_dir(args.state_dir.join("pods"));
 
         // Retired: it served an arbitrary pod's SVID to any local connector.
         // Rationale and the gate live in `identity.rs::retired_surface_tests`.
@@ -2770,9 +2770,7 @@ async fn spawn_firecracker_pod(
                     // Served WITH the capability, not separately — the proxy
                     // needs both to reach the broker and neither is useful alone.
                     broker_port: state.broker_vsock_port,
-                    broker_secret_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                        false,
-                    )),
+                    broker_secret_served: std::sync::Arc::default(),
                     // The S3 audit-sink credentials, served once over this
                     // socket instead of riding the world-readable kernel
                     // command line (the C1 exposure).
@@ -2782,9 +2780,11 @@ async fn spawn_firecracker_pod(
                     audit_creds_served: std::sync::Arc::default(),
                     // A per-pod ed25519 seed the guest proxy signs receipts with,
                     // served ONCE before the workload exists. See `mediation`.
-                    mediation_signing_key: mediation::new_seed_hex(),
+                    mediation_signing_key: mediation::new_seed_hex(pod_dir),
                     mediation_spiffe_id: Some(mediation::spiffe_id(manager.trust_domain(), id)),
                     mediation_key_served: std::sync::Arc::default(),
+                    // Where the host durably collects SHIP_RECEIPT receipts.
+                    receipt_dir: Some(pod_dir.to_path_buf()),
                     pod_registry: state.pods.clone(),
                 },
                 // Only when jailed: unjailed Firecracker runs as this same user

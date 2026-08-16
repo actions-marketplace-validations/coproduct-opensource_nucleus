@@ -85,6 +85,32 @@ jobs:
             DelegationProofs \
             DerivationProofs \
             SessionCeilingProofs \
+            GkatSyntaxProofs \
+            GkatGuardedStringProofs \
+            GkatInexpressibleProofs \
+            GkatUniquenessFrontierProofs \
+            GkatExistenceFrontierProofs \
+            GkatUAIndependenceProofs \
+            GkatObservationProofs \
+            GkatPullbackWitnessProofs \
+            GkatDerivativeProofs \
+            GkatWellNestedProofs \
+            GkatBisimulationProofs \
+            GkatCompletenessProofs \
+            GkatDerivativeFiniteProofs \
+            GkatDecisionProofs \
+            GkatBehaviorProofs \
+            GkatInexpressibilityProofs \
+            GkatCoequationProofs \
+            GkatFaithfulnessProofs \
+            GkatKleeneProofs \
+            GkatChainEliminationProofs \
+            ExposureLoopFixpointProofs \
+            GkatGuardedLoopBridge \
+            GkatWhileStep \
+            GkatOrderedProofs \
+            SnapshotCloneSafetyProofs \
+            DerivationCascadeAdmissible \
             ReceiptChainProofs \
             IFCSemilatticeProofs \
             DelegationCategoryProofs \
@@ -104,6 +130,7 @@ jobs:
             IdentityMaterialNoninterferenceExtracted \
             PortcullisCoreChannel \
             ChannelAdmissionExtracted \
+            SnapshotChannelBindingProofs \
             AssuranceCoverage \
             UniversalDetection \
             PodMachineSpike \
@@ -202,11 +229,117 @@ jobs:
           import CapabilityResiduatedQuantaleProofs
           import AssuranceCoverage
           import UniversalDetection
+          import ExposureLoopFixpointProofs
+          import GkatGuardedLoopBridge
+          import GkatWhileStep
+          import GkatSyntaxProofs
+          import GkatGuardedStringProofs
+          import GkatInexpressibleProofs
+          import GkatUniquenessFrontierProofs
+          import GkatExistenceFrontierProofs
+          import GkatDerivativeProofs
+          import GkatBisimulationProofs
+          import GkatCompletenessProofs
+          import GkatDerivativeFiniteProofs
+          import GkatDecisionProofs
+          import GkatBehaviorProofs
+          import GkatInexpressibilityProofs
+          import GkatCoequationProofs
+          import GkatFaithfulnessProofs
+          import GkatKleeneProofs
+          import SnapshotCloneSafetyProofs
+          import DerivationCascadeAdmissible
+          import SnapshotChannelBindingProofs
           #print axioms FlowProofs.authority_confinement_left
+          #print axioms GkatSyntax.salomaa_solutions_agree
+          #print axioms GkatGS.sound
+          #print axioms GkatGS.left_distrib_fails
+          #print axioms GkatGS.left_distrib_not_gkat_theorem
+          #print axioms GkatInexpr.InLoop_exits_on_not_b
+          #print axioms GkatInexpr.single_b_loop_strictly_weaker
+          #print axioms GkatUniqFrontier.two_state_semantic_uniqueness
+          #print axioms GkatUniqFrontier.productivity_is_necessary
+          #print axioms GkatExistFrontier.two_state_existence_pure_return
+          #print axioms GkatDeriv.den_cons
+          #print axioms GkatDeriv.decDen
+          #print axioms GkatBisim.bisim_sound
+          #print axioms GkatComplete.bisim_upto_iff
+          #print axioms GkatDeriv.derivs_closed
+          #print axioms GkatDeriv.den_run
+          #print axioms GkatDeriv.nonempty_iff_run_halts
+          #print axioms GkatBehavior.langDeriv_den
+          #print axioms GkatDeriv.loop_deriv_halts_on_not_b
+          #print axioms GkatDeriv.loop_no_complementary
+          #print axioms GkatDeriv.complementary_accBounded_false
+          #print axioms GkatDeriv.Reaches.trans
+          #print axioms GkatDeriv.loopActive_step
+          #print axioms GkatDeriv.reaches_mem_derivs
+          #print axioms GkatDeriv.no_selfcycle_act
+          #print axioms GkatDeriv.selfCyclic_loopActive
+          #print axioms GkatDeriv.cycle_common_bound
+          #print axioms GkatDeriv.no_mutreach_complementary
+          #print axioms GkatDeriv.list_pigeonhole
+          #print axioms GkatDeriv.fig3_inexpressible
+          #print axioms GkatCoequation.W_den_test
+          #print axioms GkatCoequation.W_den_act
+          #print axioms GkatCoequation.W_den_seq
+          #print axioms GkatCoequation.W_derivs_seq
+          #print axioms GkatCoequation.W_derivs_ite
+          #print axioms GkatCoequation.W_derivs_wh
+          #print axioms GkatCoequation.den_mem_W
+          #print axioms GkatCoequation.W_not_subset_den
+          #print axioms GkatCoequation.localDet_den
+          #print axioms GkatCoequation.deterministic_den
+          #print axioms GkatCoequation.halt_not_bexp_not_den
+          #print axioms GkatFaithful.left_distrib_not_ba_theorem
+          #print axioms GkatFaithful.two_state_uniqueness_nonvacuous
+          #print axioms GkatFaithful.loop_is_union_of_iterations
+          #print axioms GkatKleene.firstMatch_transG
+          #print axioms GkatKleene.autLang_derivAut
+          #print axioms GkatKleene.WF_derivAut
+          #print axioms GkatKleene.Nested_derivAut
+          #print axioms GkatKleene.fig3_not_nested
+          #print axioms GkatKleene.autLang_eq_of_gbisim
+          #print axioms GkatKleene.den_foldr_ite
+          #print axioms GkatKleene.loopAut_solves
+          #print axioms GkatKleene.sem_solves_autLang
+          #print axioms GkatKleene.solves_autLang
+          #print axioms GkatKleene.semSolves_derivAut
+          #print axioms GkatKleene.buildSol_solves
+          #print axioms GkatKleene.acyclic_expressible
+          #print axioms GkatKleene.selfLoop_solves
+          #print axioms GkatKleene.loopExitAut_solves
+          #print axioms GkatKleene.loopExitAut_expressible
+          #print axioms GkatKleene.wnSol_solves
+          #print axioms GkatKleene.wn_expressible
+          #print axioms GkatKleene.AutMutReach.trans
+          #print axioms GkatKleene.AutBelow.trans
+          #print axioms GkatKleene.AutBelow.congr_left
+          #print axioms GkatKleene.reachCount_lt_of_below
+          #print axioms GkatKleene.reachCount_eq_of_mutReach
+          #print axioms GkatKleene.reachCount_step_le
+          #print axioms GkatKleene.reachCount_lt_of_step_not_mutReach
+          #print axioms GkatKleene.autBelow_wf
+          #print axioms GkatKleene.firstMatch_eq_of_mem_det
+          #print axioms GkatKleene.acyclic_flat_expressible
+          #print axioms GkatKleene.flat_selfloop_expressible
+          #print axioms GkatKleene.wnSolE_solves
+          #print axioms GkatKleene.loopChain_solves
+          #print axioms GkatKleene.loop2Aut_semsolves
+          #print axioms GkatKleene.loop2Aut_expressible
+          #print axioms GkatKleene.loopAut_expressible
           #print axioms IntegrityNoninterferenceExtracted.web_tainted_never_git_pushes
           #print axioms CapabilityResiduatedQuantaleProofs.residuation_adjunction
           #print axioms Nucleus.Assurance.suite_not_full
           #print axioms PortcullisCore.UniversalDetection.universal_detection_impossibility
+          #print axioms ExposureLoop.loop_admissible
+          #print axioms ExposureLoop.ceilingFold_eq_lfp
+          #print axioms GkatBridge.guarded_loop_is_lfp
+          #print axioms GkatWhile.whileStep_ratchets
+          #print axioms GkatWhile.solution_unique
+          #print axioms SnapshotCloneSafety.unsafe_persists_under_superset
+          #print axioms DerivationCascade.user_cascade_ratchets
+          #print axioms SnapshotChannelBinding.mappable_keys_never_reach_workload_via_cmdline
           EOF
           AXIOMS="$(lake env lean PrintAxioms.lean 2>&1 || true)"
           echo "$AXIOMS"

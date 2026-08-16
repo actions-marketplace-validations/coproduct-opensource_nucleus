@@ -132,6 +132,13 @@ lean_lib «PortcullisCoreChannel» where
 lean_lib «ChannelAdmissionExtracted» where
   roots := #[`ChannelAdmissionExtracted]
 
+-- Binds the snapshot clone-safety per-pod keys to the extracted Cmdline
+-- noninterference proof above: the keys with a Secret-labelled MaterialKind
+-- inherit `the_cmdline_delivers_no_secret_to_the_workload`; the residue
+-- (auth_secret=Internal, AWS creds=no material) is a checked boundary.
+lean_lib «SnapshotChannelBindingProofs» where
+  roots := #[`SnapshotChannelBindingProofs]
+
 -- Confidentiality-axis noninterference over the extracted core (D1/C1; STAGED —
 -- builds once aeneas-ifc-scoped extracts the ifc_confidentiality functions)
 lean_lib «ConfidentialityNoninterferenceExtracted» where
@@ -218,6 +225,124 @@ lean_lib «DeclassifyProofs» where
 
 lean_lib «SessionCeilingProofs» where
   roots := #[`SessionCeilingProofs]
+
+-- GKAT syntax + equational axioms (POPL'20 Fig.1) and the single-state Salomaa
+-- reduction (existence via W1/U5/S1/S4, uniqueness via W3) — the base case of the
+-- completeness reduction, done syntactically. General-n existence is open.
+lean_lib «GkatSyntaxProofs» where
+  roots := #[`GkatSyntaxProofs]
+
+lean_lib «GkatGuardedStringProofs» where
+  roots := #[`GkatGuardedStringProofs]
+
+lean_lib «GkatInexpressibleProofs» where
+  roots := #[`GkatInexpressibleProofs]
+
+lean_lib «GkatUniquenessFrontierProofs» where
+  roots := #[`GkatUniquenessFrontierProofs]
+
+lean_lib «GkatExistenceFrontierProofs» where
+  roots := #[`GkatExistenceFrontierProofs]
+
+-- UA₂ = UA₁ + a guard-pullback witness: the wp-definability decomposition of the
+-- Uniqueness Axiom, and a new sufficient condition for GKAT-solvability.
+lean_lib «GkatUAIndependenceProofs» where
+  roots := #[`GkatUAIndependenceProofs]
+
+-- Semantic observation layer: guard-definability ⟺ descent to the observation
+-- quotient, with a certified non-definable (regime-3) crossing.
+lean_lib «GkatObservationProofs» where
+  roots := #[`GkatObservationProofs]
+
+-- No guard-pullback witness exists for a genuine action (the model side of the
+-- obstruction, via GkatGS.sound in the guarded-string model).
+lean_lib «GkatPullbackWitnessProofs» where
+  roots := #[`GkatPullbackWitnessProofs]
+
+lean_lib «GkatDerivativeProofs» where
+  roots := #[`GkatDerivativeProofs]
+
+-- Where the pullback witnesses come from: well-nested systems are witness-free
+-- (Track 1), and the regime-1 witness is sound under a test-invariance hypothesis
+-- (Track 2, KA-with-hypotheses).
+lean_lib «GkatWellNestedProofs» where
+  roots := #[`GkatWellNestedProofs]
+
+lean_lib «GkatBisimulationProofs» where
+  roots := #[`GkatBisimulationProofs]
+
+lean_lib «GkatCompletenessProofs» where
+  roots := #[`GkatCompletenessProofs]
+
+lean_lib «GkatDerivativeFiniteProofs» where
+  roots := #[`GkatDerivativeFiniteProofs]
+
+lean_lib «GkatDecisionProofs» where
+  roots := #[`GkatDecisionProofs]
+
+lean_lib «GkatBehaviorProofs» where
+  roots := #[`GkatBehaviorProofs]
+
+lean_lib «GkatInexpressibilityProofs» where
+  roots := #[`GkatInexpressibilityProofs]
+
+lean_lib «GkatCoequationProofs» where
+  roots := #[`GkatCoequationProofs]
+
+lean_lib «GkatFaithfulnessProofs» where
+  roots := #[`GkatFaithfulnessProofs]
+
+-- Kleene synthesis, Phase 1: the GKAT automaton carrier `GAut` (finite, BExp-guarded,
+-- deterministic), the derivative automaton `derivAut e` (guarded transitions read off
+-- `next`, `autLang = den`), well-formedness, and the automaton-level nesting coequation
+-- `Nested` — proven for every `derivAut e` and shown to reject the Fig 3 witness. Toward
+-- the completeness half `W ⊆ {⟦e⟧}` (rel UA).
+lean_lib «GkatKleeneProofs» where
+  roots := #[`GkatKleeneProofs]
+
+-- The n-ary decomposition of the Uniqueness Axiom: chain-elimination reduces an
+-- n-state guarded cycle to a single W3 loop given a pullback witness per crossing
+-- (UAₙ = UA₁ + (n−1) witnesses).
+lean_lib «GkatChainEliminationProofs» where
+  roots := #[`GkatChainEliminationProofs]
+
+-- Snapshot clone-safety: the cmdline key classification is disjoint, the
+-- snapshot_safety guard is sound+complete, and unsafety is fail-closed (monotone).
+-- Lifts the Rust test-gates #2300/#2301; bound to production by the snapshot.rs
+-- parity test.
+lean_lib «SnapshotCloneSafetyProofs» where
+  roots := #[`SnapshotCloneSafetyProofs]
+
+-- One-theorem admissibility for user-defined loops: a monotone endomap on the
+-- exposure lattice inherits the ratchet at its least fixpoint (Knaster–Tarski by
+-- strict rank ascent). Ties the shipped session-ceiling fold to that lfp.
+lean_lib «ExposureLoopFixpointProofs» where
+  roots := #[`ExposureLoopFixpointProofs]
+
+-- GKAT guarded loop ↔ least fixed point: GKAT's unique guarded fixed point of a
+-- monotone body coincides with the Knaster–Tarski lfp our ratchet computes, so a
+-- guarded loop inherits the ratchet; the general-guard boundary is a falsification.
+lean_lib «GkatGuardedLoopBridge» where
+  roots := #[`GkatGuardedLoopBridge]
+
+-- GKAT `while b do body` as a monotone cascade step: under a guardedness
+-- condition on the test, the guarded loop is a monotone endomap that inherits the
+-- ratchet — extends the cascade surface to if/while.
+lean_lib «GkatWhileStep» where
+  roots := #[`GkatWhileStep]
+
+-- A minimal ordered (inequational) GKAT: the least-fixpoint / star-induction rule,
+-- proven sound for guarded-string language inclusion. The Kozen/DDP-style order the
+-- equational theory drops (using Salomaa/UA instead).
+lean_lib «GkatOrderedProofs» where
+  roots := #[`GkatOrderedProofs]
+
+-- User-authored cascades over the REAL derivation diamond inherit the ratchet:
+-- RankedLattice instance for the DerivationClass lattice + monotone step
+-- vocabulary + the one-theorem cascade admissibility (loop_admissible fired at
+-- the shipped lattice). Anchored to production by the Rust parity test (Brick B).
+lean_lib «DerivationCascadeAdmissible» where
+  roots := #[`DerivationCascadeAdmissible]
 
 lean_lib «ReceiptChainProofs» where
   roots := #[`ReceiptChainProofs]
